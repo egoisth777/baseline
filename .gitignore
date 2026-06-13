@@ -1,0 +1,12 @@
+node_modules/
+.baseline-counters.json
+*.tmp
+.zig-cache/
+zig-cache/
+zig-out/
+*.o
+*.obj
+*.pdb
+*.exp
+*.lib
+.DS_Store
