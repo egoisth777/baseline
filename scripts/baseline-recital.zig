@@ -12,6 +12,7 @@
 //  - every path exits 0; all errors swallowed silently.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const Io = std.Io;
 
 // ---- constants matching the JS defaults ------------------------------------
@@ -19,6 +20,11 @@ const DEFAULT_N: i64 = 5;
 const DEFAULT_PREFIX = "LI BASELINE ALIGNED:";
 const FALLBACK_RULE = "File read/write/search -> subagent (cavecrew-investigator/builder, Explore), not inline. Save main ctx.";
 const PRUNE_MS: i64 = 7 * 24 * 60 * 60 * 1000; // 604800000
+const MAX_STDIN_BYTES: usize = 1024 * 1024;
+const MAX_BASELINE_BYTES: usize = 64 * 1024;
+const MAX_COUNTER_BYTES: usize = 1024 * 1024;
+const MAX_RULES: usize = 50;
+const MAX_RULE_CHARS: usize = 500;
 
 // Arena allocator for the whole run; freed implicitly at process exit.
 var A: std.mem.Allocator = undefined;
@@ -92,7 +98,7 @@ fn readAllStdin(io: Io) ![]u8 {
     var buf: [4096]u8 = undefined;
     var reader = std.Io.File.stdin().readerStreaming(io, &buf);
     // allocRemaining reads to EOF and returns a caller-owned slice.
-    return reader.interface.allocRemaining(A, .unlimited);
+    return reader.interface.allocRemaining(A, .limited(MAX_STDIN_BYTES));
 }
 
 fn writeStdout(io: Io, bytes: []const u8) void {
@@ -106,10 +112,36 @@ fn configDir(env: *std.process.Environ.Map) ?[]const u8 {
     if (env.get("CLAUDE_CONFIG_DIR")) |v| {
         if (v.len > 0) return v;
     }
-    // os.homedir(): HOME, then USERPROFILE on Windows.
-    const home = env.get("HOME") orelse env.get("USERPROFILE") orelse return null;
+    const home = (if (builtin.os.tag == .windows) windowsHome(env) else posixHome(env)) orelse return null;
     if (home.len == 0) return null;
     return joinPath(home, ".claude") catch null;
+}
+
+fn posixHome(env: *std.process.Environ.Map) ?[]const u8 {
+    if (env.get("HOME")) |v| {
+        if (v.len > 0) return v;
+    }
+    if (env.get("USERPROFILE")) |v| {
+        if (v.len > 0) return v;
+    }
+    return null;
+}
+
+fn windowsHome(env: *std.process.Environ.Map) ?[]const u8 {
+    if (env.get("USERPROFILE")) |v| {
+        if (v.len > 0) return v;
+    }
+    if (env.get("HOMEDRIVE")) |drive| {
+        if (env.get("HOMEPATH")) |home_path| {
+            if (drive.len > 0 and home_path.len > 0) {
+                return std.fmt.allocPrint(A, "{s}{s}", .{ drive, home_path }) catch null;
+            }
+        }
+    }
+    if (env.get("HOME")) |v| {
+        if (v.len > 0) return v;
+    }
+    return null;
 }
 
 fn joinPath(a: []const u8, b: []const u8) ![]u8 {
@@ -127,7 +159,11 @@ fn joinPath(a: []const u8, b: []const u8) ![]u8 {
 // ---------------------------------------------------------------------------
 // file read helper. Returns null on any failure. Uses absolute paths.
 fn readFileAll(io: Io, path: []const u8) ?[]u8 {
-    return std.Io.Dir.cwd().readFileAlloc(io, path, A, .unlimited) catch null;
+    return std.Io.Dir.cwd().readFileAlloc(io, path, A, .limited(MAX_COUNTER_BYTES)) catch null;
+}
+
+fn readBaselineFile(io: Io, path: []const u8) ?[]u8 {
+    return std.Io.Dir.cwd().readFileAlloc(io, path, A, .limited(MAX_BASELINE_BYTES)) catch null;
 }
 
 // lstat-style symlink check (no symlink following). Returns true only if the
@@ -188,7 +224,7 @@ fn loadBaseline(io: Io, path: []const u8) Baseline {
         .rules = .empty,
     };
 
-    const raw = readFileAll(io, path) orelse {
+    const raw = readBaselineFile(io, path) orelse {
         bl.rules.append(A, FALLBACK_RULE) catch {};
         return bl;
     };
@@ -219,10 +255,11 @@ fn loadBaseline(io: Io, path: []const u8) Baseline {
     // rules from body
     var lit = std.mem.splitScalar(u8, body, '\n');
     while (lit.next()) |line_raw| {
+        if (bl.rules.items.len >= MAX_RULES) break;
         const line = jsTrim(line_raw); // trims spaces/tabs/\r/\n
         if (line.len == 0) continue;
         if (line[0] == '#') continue;
-        bl.rules.append(A, line) catch {};
+        bl.rules.append(A, if (line.len > MAX_RULE_CHARS) line[0..MAX_RULE_CHARS] else line) catch {};
     }
     if (bl.rules.items.len == 0) {
         bl.rules.append(A, FALLBACK_RULE) catch {};

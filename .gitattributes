@@ -1,0 +1,2 @@
+*.sh text eol=lf
+bin/SHA256SUMS text eol=lf
