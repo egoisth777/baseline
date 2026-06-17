@@ -13,6 +13,10 @@ a `<system-reminder>` — higher-priority, drift-resistant context, not shown as
 chat message. That wrapper is exactly why a recital works: it lands in the
 model's attention every Nth turn without the user lifting a finger.
 
+Trust boundary: anything written to `~/.claude/baseline.md` becomes future
+higher-priority reminder context. Treat that file as trusted configuration, not
+scratch text. Keep rules short and review edits before relying on them.
+
 Plain stdout (non-JSON) is also injected, but as visible transcript text rather
 than a system reminder. We use the JSON form on purpose.
 
@@ -50,6 +54,8 @@ Hardening / robustness in the counter path:
 - **Symlink refusal** (`lstat` check) so we never write through a planted link.
 - **Stale prune** (`PRUNE_MS`, 7 days) so the map can't grow unbounded across
   many sessions.
+- **Read caps** so prompt stdin and counters are capped at 1 MiB, `baseline.md`
+  at 64 KiB, and injected rules at 50 lines of 500 characters each.
 - Every failure path is swallowed — worst case the hook injects nothing.
 
 ## baseline.md format
@@ -68,8 +74,11 @@ two scalar keys and the hook must stay dependency-free and fast.
 
 `scripts/baseline-recital.js` in the skill is canonical. `manage.js install`
 copies it to `~/.claude/hooks/baseline-recital.js` (always overwrites — skill
-wins) and wires settings. `status` reports whether the deployed copy is byte-for-
-byte in sync with the canonical source, so you can tell if a redeploy is due.
+wins) and wires the JS runtime by default. The Zig file is an optional native
+port and must mirror the JS behavior. Prebuilt native installs are explicit and
+verified against `bin/SHA256SUMS`; source builds require Zig 0.16.x and refresh
+the checksum manifest. `status` reports JS byte sync and native checksum status
+separately, so a stale native binary is not presented as source-synced.
 `baseline.md` is seeded from `assets/baseline.template.md` only if absent — edited
 rules are never clobbered.
 
@@ -77,7 +86,9 @@ rules are never clobbered.
 
 `install` appends our command into the first existing `UserPromptSubmit` hook
 group (sharing it with any co-resident hook such as caveman), or creates a group
-if none exists. It's idempotent: if our command is already present it just
+if none exists. It's idempotent: if our deployed hook path is already present it
 refreshes the command string (e.g. if the node path changed). `uninstall`
-filters our entry out and drops emptied groups. All edits reserialize with
-2-space indent + trailing newline to stay diff-clean.
+filters only entries pointing at this package's deployed JS or native hook paths
+and drops emptied groups. Malformed `settings.json` is a hard error; the manager
+refuses to rewrite it rather than replacing co-resident hooks. All edits
+reserialize with 2-space indent + trailing newline to stay diff-clean.
