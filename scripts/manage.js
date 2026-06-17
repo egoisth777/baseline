@@ -649,14 +649,6 @@ function cmdVerify() {
   if (!ok) process.exit(1);
 }
 
-// Map the runtime reported by commandInfo() back to an install runtime token.
-// 'native exe' was deployed from a prebuilt/built binary; redeploying it from a
-// fresh checkout is best done via the verified prebuilt for this platform.
-function installRuntimeForWired(wiredRuntime) {
-  if (wiredRuntime === 'native exe') return 'prebuilt';
-  return 'js';
-}
-
 // Re-deploy the hook + re-wire settings from the CURRENT repo source, keeping
 // the runtime already in use (or --runtime <x> if given). Refreshes a stale
 // deployed .js/binary after the repo files change. git pull is left to the
@@ -666,8 +658,8 @@ function cmdUpdate(opts) {
   const ourHook = findOurHook(settings);
   const wiredRuntime = ourHook ? runtimeFromCommand(ourHook.command) : 'none';
 
-  let runtime = opts.runtime;
-  if (!runtime) runtime = ourHook ? installRuntimeForWired(wiredRuntime) : 'js';
+  // A native install redeploys via the verified prebuilt; everything else is js.
+  const runtime = opts.runtime || (wiredRuntime === 'native exe' ? 'prebuilt' : 'js');
 
   console.log('[baseline] update — redeploying from repo (was: ' + wiredRuntime + ', target runtime: ' + runtime + ')');
   console.log('');
@@ -675,8 +667,10 @@ function cmdUpdate(opts) {
     cmdInstall({ runtime });
   } catch (e) {
     // Native redeploy can fail on a host without the prebuilt/zig — fall back to
-    // the always-available js runtime rather than leaving the user broken.
-    if (runtime !== 'js') {
+    // the always-available js runtime rather than leaving the user broken. Only
+    // a runtime-resolution failure is recoverable this way; rethrow anything else
+    // (e.g. invalid settings, write errors) so it is not masked as "unavailable".
+    if (runtime !== 'js' && /runtime unavailable/i.test(e.message)) {
       console.log('[baseline] update: ' + runtime + ' runtime unavailable (' + e.message + '); falling back to js.');
       console.log('');
       cmdInstall({ runtime: 'js' });
@@ -718,9 +712,15 @@ function doctorChecks() {
       : { name: 'hook .js', level: 'warn', detail: 'DIFFERS from repo source (stale — update will refresh)', fixable: true });
   }
 
+  // The binary only matters when settings are wired to it. On a js install any
+  // deployed exe is unused, so it is never a problem update needs to fix.
   const exeExists = fs.existsSync(paths.hookDeployedExe);
   const wiredNative = ourHook && runtimeFromCommand(ourHook.command) === 'native exe';
-  if (exeExists) {
+  if (!wiredNative) {
+    checks.push({ name: 'hook binary', level: 'ok', detail: exeExists ? 'present but unused (js runtime)' : 'not present (js runtime — expected)' });
+  } else if (!exeExists) {
+    checks.push({ name: 'hook binary', level: 'fail', detail: 'settings wired to native exe but binary is MISSING', fixable: true });
+  } else {
     const key = platformKey();
     const expected = key ? expectedPrebuiltHash(prebuiltBinaryName(key)) : null;
     let actual = null;
@@ -730,12 +730,8 @@ function doctorChecks() {
     } else if (expected) {
       checks.push({ name: 'hook binary', level: 'warn', detail: 'sha256 DIFFERS from checked-in prebuilt (update will refresh)', fixable: true });
     } else {
-      checks.push({ name: 'hook binary', level: 'warn', detail: 'present, no checked-in prebuilt for this platform to compare', fixable: false });
+      checks.push({ name: 'hook binary', level: 'warn', detail: 'present, cannot verify (no checked-in prebuilt for this platform)', fixable: false });
     }
-  } else if (wiredNative) {
-    checks.push({ name: 'hook binary', level: 'fail', detail: 'settings wired to native exe but binary is MISSING', fixable: true });
-  } else {
-    checks.push({ name: 'hook binary', level: 'ok', detail: 'not present (js runtime — expected)' });
   }
 
   const baselineExists = fs.existsSync(paths.baseline);
@@ -777,6 +773,13 @@ function cmdDoctor(opts) {
   }
 
   // --fix: re-deploy from repo, preserving the wired runtime, then re-scan.
+  // Refuse to touch anything while settings.json is invalid — a repair pass
+  // would mutate hook/baseline files but still fail at the broken settings.
+  if (checks.some(c => c.name === 'settings.json' && c.level === 'fail')) {
+    console.log('');
+    console.log('[baseline] doctor: settings.json is invalid JSON — fix it by hand first, then rerun --fix. Nothing was changed.');
+    process.exit(1);
+  }
   if (!fixable.length) {
     console.log('');
     console.log('[baseline] doctor: nothing auto-fixable. Manual action needed for the issues above.');
@@ -795,13 +798,14 @@ function cmdDoctor(opts) {
   console.log('');
   checks = doctorChecks();
   printDoctorChecks(checks);
-  const left = checks.filter(c => c.level === 'fail');
+  const remaining = checks.filter(c => c.level !== 'ok');
   console.log('');
-  if (left.length) {
-    console.log('[baseline] doctor: ' + left.length + ' issue(s) remain after fix — manual action needed.');
+  if (remaining.some(c => c.level === 'fail')) {
+    console.log('[baseline] doctor: ' + remaining.length + ' issue(s) remain after fix — manual action needed.');
     process.exit(1);
   }
-  console.log('[baseline] doctor: installation repaired.');
+  console.log('[baseline] doctor: installation repaired'
+    + (remaining.length ? ' (' + remaining.length + ' non-fixable warning(s) remain — see above).' : '.'));
 }
 
 // --- help / arg parsing -----------------------------------------------------
@@ -830,8 +834,10 @@ function printHelp() {
   console.log('Config dir: CLAUDE_CONFIG_DIR if set, otherwise ~/.claude.');
 }
 
-// Parse install flags from argv (everything after the subcommand).
-function parseInstallOpts(argv) {
+// Parse install flags from argv (everything after the subcommand). cmd names the
+// caller so a bad --runtime reports the right command in its error.
+function parseInstallOpts(argv, cmd) {
+  cmd = cmd || 'install';
   const opts = { runtime: null }; // null => js default
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
@@ -840,15 +846,12 @@ function parseInstallOpts(argv) {
     } else if (a === '--runtime' || a === '-runtime') {
       const v = (argv[i + 1] || '').toLowerCase();
       i++;
-      if (v === 'prebuilt' || v === 'build' || v === 'js') {
-        opts.runtime = v;
-      } else {
-        fail('install: unknown --runtime "' + (argv[i] || '') + '" (use prebuilt|build|js).', 2);
-      }
+      if (v === 'prebuilt' || v === 'build' || v === 'js') opts.runtime = v;
+      else fail(cmd + ': unknown --runtime "' + v + '" (use prebuilt|build|js).', 2);
     } else if (a.startsWith('--runtime=') || a.startsWith('-runtime=')) {
       const v = a.slice(a.indexOf('=') + 1).toLowerCase();
       if (v === 'prebuilt' || v === 'build' || v === 'js') opts.runtime = v;
-      else fail('install: unknown --runtime "' + v + '" (use prebuilt|build|js).', 2);
+      else fail(cmd + ': unknown --runtime "' + v + '" (use prebuilt|build|js).', 2);
     }
   }
   return opts;
@@ -856,7 +859,7 @@ function parseInstallOpts(argv) {
 
 // Parse doctor flags: --fix (repair) and the shared --runtime selector.
 function parseDoctorOpts(argv) {
-  const opts = parseInstallOpts(argv);
+  const opts = parseInstallOpts(argv, 'doctor');
   opts.fix = argv.some(a => a === '--fix' || a === '-fix');
   return opts;
 }
@@ -889,7 +892,7 @@ switch (cmd) {
     break;
   case 'update':
     try {
-      cmdUpdate(parseInstallOpts(process.argv.slice(3)));
+      cmdUpdate(parseInstallOpts(process.argv.slice(3), 'update'));
     } catch (e) {
       fail('update: ' + e.message, 1);
     }
