@@ -152,7 +152,7 @@ function testUnquotedWindowsNativePathIsRecognized() {
 
 function testChecksumsMatchBinaries() {
   const sumsPath = path.join(root, 'bin', 'SHA256SUMS');
-  if (!fs.existsSync(sumsPath)) return;
+  assert.ok(fs.existsSync(sumsPath), 'bin/SHA256SUMS is missing');
 
   const raw = fs.readFileSync(sumsPath, 'utf8');
   // CRLF breaks `sha256sum -c` on POSIX (trailing \r becomes part of the
@@ -161,15 +161,73 @@ function testChecksumsMatchBinaries() {
 
   const lines = raw.split('\n').filter(Boolean);
   assert.ok(lines.length > 0, 'SHA256SUMS is empty');
+  const listed = new Set();
   for (const line of lines) {
     const m = line.match(/^([0-9a-f]{64})\s+(.+)$/);
     assert.ok(m, 'malformed SHA256SUMS line: ' + line);
     const [, expected, name] = m;
+    listed.add(name);
     const file = path.join(root, 'bin', name);
     assert.ok(fs.existsSync(file), 'missing binary listed in SHA256SUMS: ' + name);
     const actual = crypto.createHash('sha256').update(fs.readFileSync(file)).digest('hex');
     assert.strictEqual(actual, expected, 'sha256 mismatch for ' + name);
   }
+  // Every shipped prebuilt must have a checksum entry — a new binary added to
+  // bin/ without one would otherwise deploy unverified.
+  for (const f of fs.readdirSync(path.join(root, 'bin'))) {
+    if (/^baseline-recital-/.test(f)) {
+      assert.ok(listed.has(f), 'prebuilt ' + f + ' has no entry in SHA256SUMS');
+    }
+  }
+}
+
+function testUpdatePreservesRuntimeAndRepairs() {
+  const cfg = tempConfig();
+  assert.strictEqual(run(['install'], cfg).status, 0);
+
+  // Corrupt the deployed hook, then update should redeploy from repo source.
+  const deployed = path.join(cfg, 'hooks', 'baseline-recital.js');
+  fs.writeFileSync(deployed, '// tampered\n');
+  const update = run(['update'], cfg);
+  assert.strictEqual(update.status, 0, update.stderr || update.stdout);
+  assert.match(update.stdout, /target runtime: js/);
+  assert.strictEqual(
+    fs.readFileSync(deployed, 'utf8'),
+    fs.readFileSync(path.join(root, 'scripts', 'baseline-recital.js'), 'utf8'),
+    'update did not restore the hook from repo source');
+  assert.strictEqual(run(['verify'], cfg).status, 0);
+}
+
+function testDoctorReportsAndFixes() {
+  const cfg = tempConfig();
+  assert.strictEqual(run(['install'], cfg).status, 0);
+
+  // Healthy install → exit 0, healthy.
+  const healthy = run(['doctor'], cfg);
+  assert.strictEqual(healthy.status, 0, healthy.stderr || healthy.stdout);
+  assert.match(healthy.stdout, /doctor: healthy/);
+
+  // Break it: delete the deployed hook → doctor FAILs (exit 1).
+  fs.unlinkSync(path.join(cfg, 'hooks', 'baseline-recital.js'));
+  const broken = run(['doctor'], cfg);
+  assert.strictEqual(broken.status, 1, broken.stdout);
+  assert.match(broken.stdout, /\[FAIL\] hook \.js/);
+
+  // doctor --fix repairs and re-scans clean.
+  const fixed = run(['doctor', '--fix'], cfg);
+  assert.strictEqual(fixed.status, 0, fixed.stderr || fixed.stdout);
+  assert.match(fixed.stdout, /doctor: installation repaired/);
+}
+
+function testDoctorFixRefusesInvalidSettings() {
+  const cfg = tempConfig();
+  const settings = path.join(cfg, 'settings.json');
+  write(settings, '{ invalid json');
+
+  const fixed = run(['doctor', '--fix'], cfg);
+  assert.notStrictEqual(fixed.status, 0, 'doctor --fix unexpectedly succeeded on invalid settings');
+  // Must NOT have rewritten the broken settings.
+  assert.strictEqual(fs.readFileSync(settings, 'utf8'), '{ invalid json');
 }
 
 testDefaultInstallAndVerify();
@@ -181,4 +239,7 @@ testPrebuiltInstallAndVerify();
 testBuildInstallAndVerifyWhenZigAvailable();
 testUnquotedWindowsNativePathIsRecognized();
 testChecksumsMatchBinaries();
+testUpdatePreservesRuntimeAndRepairs();
+testDoctorReportsAndFixes();
+testDoctorFixRefusesInvalidSettings();
 console.log('baseline tests passed');
