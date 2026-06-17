@@ -134,7 +134,7 @@ node scripts/manage.js status
 
 ## Managing the hook
 
-The manager script provides four commands:
+The manager script provides these commands:
 
 | Command | Description |
 |---------|-------------|
