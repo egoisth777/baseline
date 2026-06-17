@@ -20,7 +20,8 @@ fi
 # Zig is only needed when building from source. Warn early, but keep going.
 if [[ " $* " == *" --build "* ]]; then
 	if ! command -v zig >/dev/null 2>&1; then
-		echo "Note: Zig was not found, so --build cannot compile from source. The installer will fall back to a prebuilt binary or the Node version."
+		echo "Error: Zig was not found, so --build cannot compile from source." >&2
+		exit 1
 	fi
 fi
 

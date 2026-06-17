@@ -1,7 +1,8 @@
 #Requires -Version 5.1
 param(
+	[switch]$build,
 	[Parameter(ValueFromRemainingArguments = $true)]
-	$Args
+	[string[]]$RemainingArgs
 )
 
 $ErrorActionPreference = "Stop"
@@ -17,8 +18,15 @@ if (-not $node) {
 }
 
 $manage = Join-Path $root "scripts\manage.js"
+$forwardArgs = @()
+if ($build) {
+	$forwardArgs += "--build"
+}
+if ($RemainingArgs) {
+	$forwardArgs += $RemainingArgs
+}
 
-& node $manage install @Args
+& node $manage install @forwardArgs
 $code = $LASTEXITCODE
 
 if ($code -eq 0) {

@@ -34,6 +34,11 @@ const FALLBACK_RULES = [
 ];
 // Drop counter entries untouched for longer than this (stale sessions).
 const PRUNE_MS = 7 * 24 * 60 * 60 * 1000;
+const MAX_STDIN_BYTES = 1024 * 1024;
+const MAX_BASELINE_BYTES = 64 * 1024;
+const MAX_COUNTER_BYTES = 1024 * 1024;
+const MAX_RULES = 50;
+const MAX_RULE_CHARS = 500;
 
 const claudeDir = process.env.CLAUDE_CONFIG_DIR || path.join(os.homedir(), '.claude');
 const counterPath = path.join(claudeDir, '.baseline-counters.json');
@@ -45,7 +50,10 @@ const baselinePath = path.join(claudeDir, 'baseline.md');
 function loadBaseline() {
   let raw;
   try {
+    const st = fs.statSync(baselinePath);
+    if (st.size > MAX_BASELINE_BYTES) throw new Error('baseline.md too large');
     raw = fs.readFileSync(baselinePath, 'utf8');
+    if (Buffer.byteLength(raw, 'utf8') > MAX_BASELINE_BYTES) throw new Error('baseline.md too large');
   } catch (e) {
     return { interval: DEFAULT_N, prefix: DEFAULT_PREFIX, rules: FALLBACK_RULES };
   }
@@ -77,7 +85,9 @@ function loadBaseline() {
   const rules = body
     .split(/\r?\n/)
     .map(l => l.trim())
-    .filter(l => l && !l.startsWith('#'));
+    .filter(l => l && !l.startsWith('#'))
+    .slice(0, MAX_RULES)
+    .map(l => l.length > MAX_RULE_CHARS ? l.slice(0, MAX_RULE_CHARS) : l);
 
   return {
     interval,
@@ -92,6 +102,7 @@ function readCounters() {
   try {
     const st = fs.lstatSync(counterPath);
     if (st.isSymbolicLink()) return {};
+    if (st.size > MAX_COUNTER_BYTES) return {};
     const obj = JSON.parse(fs.readFileSync(counterPath, 'utf8'));
     return (obj && typeof obj === 'object') ? obj : {};
   } catch (e) {
@@ -116,9 +127,20 @@ function writeCounters(counters) {
 }
 
 let input = '';
-process.stdin.on('data', chunk => { input += chunk; });
+let inputBytes = 0;
+let inputTooLarge = false;
+process.stdin.on('data', chunk => {
+  inputBytes += chunk.length;
+  if (inputBytes > MAX_STDIN_BYTES) {
+    inputTooLarge = true;
+    input = '';
+    return;
+  }
+  input += chunk;
+});
 process.stdin.on('end', () => {
   try {
+    if (inputTooLarge) return;
     const data = JSON.parse(input);
     const sessionId = data.session_id;
     if (!sessionId) return; // No stable key → nothing to count.
@@ -143,7 +165,8 @@ process.stdin.on('end', () => {
     counters[sessionId] = { count: count, ts: now };
     writeCounters(counters);
 
-    // Fire on every Nth prompt (interval, 2*interval, ...). Turn 1 never fires.
+    // Fire on every Nth prompt (interval, 2*interval, ...). When interval > 1,
+    // turn 1 never fires; when interval is 1, every turn fires.
     if (count % interval !== 0) return;
 
     const recited = rules.map(r => '- ' + r).join('\n');
