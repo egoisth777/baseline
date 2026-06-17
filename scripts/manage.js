@@ -800,12 +800,11 @@ function cmdDoctor(opts) {
   printDoctorChecks(checks);
   const remaining = checks.filter(c => c.level !== 'ok');
   console.log('');
-  if (remaining.some(c => c.level === 'fail')) {
+  if (remaining.length) {
     console.log('[baseline] doctor: ' + remaining.length + ' issue(s) remain after fix — manual action needed.');
     process.exit(1);
   }
-  console.log('[baseline] doctor: installation repaired'
-    + (remaining.length ? ' (' + remaining.length + ' non-fixable warning(s) remain — see above).' : '.'));
+  console.log('[baseline] doctor: installation repaired.');
 }
 
 // --- help / arg parsing -----------------------------------------------------
