@@ -3,11 +3,11 @@ name: baseline
 description: >-
   Control surface for the baseline-recital drift-correction hook: a Claude Code
   UserPromptSubmit hook that periodically injects trusted baseline rules from
-  ~/.claude/baseline.md so the agent recites them before continuing. Use when
+  ~/.omne/baseline.md so the agent recites them before continuing. Use when
   the user asks to view, edit, add, or remove baseline-recital rules; tune the
   recital interval; change the recital prefix; install, verify, check status,
   repair, or uninstall the baseline-recital hook; or manage
-  ~/.claude/baseline.md. Trigger on qualified phrases like "baseline-recital",
+  ~/.omne/baseline.md. Trigger on qualified phrases like "baseline-recital",
   "baseline rules", "baseline hook", "baseline drift", "change baseline
   interval", or "make the agent recite X every N turns".
 ---
@@ -24,10 +24,11 @@ The baseline is the minimal invariant subset of rules the agent re-aligns to —
 |---|---|---|
 | Hook program (canonical) | `scripts/baseline-recital.js` | Source of truth: count per session, fire on Nth. Default runtime. |
 | Native port | `scripts/baseline-recital.zig` | Optional speed path. Must mirror the JS hook. Build with Zig 0.16.x. |
-| Deployed hook | `~/.claude/hooks/baseline-recital.js` or `~/.claude/hooks/baseline-recital[.exe]` | Installed hook command wired in settings. |
-| Baseline data | `~/.claude/baseline.md` | **Everything tunable**: interval + prefix (frontmatter) + rules (body). Read live every fire — edits need NO reinstall. |
+| Central hook | `~/.omne/hooks/baseline-recital.js` or `~/.omne/hooks/baseline-recital[.exe]` | Canonical deployed hook artifact. |
+| Agent hook link | `~/.claude/hooks/baseline-recital.js` or `~/.claude/hooks/baseline-recital[.exe]` | Installed command path wired in settings; links to central. |
+| Baseline data | `~/.omne/baseline.md` | **Everything tunable**: interval + prefix (frontmatter) + rules (body). Read live via symlink/hardlink; copy fallback needs install/update after edits. |
 | Counter state | `~/.claude/.baseline-counters.json` | Per-session turn counts. Auto-pruned. Never edit by hand. |
-| Wiring | `~/.claude/settings.json` | `UserPromptSubmit` → command entry. `install`/`uninstall` manage it. |
+| Wiring | `~/.claude/settings.json` | `UserPromptSubmit` → agent hook link command. `install`/`uninstall` manage it. |
 | Manager | `scripts/manage.js` | install / update / doctor / verify / status / uninstall. Run from repo root. |
 | Platform wrappers | `install` / `update` / `doctor` / `uninstall` `.sh` (Linux+macOS) and `.ps1` (Windows) | Per-command entry points. |
 | Builder | `build.sh` / `build.ps1` | Compile Zig binary from source (optional). |
@@ -49,13 +50,13 @@ macOS has no shipped prebuilt; use the default JS runtime unless you are deliber
 
 ## Trust Boundary
 
-`~/.claude/baseline.md` is injected as higher-priority reminder context every N prompts. Treat it as trusted configuration: inspect edits, keep rules short, and do not copy untrusted text into it. The hook caps file size, rule count, and rule length, but content still steers future agent behavior.
+`~/.omne/baseline.md` is injected as higher-priority reminder context every N prompts through the agent's linked `baseline.md`. Treat it as trusted configuration: inspect edits, keep rules short, and do not copy untrusted text into it. The hook caps file size, rule count, and rule length, but content still steers future agent behavior. If `status` reports a plain-copy fallback, rerun install/update after editing the central file.
 
 ## The two most common tasks
 
 ### Edit the baseline (rules / interval / prefix) — no reinstall
 
-This is the everyday case and it is just editing one file: `~/.claude/baseline.md`.
+This is the everyday case and it is just editing one file: `~/.omne/baseline.md`.
 
 ```
 ---
@@ -69,7 +70,7 @@ File read/write/search -> subagent (cavecrew-investigator/builder, Explore), not
 - **Add a rule:** append a line. Keep it short — it's injected into context every fire, so caveman-compress it (drop articles/filler).
 - **Change interval:** edit `interval:`. Lower = tighter leash, more tokens.
 - **Change prefix:** edit `prefix:`. This is the literal line the agent recites under.
-- Changes apply on the **next prompt** — the hook reads this file live. No reinstall.
+- Changes apply on the **next prompt** when `status` reports a symlink or hardlink. If it reports a copy fallback, rerun install/update.
 
 After editing, you can confirm what's live with `status` (below).
 
@@ -79,11 +80,11 @@ Run the manager from the repo root:
 
 ```bash
 node scripts/manage.js status      # what's installed, in-sync?, current rules
-node scripts/manage.js install     # deploy hook + seed baseline.md + wire settings
+node scripts/manage.js install     # deploy central hook/baseline + link agent + wire settings
 node scripts/manage.js verify      # functional: confirm it fires on turn N
 node scripts/manage.js update      # redeploy hook + settings from repo (keeps wired runtime)
 node scripts/manage.js doctor      # scan installation health; --fix to repair
-node scripts/manage.js uninstall   # unwire settings + delete deployed hook (keeps baseline.md)
+node scripts/manage.js uninstall   # unwire settings + remove agent links (keeps central baseline.md)
 ```
 
 Or use the platform installer scripts:
@@ -97,7 +98,7 @@ The commands are idempotent and preserve any co-resident `UserPromptSubmit` hook
 ## Workflow guidance for the agent using this skill
 
 1. **Identify the intent.** Editing rules/interval/prefix → it's a `baseline.md` edit, nothing more. Installing/repairing/removing → it's a `manage.js` run.
-2. **For data edits:** read `~/.claude/baseline.md`, make the change, keep rules caveman-short, preserve the frontmatter fences. Then run `node scripts/manage.js status` (from repo root) to show the user the live result.
+2. **For data edits:** read `~/.omne/baseline.md`, make the change, keep rules caveman-short, preserve the frontmatter fences. Then run `node scripts/manage.js status` (from repo root) to show the user the live result.
 3. **For mechanism changes** (how counting/injection works): edit `scripts/baseline-recital.js` first. If native support must stay current, mirror the change in `scripts/baseline-recital.zig`, run `build.sh` / `build.ps1` to regenerate binaries and `bin/SHA256SUMS`, then install the intended runtime (`node scripts/manage.js install` for JS, `--runtime build` or `--runtime prebuilt` for native).
 4. **Always end with `node scripts/test.js` plus `status` or `verify`** so the user sees ground truth, not a claim. After any settings change, remind them: open `/hooks` once or restart so Claude Code reloads settings (the running session won't pick it up otherwise).
 
@@ -109,4 +110,4 @@ This skill is meant to grow. Likely future directions, and where they'd live:
 - **Different cadence logic** (e.g. fire on token-count instead of turn-count): mechanism. Note the harness gives the hook `session_id`, `transcript_path`, `cwd`, `prompt` on stdin; there is no context-percentage field, so turn-count is the reliable trigger.
 - **Per-project baselines:** mechanism: have the hook read a project-local `baseline.md` (via `cwd` from stdin) and merge with the global one.
 
-When you change mechanism, keep `scripts/baseline-recital.js` as the source of truth and redeploy with `install`; never hand-edit the deployed copy in `~/.claude/hooks/`.
+When you change mechanism, keep `scripts/baseline-recital.js` as the source of truth and redeploy with `install`; never hand-edit the deployed copy in `~/.omne/hooks/`.

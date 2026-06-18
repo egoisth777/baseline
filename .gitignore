@@ -1,6 +1,10 @@
 node_modules/
 .arca/
-resources/
+resources/*
+!resources/logo.png
+!resources/logo.svg
+!resources/logo.txt
+!resources/logo.ans
 .baseline-counters.json
 *.tmp
 .zig-cache/

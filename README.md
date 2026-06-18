@@ -1,5 +1,14 @@
 # baseline
 
+<p align="center">
+  <img src="resources/logo.png" alt="BASELINE stencil ruler logo" width="720">
+</p>
+
+<p align="center">
+  <a href="resources/logo.ans">ANSI logo</a> |
+  <a href="resources/logo.txt">plain text logo</a>
+</p>
+
 A drift-correction system for [Claude Code](https://claude.com/claude-code). Over a long session the agent forgets standing rules (e.g. "route file operations through subagents, don't do them inline"). This installs a hook that periodically forces the agent to recite a small baseline of standing rules before continuing. Reciting both re-aligns the agent (generating the rule primes the next action) and exposes drift (you see in the recital whether it got the rules right).
 
 Inspired by the Blade Runner 2049 baseline test.
@@ -16,7 +25,11 @@ This package targets Claude Code. The engine is designed so adapters for other a
 
 A small hook program runs on every prompt submit. It reads `session_id` from the JSON the harness passes on stdin, keeps a per-session turn counter in `~/.claude/.baseline-counters.json`, and on every Nth turn prints a JSON object whose `additionalContext` field Claude Code injects into the model's context as a system reminder. The agent sees the recital text and is prompted to open its reply with the prefix line followed by the rules.
 
-All tunable parameters (the rules, interval, and prefix) live in `~/.claude/baseline.md`. The hook reads this file live on every fire, so edits take effect on the next prompt with NO reinstall.
+All tunable parameters (the rules, interval, and prefix) live in the central
+`~/.omne/baseline.md` file. Each agent config links its local `baseline.md` to
+that central file. With a symlink or hardlink, the hook reads central edits live
+on every fire; with a plain-copy fallback, rerun `install` or `update` after
+editing.
 
 ## Requirements
 
@@ -41,9 +54,22 @@ bash install.sh
 ```
 
 Both scripts delegate to `node scripts/manage.js install`, which:
-1. Deploys the hook to `~/.claude/hooks/baseline-recital.js` (JS runtime by default)
-2. Seeds `~/.claude/baseline.md` if it does not already exist
+1. Deploys the canonical hook + the single editable `baseline.md` to a **central
+   store**, `~/.omne` (JS runtime by default)
+2. **Links** each agent's config dir back into the center —
+   `~/.claude/hooks/baseline-recital.js` → `~/.omne/hooks/baseline-recital.js`
+   and `~/.claude/baseline.md` → `~/.omne/baseline.md`
 3. Wires the hook into `~/.claude/settings.json` under `UserPromptSubmit`
+
+When `status` reports a symlink or hardlink, editing the central
+`~/.omne/baseline.md` changes the live rules for wired agents at once. If the
+link layer had to fall back to a plain copy, rerun `install` or `update` after
+editing the central file.
+
+The central root is `~/.omne` by default; override it with the `OMNE_HOME`
+environment variable. On Windows without symlink privilege the link layer
+degrades automatically to a hardlink (then a plain copy as a last resort);
+`status`/`doctor` report which mechanism is in effect.
 
 After install, open `/hooks` in Claude Code once (or restart Claude Code) so the settings reload.
 
@@ -86,7 +112,8 @@ bash install.sh --build
 .\install.ps1 -build
 ```
 
-This compiles `scripts/baseline-recital.zig` for your host and deploys it to `~/.claude/hooks/`.
+This compiles `scripts/baseline-recital.zig` for your host and deploys it to the
+central `~/.omne/hooks/` store, then links the agent hook path to it.
 
 **Regenerate both committed prebuilts via cross-compilation:**
 ```bash
@@ -106,7 +133,8 @@ bash install.sh --runtime js
 
 ## Editing the baseline (the everyday task)
 
-Edit `~/.claude/baseline.md`. This is the file you'll touch most often.
+Edit `~/.omne/baseline.md`. This is the file you'll touch most often. The agent
+path `~/.claude/baseline.md` links back to it after install.
 
 **Example:**
 ```markdown
@@ -125,7 +153,8 @@ Never commit without explicit user request.
 - `prefix:` — The literal line the agent opens its reply with when reciting.
 - **Body** — One rule per line. Keep rules short (they're injected into context every fire). Lines starting with `#` and blank lines are ignored.
 
-**Changes apply on the next prompt.** No reinstall required. The hook reads this file live.
+**Changes apply on the next prompt** when `status` reports a symlink or hardlink.
+If it reports a plain-copy fallback, rerun `install` or `update`.
 
 After editing, confirm what's live with:
 ```bash
@@ -140,10 +169,10 @@ The manager script provides these commands:
 |---------|-------------|
 | `status` | Shows what's installed, whether it's in sync with the canonical source, and the current rules. |
 | `verify` | Functional test: confirms the hook fires on turn N as expected. |
-| `install` | Deploys the hook, seeds `baseline.md` if missing, and wires `settings.json`. Idempotent. |
-| `update` | Redeploys the hook and re-wires settings from the current repo source, keeping the runtime already in use (native falls back to JS if unavailable). |
-| `doctor` | Scans the installation and reports each check as OK/WARN/FAIL. `--fix` repairs the auto-fixable issues and re-scans. |
-| `uninstall` | Unwires the hook from settings and removes the deployed hook. Preserves your `baseline.md`. |
+| `install` | Deploys the hook + `baseline.md` to the central `~/.omne`, links each agent dir to it, and wires `settings.json`. Idempotent. Migrates a pre-existing real `baseline.md` into the center without clobbering edits. |
+| `update` | Redeploys the central hook and re-wires settings + re-links from the current repo source, keeping the runtime already in use (native falls back to JS if unavailable). |
+| `doctor` | Scans the installation and reports each check as OK/WARN/FAIL — including whether each agent link resolves to the center. `--fix` repairs the auto-fixable issues and re-scans. |
+| `uninstall` | Unwires the hook from settings and removes the per-agent links. Preserves the central `~/.omne/baseline.md`. |
 
 **Run with Node.js:**
 ```bash
@@ -189,7 +218,12 @@ baseline/
 │   ├── baseline-recital-linux-x64
 │   └── SHA256SUMS
 ├── assets/
-│   └── baseline.template.md # Seeded as ~/.claude/baseline.md if missing
+│   └── baseline.template.md # Seeded as ~/.omne/baseline.md if missing
+├── resources/
+│   ├── logo.png             # Repository image / preview source
+│   ├── logo.svg             # Scalable logo source
+│   ├── logo.txt             # Plain text ASM logo
+│   └── logo.ans             # ANSI ASM logo
 ├── references/
 │   └── architecture.md      # Internals: counting, injection, hardening
 ├── SKILL.md                 # Skill manifest for Claude Code
@@ -202,7 +236,7 @@ baseline/
 node scripts/manage.js uninstall
 ```
 
-This unwires the hook from `~/.claude/settings.json` and removes the deployed hook binary or script from `~/.claude/hooks/`. Your `~/.claude/baseline.md` is preserved.
+This unwires the hook from `~/.claude/settings.json` and removes the per-agent links from `~/.claude/hooks/` and `~/.claude/baseline.md`. The central `~/.omne/baseline.md` is preserved (delete `~/.omne` by hand if you want it gone).
 
 ## How firing is counted
 

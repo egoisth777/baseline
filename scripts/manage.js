@@ -16,17 +16,22 @@
 // requests fail if the binary cannot be verified or built.
 //
 // Design notes:
-// - The repo is the source of truth. install deploys the hook into the Claude
-//   config dir (CLAUDE_CONFIG_DIR or ~/.claude) and seeds baseline.md from the
-//   template ONLY if absent (never clobbers operator-edited rules).
-// - The .js hook is the portable source of truth: install ALWAYS
-//   deploys scripts/baseline-recital.js to hooks/, regardless of which runtime
-//   is wired, so there is always a working reference copy.
-// - A native runtime (prebuilt binary, or a fresh zig build) eliminates Node
-//   process-boot latency on the hot path. Because native hooks execute on every
-//   prompt, they are opt-in and verified before wiring.
+// - There is ONE central install root, OMNE_HOME or ~/.omne. The canonical
+//   deployed hook (.js + optional native exe) and the single editable
+//   baseline.md live there. The repo is the source of truth for the hook .js;
+//   install always overwrites the central .js from it.
+// - Each agent's config dir (Claude: CLAUDE_CONFIG_DIR or ~/.claude) gets LINKS
+//   back into the center: hooks/baseline-recital.js and baseline.md point at the
+//   central copies. Editing ~/.omne/baseline.md changes the live rules when the
+//   link layer can use symlink/hardlink; copy fallback is reported as degraded.
+// - settings.json and .baseline-counters.json stay REAL, per-agent files: the
+//   hook refuses a symlinked counter file (planted-link hardening), and settings
+//   carry per-agent co-resident hooks. Neither is ever linked.
+// - baseline.md is seeded from the template ONLY if no rules exist anywhere; an
+//   existing real baseline.md in an agent dir is MIGRATED into the center (moved,
+//   not clobbered) so operator-edited rules are never lost.
 // - settings.json editing is surgical and idempotent. Our entry is recognised by
-//   parsing its command and matching the deployed JS or native path exactly.
+//   parsing its command and matching the agent's deployed JS or native path.
 //   Co-resident UserPromptSubmit hooks are always preserved. JSON reserializes
 //   with 2-space indent + trailing newline.
 // - All paths are built with os/path (no hardcoded separators). The Node runtime
@@ -51,15 +56,34 @@ const MAX_RULE_CHARS = 500;
 // --- platform + path resolution -------------------------------------------
 
 const isWin = process.platform === 'win32';
-
-// Base config dir: explicit override, else ~/.claude. Cross-platform via os/path.
-const baseDir = process.env.CLAUDE_CONFIG_DIR || path.join(os.homedir(), '.claude');
+const homeDir = os.homedir();
 
 // Repo root resolved relative to this file (scripts/ sits directly under root).
 const repoRoot = path.resolve(__dirname, '..');
 
 // Deployed native-exe basename differs by platform (.exe suffix on Windows only).
 const exeExt = isWin ? '.exe' : '';
+
+// Central install root: explicit override, else ~/.omne. The canonical deployed
+// artifacts and the single editable baseline.md live here.
+const centralRoot = process.env.OMNE_HOME || path.join(homeDir, '.omne');
+
+const central = {
+  root:     centralRoot,
+  hooksDir: path.join(centralRoot, 'hooks'),
+  hookJs:   path.join(centralRoot, 'hooks', 'baseline-recital.js'),
+  hookExe:  path.join(centralRoot, 'hooks', 'baseline-recital' + exeExt),
+  baseline: path.join(centralRoot, 'baseline.md'),
+};
+
+// Repo sources (the source of truth for what gets deployed).
+const repo = {
+  hookSourceJs:  path.join(repoRoot, 'scripts', 'baseline-recital.js'),
+  hookSourceZig: path.join(repoRoot, 'scripts', 'baseline-recital.zig'),
+  template:      path.join(repoRoot, 'assets', 'baseline.template.md'),
+  binDir:        path.join(repoRoot, 'bin'),
+  checksums:     path.join(repoRoot, 'bin', 'SHA256SUMS'),
+};
 
 // Map process.platform -> the platform key used in prebuilt binary filenames.
 // Returns null for anything we don't ship a prebuilt for.
@@ -69,28 +93,45 @@ function platformKey() {
   return null;
 }
 
-const paths = {
-  settings:        path.join(baseDir, 'settings.json'),
-  hooksDir:        path.join(baseDir, 'hooks'),
-  hookDeployedJs:  path.join(baseDir, 'hooks', 'baseline-recital.js'),
-  hookDeployedExe: path.join(baseDir, 'hooks', 'baseline-recital' + exeExt),
-  baseline:        path.join(baseDir, 'baseline.md'),
-  counters:        path.join(baseDir, '.baseline-counters.json'),
-  hookSourceJs:    path.join(repoRoot, 'scripts', 'baseline-recital.js'),
-  hookSourceZig:   path.join(repoRoot, 'scripts', 'baseline-recital.zig'),
-  template:        path.join(repoRoot, 'assets', 'baseline.template.md'),
-  binDir:          path.join(repoRoot, 'bin'),
-  checksums:       path.join(repoRoot, 'bin', 'SHA256SUMS'),
-};
-
 // Prebuilt binary filename in repo bin/ for a given platform key.
 function prebuiltBinaryName(key) {
   return key === 'windows-x64' ? 'baseline-recital-windows-x64.exe' : 'baseline-recital-linux-x64';
 }
 
-// Existing settings commands are parsed into argv before hook identity checks.
-// Exact deployed JS/native path matches refresh the entry across runtime
-// switches and let uninstall remove only our own hook.
+// --- agent registry --------------------------------------------------------
+
+// The set of agent harnesses we link into. Only Claude Code ships today; the
+// shape is a list so new harnesses can be added in exactly one place. Each
+// agent's configDir already honours its own env override.
+function agentRegistry() {
+  return [
+    {
+      name: 'claude-code',
+      configDir: process.env.CLAUDE_CONFIG_DIR || path.join(homeDir, '.claude'),
+    },
+  ];
+}
+
+// Derive every per-agent path from its config dir. baseline.md / hookJs / hookExe
+// are LINKS to the center; settings.json / counters are real per-agent files.
+function agentPaths(agent) {
+  const d = agent.configDir;
+  return {
+    name:     agent.name,
+    configDir: d,
+    settings: path.join(d, 'settings.json'),
+    counters: path.join(d, '.baseline-counters.json'),
+    baseline: path.join(d, 'baseline.md'),
+    hooksDir: path.join(d, 'hooks'),
+    hookJs:   path.join(d, 'hooks', 'baseline-recital.js'),
+    hookExe:  path.join(d, 'hooks', 'baseline-recital' + exeExt),
+  };
+}
+
+function allAgentPaths() {
+  return agentRegistry().map(agentPaths);
+}
+
 function fail(message, code) {
   console.error('[baseline] ' + message);
   process.exit(code || 1);
@@ -129,18 +170,42 @@ function readJson(file) {
   }
 }
 
-function settingsOrEmptyForWrite() {
-  const r = readJson(paths.settings);
+function settingsShapeError(settings) {
+  if (!settings) return null;
+  if (typeof settings !== 'object' || Array.isArray(settings)) return 'root must be an object';
+  if (settings.hooks == null) return null;
+  if (typeof settings.hooks !== 'object' || Array.isArray(settings.hooks)) return 'hooks must be an object';
+  const groups = settings.hooks.UserPromptSubmit;
+  if (groups == null) return null;
+  if (!Array.isArray(groups)) return 'hooks.UserPromptSubmit must be an array';
+  for (let i = 0; i < groups.length; i++) {
+    const hooks = groups[i] && groups[i].hooks;
+    if (hooks != null && !Array.isArray(hooks)) return 'hooks.UserPromptSubmit[' + i + '].hooks must be an array';
+  }
+  return null;
+}
+
+function settingsOrEmptyForWrite(ap) {
+  const r = readJson(ap.settings);
   if (!r.ok) {
     throw new Error('refusing to rewrite invalid settings.json: ' + r.error.message);
   }
-  return r.value || {};
+  const settings = r.value || {};
+  const shapeError = settingsShapeError(settings);
+  if (shapeError) {
+    throw new Error('refusing to rewrite invalid settings.json: ' + shapeError);
+  }
+  return settings;
 }
 
-function settingsForRead() {
-  const r = readJson(paths.settings);
+function settingsForRead(ap) {
+  const r = readJson(ap.settings);
   if (!r.ok) return { settings: {}, error: r.error };
-  return { settings: r.value || {}, error: null };
+  const settings = r.value || {};
+  const shapeError = settingsShapeError(settings);
+  return shapeError
+    ? { settings: {}, error: new Error(shapeError) }
+    : { settings, error: null };
 }
 
 function fileSize(file) {
@@ -148,17 +213,126 @@ function fileSize(file) {
   catch (e) { return 0; }
 }
 
-// --- command-string builders -----------------------------------------------
-
-// settings.json command that runs the deployed native binary: just its quoted path.
-function exeCommand() {
-  return quoteArg(paths.hookDeployedExe);
+function samePath(a, b) {
+  if (!a || !b) return false;
+  const aa = path.resolve(a);
+  const bb = path.resolve(b);
+  return isWin ? aa.toLowerCase() === bb.toLowerCase() : aa === bb;
 }
 
-// settings.json command that runs the deployed Node .js hook: this Node binary
+// --- link layer (cross-platform) -------------------------------------------
+
+// Remove a symlink, hardlink, or regular file at p. Refuses to remove a real
+// directory — we never recursively delete an operator's directory to plant a
+// link. Absent path is a no-op.
+function removeIfLinkOrFile(p) {
+  let st;
+  try { st = fs.lstatSync(p); }
+  catch (e) { return; } // absent
+  if (st.isDirectory() && !st.isSymbolicLink()) {
+    throw new Error('refusing to replace a real directory with a link: ' + p);
+  }
+  fs.unlinkSync(p);
+}
+
+// Create a link at linkPath pointing into the central `target`. Tries the
+// strongest mechanism the OS allows and reports which won:
+//   symlink  — normal on POSIX; on Windows needs Developer Mode / privilege.
+//   hardlink — same-volume fallback (Windows without privilege). Same inode, so
+//              editing the center is still reflected. Re-made every install
+//              because a central tmp+rename replaces the inode.
+//   copy     — last resort (e.g. cross-volume). Edits will NOT propagate; the
+//              caller surfaces this as a degraded mechanism.
+function linkInto(target, linkPath) {
+  fs.mkdirSync(path.dirname(linkPath), { recursive: true });
+  removeIfLinkOrFile(linkPath);
+  try {
+    fs.symlinkSync(target, linkPath, isWin ? 'file' : undefined);
+    return 'symlink';
+  } catch (e) { /* fall through */ }
+  try {
+    fs.linkSync(target, linkPath);
+    return 'hardlink';
+  } catch (e) { /* fall through */ }
+  copyBinary(target, linkPath);
+  if (!isWin && path.basename(target) === 'baseline-recital' + exeExt) {
+    try { fs.chmodSync(linkPath, 0o755); } catch (e) {}
+  }
+  return 'copy';
+}
+
+// Inspect linkPath relative to the central target. Returns { ok, mechanism }.
+// mechanism: 'symlink' | 'hardlink' | 'copy' (ok=true) or
+//            'missing' | 'broken' | 'wrong' | 'stale' (ok=false).
+function linkState(linkPath, target) {
+  let lst;
+  try { lst = fs.lstatSync(linkPath); }
+  catch (e) { return { ok: false, mechanism: 'missing' }; }
+
+  if (lst.isSymbolicLink()) {
+    let resolved;
+    try { resolved = fs.readlinkSync(linkPath); }
+    catch (e) { return { ok: false, mechanism: 'broken' }; }
+    const abs = path.isAbsolute(resolved) ? resolved : path.resolve(path.dirname(linkPath), resolved);
+    return samePath(abs, target) ? { ok: true, mechanism: 'symlink' } : { ok: false, mechanism: 'wrong' };
+  }
+
+  // Regular file: a hardlink shares dev+ino with the target; a copy is just
+  // byte-identical. Anything else is a stale/foreign file.
+  try {
+    const a = fs.statSync(linkPath);
+    const b = fs.statSync(target);
+    if (a.ino !== 0 && a.dev === b.dev && a.ino === b.ino) return { ok: true, mechanism: 'hardlink' };
+  } catch (e) { /* target may be missing */ }
+  try {
+    if (fs.readFileSync(linkPath).equals(fs.readFileSync(target))) return { ok: true, mechanism: 'copy' };
+  } catch (e) { /* unreadable */ }
+  return { ok: false, mechanism: 'stale' };
+}
+
+function describeLink(s) {
+  if (s.ok) return 'OK (' + s.mechanism + (s.mechanism === 'copy' ? ' — degraded, edits will not propagate' : '') + ')';
+  return s.mechanism.toUpperCase();
+}
+
+// Remove a per-agent link we created (symlink, or hardlink/copy of the central
+// target). Refuses to delete a real, divergent file. Returns true if removed.
+function removeOurLink(linkPath, target) {
+  let lst;
+  try { lst = fs.lstatSync(linkPath); }
+  catch (e) { return false; } // absent
+  if (lst.isSymbolicLink()) {
+    try { fs.unlinkSync(linkPath); return true; } catch (e) { return false; }
+  }
+  if (linkState(linkPath, target).ok) {
+    try { fs.unlinkSync(linkPath); return true; } catch (e) { return false; }
+  }
+  return false; // real, divergent file — leave it
+}
+
+// Link an agent's baseline.md to the center, but first preserve a real,
+// divergent file (operator edits we are not migrating) as a .bak so we never
+// silently destroy rules.
+function linkBaselineSafe(ap) {
+  let lst = null;
+  try { lst = fs.lstatSync(ap.baseline); } catch (e) {}
+  if (lst && !lst.isSymbolicLink() && lst.isFile() && !linkState(ap.baseline, central.baseline).ok) {
+    try { fs.copyFileSync(ap.baseline, ap.baseline + '.bak'); } catch (e) {}
+  }
+  return linkInto(central.baseline, ap.baseline);
+}
+
+// --- command-string builders -----------------------------------------------
+
+// settings.json command that runs an agent's native binary: just its quoted path.
+function exeCommand(ap) {
+  return quoteArg(ap.hookExe);
+}
+
+// settings.json command that runs the agent's Node .js hook: this Node binary
 // (process.execPath) + the deployed .js, each quoted independently.
-function jsCommand() {
-  return quoteArg(process.execPath) + ' ' + quoteArg(paths.hookDeployedJs);
+function jsCommand(ap) {
+  return quoteArg(process.execPath) + ' ' + quoteArg(ap.hookJs);
 }
 
 function parseCommandLine(command) {
@@ -192,34 +366,32 @@ function parseCommandLine(command) {
   return args.length ? args : null;
 }
 
-function samePath(a, b) {
-  if (!a || !b) return false;
-  const aa = path.resolve(a);
-  const bb = path.resolve(b);
-  return isWin ? aa.toLowerCase() === bb.toLowerCase() : aa === bb;
-}
-
-function commandInfo(command) {
+// Identify whether a settings command string is ours, for a given agent. An
+// exact match against that agent's deployed JS/native path makes it ours, so
+// uninstall removes only our entry and install refreshes across runtime switches.
+function commandInfo(command, ap) {
   const argv = parseCommandLine(command);
   if (!argv) return { runtime: 'unknown', argv: null, isOurs: false };
-  if (argv.length === 1 && samePath(argv[0], paths.hookDeployedExe)) {
+  if (argv.length === 1 && samePath(argv[0], ap.hookExe)) {
     return { runtime: 'native exe', argv, isOurs: true };
   }
-  if (argv.length >= 2 && samePath(argv[1], paths.hookDeployedJs)) {
+  if (argv.length >= 2 && samePath(argv[1], ap.hookJs)) {
     return { runtime: 'node js', argv, isOurs: true };
   }
   return { runtime: 'unknown', argv, isOurs: false };
 }
 
+function runtimeFromCommand(command, ap) {
+  return commandInfo(command, ap).runtime;
+}
+
 // --- settings.json surgery -------------------------------------------------
 
-// Find our hook entry within hooks.UserPromptSubmit, if present. The command is
-// parsed and matched against the deployed JS/native path.
-function findOurHook(settings) {
-  const groups = (settings.hooks && settings.hooks.UserPromptSubmit) || [];
+function findOurHook(settings, ap) {
+  const groups = (settings.hooks && Array.isArray(settings.hooks.UserPromptSubmit)) ? settings.hooks.UserPromptSubmit : [];
   for (const group of groups) {
-    for (const h of (group.hooks || [])) {
-      if (h && commandInfo(h.command).isOurs) {
+    for (const h of (Array.isArray(group.hooks) ? group.hooks : [])) {
+      if (h && commandInfo(h.command, ap).isOurs) {
         return h;
       }
     }
@@ -230,54 +402,45 @@ function findOurHook(settings) {
 // Ensure our hook is wired into hooks.UserPromptSubmit with the given command.
 // Refreshes command/timeout/statusMessage if already present; otherwise appends
 // to the first group's hooks (creating a group if none). Preserves co-residents.
-function wireSettings(command) {
-  const settings = settingsOrEmptyForWrite();
+function wireSettings(ap, command) {
+  const settings = settingsOrEmptyForWrite(ap);
   settings.hooks = settings.hooks || {};
   settings.hooks.UserPromptSubmit = settings.hooks.UserPromptSubmit || [];
 
-  const existing = findOurHook(settings);
+  const existing = findOurHook(settings, ap);
   if (existing) {
     existing.command = command;
     existing.timeout = 5;
     existing.statusMessage = 'Baseline check...';
-    atomicWrite(paths.settings, JSON.stringify(settings, null, 2) + '\n');
+    atomicWrite(ap.settings, JSON.stringify(settings, null, 2) + '\n');
     return 'refreshed';
   }
 
   const entry = { type: 'command', command: command, timeout: 5, statusMessage: 'Baseline check...' };
-  // Prefer the first existing group so we share it with any co-resident hook.
   if (settings.hooks.UserPromptSubmit.length && settings.hooks.UserPromptSubmit[0].hooks) {
     settings.hooks.UserPromptSubmit[0].hooks.push(entry);
   } else {
     settings.hooks.UserPromptSubmit.push({ hooks: [entry] });
   }
-  atomicWrite(paths.settings, JSON.stringify(settings, null, 2) + '\n');
+  atomicWrite(ap.settings, JSON.stringify(settings, null, 2) + '\n');
   return 'added';
 }
 
 // Remove our hook entry and drop any group left empty. Other hooks untouched.
-function unwireSettings() {
-  const r = readJson(paths.settings);
-  if (!r.ok) throw new Error('refusing to rewrite invalid settings.json: ' + r.error.message);
-  const settings = r.value;
+function unwireSettings(ap) {
+  const settings = settingsOrEmptyForWrite(ap);
   if (!settings || !settings.hooks || !settings.hooks.UserPromptSubmit) return 'absent';
   let removed = false;
   for (const group of settings.hooks.UserPromptSubmit) {
     if (!group.hooks) continue;
     const before = group.hooks.length;
-    group.hooks = group.hooks.filter(h => !(h && commandInfo(h.command).isOurs));
+    group.hooks = group.hooks.filter(h => !(h && commandInfo(h.command, ap).isOurs));
     if (group.hooks.length !== before) removed = true;
   }
   settings.hooks.UserPromptSubmit = settings.hooks.UserPromptSubmit.filter(g => g.hooks && g.hooks.length);
   if (!settings.hooks.UserPromptSubmit.length) delete settings.hooks.UserPromptSubmit;
-  atomicWrite(paths.settings, JSON.stringify(settings, null, 2) + '\n');
+  atomicWrite(ap.settings, JSON.stringify(settings, null, 2) + '\n');
   return removed ? 'removed' : 'absent';
-}
-
-// Infer which runtime a wired command string drives, for status/verify. A
-// reference to the native binary basename means native; otherwise node+js.
-function runtimeFromCommand(command) {
-  return commandInfo(command).runtime;
 }
 
 // --- native build (zig) ----------------------------------------------------
@@ -293,25 +456,25 @@ function findZig() {
   return null;
 }
 
-// Build the zig hook for the host target and deploy it to hookDeployedExe.
+// Build the zig hook for the host target and deploy it to the central exe.
 // Returns the deployed path on success, or null (with report.reason set) for any
 // failure. Never throws.
 function buildAndDeployExe(report) {
   report = report || {};
   let buildDir = null;
   try {
-    if (!fs.existsSync(paths.hookSourceZig)) { report.reason = 'zig source not in repo (scripts/baseline-recital.zig)'; return null; }
+    if (!fs.existsSync(repo.hookSourceZig)) { report.reason = 'zig source not in repo (scripts/baseline-recital.zig)'; return null; }
     const zig = findZig();
     if (!zig) { report.reason = 'zig 0.16.x not found on PATH'; return null; }
 
-    fs.mkdirSync(paths.hooksDir, { recursive: true });
+    fs.mkdirSync(central.hooksDir, { recursive: true });
 
     // Zig 0.16 reliably emits the named host binary into cwd. Build in a temp
-    // dir, then copy the single produced artifact into the Claude hooks dir.
+    // dir, then copy the single produced artifact into the central hooks dir.
     buildDir = fs.mkdtempSync(path.join(os.tmpdir(), 'baseline-recital-'));
     const built = path.join(buildDir, 'baseline-recital' + exeExt);
     const r = spawnSync(zig, [
-      'build-exe', '-O', 'ReleaseSmall', '--name', 'baseline-recital', paths.hookSourceZig
+      'build-exe', '-O', 'ReleaseSmall', '--name', 'baseline-recital', repo.hookSourceZig
     ], { cwd: buildDir, encoding: 'utf8' });
 
     if (r.status !== 0) {
@@ -328,13 +491,13 @@ function buildAndDeployExe(report) {
       return null;
     }
 
-    fs.copyFileSync(built, paths.hookDeployedExe);
+    copyBinary(built, central.hookExe);
     try { fs.rmSync(buildDir, { recursive: true, force: true }); } catch (e) {}
     buildDir = null;
 
-    if (!isWin) { try { fs.chmodSync(paths.hookDeployedExe, 0o755); } catch (e) {} }
-    report.size = fileSize(paths.hookDeployedExe);
-    return paths.hookDeployedExe;
+    if (!isWin) { try { fs.chmodSync(central.hookExe, 0o755); } catch (e) {} }
+    report.size = fileSize(central.hookExe);
+    return central.hookExe;
   } catch (e) {
     if (buildDir) { try { fs.rmSync(buildDir, { recursive: true, force: true }); } catch (_) {} }
     report.reason = 'build error: ' + e.message;
@@ -351,7 +514,7 @@ function sha256File(file) {
 function loadChecksums() {
   const out = {};
   try {
-    for (const raw of fs.readFileSync(paths.checksums, 'utf8').split(/\r?\n/)) {
+    for (const raw of fs.readFileSync(repo.checksums, 'utf8').split(/\r?\n/)) {
       const line = raw.trim();
       if (!line || line.startsWith('#')) continue;
       const m = /^([a-fA-F0-9]{64})\s+\*?(.+)$/.exec(line);
@@ -380,7 +543,7 @@ function verifyPrebuilt(src, name, report) {
   return true;
 }
 
-// Copy a platform-matched prebuilt binary from repo bin/ to hookDeployedExe.
+// Copy a platform-matched prebuilt binary from repo bin/ to the central exe.
 // Returns the deployed path on success, or null (report.reason set) on any miss.
 function deployPrebuiltExe(report) {
   report = report || {};
@@ -388,14 +551,14 @@ function deployPrebuiltExe(report) {
     const key = platformKey();
     if (!key) { report.reason = 'unsupported platform ' + process.platform; return null; }
     const name = prebuiltBinaryName(key);
-    const src = path.join(paths.binDir, name);
+    const src = path.join(repo.binDir, name);
     if (!fs.existsSync(src)) { report.reason = 'no prebuilt binary in bin/ for ' + key; return null; }
     if (!verifyPrebuilt(src, name, report)) return null;
 
-    copyBinary(src, paths.hookDeployedExe);
-    if (!isWin) { try { fs.chmodSync(paths.hookDeployedExe, 0o755); } catch (e) {} }
-    report.size = fileSize(paths.hookDeployedExe);
-    return paths.hookDeployedExe;
+    copyBinary(src, central.hookExe);
+    if (!isWin) { try { fs.chmodSync(central.hookExe, 0o755); } catch (e) {} }
+    report.size = fileSize(central.hookExe);
+    return central.hookExe;
   } catch (e) {
     report.reason = 'prebuilt deploy error: ' + e.message;
     return null;
@@ -443,11 +606,12 @@ function parseBaseline(raw) {
   return { interval, prefix, rules };
 }
 
+// Read the central baseline.md (the single source of truth all agents link to).
 function readBaselineRaw() {
   try {
-    const st = fs.statSync(paths.baseline);
+    const st = fs.statSync(central.baseline);
     if (st.size > MAX_BASELINE_BYTES) return null;
-    const raw = fs.readFileSync(paths.baseline, 'utf8');
+    const raw = fs.readFileSync(central.baseline, 'utf8');
     if (Buffer.byteLength(raw, 'utf8') > MAX_BASELINE_BYTES) return null;
     return raw;
   } catch (e) {
@@ -455,7 +619,6 @@ function readBaselineRaw() {
   }
 }
 
-// Read interval from baseline.md (default 5). Used by verify.
 function readInterval() {
   return parseBaseline(readBaselineRaw()).interval;
 }
@@ -463,7 +626,8 @@ function readInterval() {
 // --- commands --------------------------------------------------------------
 
 // Decide and obtain a native binary per the requested runtime, or signal js.
-// Returns { runtime: 'prebuilt'|'build'|'js', exePath, report }.
+// Returns { runtime: 'prebuilt'|'build'|'js', exePath, report }. The exe (if any)
+// is deployed to the central hooks dir.
 function resolveRuntime(requested) {
   const report = {};
 
@@ -487,77 +651,119 @@ function resolveRuntime(requested) {
   throw new Error('unknown runtime "' + requested + '"');
 }
 
-function cmdInstall(opts) {
-  // 1. ALWAYS deploy the .js (portable fallback + reference) — overwrite; repo wins.
-  atomicWrite(paths.hookDeployedJs, fs.readFileSync(paths.hookSourceJs, 'utf8'));
-
-  // 2. Seed baseline.md only if missing — never clobber edited rules.
-  let seeded = false;
-  if (!fs.existsSync(paths.baseline)) {
-    atomicWrite(paths.baseline, fs.readFileSync(paths.template, 'utf8'));
-    seeded = true;
+// Establish the central baseline.md content exactly once. Precedence:
+//   1. central already has a real baseline.md -> keep it (never clobber).
+//   2. an agent has a real (non-link) baseline.md -> MIGRATE it (move to center).
+//   3. otherwise seed from the repo template.
+// Returns 'kept' | 'migrated' | 'seeded'.
+function ensureCentralBaseline(agentsP) {
+  if (fs.existsSync(central.baseline)) return 'kept';
+  for (const ap of agentsP) {
+    let st;
+    try { st = fs.lstatSync(ap.baseline); }
+    catch (e) { continue; }
+    if (st.isSymbolicLink() || !st.isFile()) continue; // a link/non-file is not migratable rules
+    const raw = fs.readFileSync(ap.baseline);
+    fs.mkdirSync(path.dirname(central.baseline), { recursive: true });
+    const tmp = central.baseline + '.tmp';
+    fs.writeFileSync(tmp, raw);
+    fs.renameSync(tmp, central.baseline);
+    fs.unlinkSync(ap.baseline); // its place is taken by a link in the per-agent loop
+    return 'migrated';
   }
+  copyBinary(repo.template, central.baseline);
+  return 'seeded';
+}
 
-  // 3. Resolve the runtime and obtain a native binary if applicable.
+function cmdInstall(opts) {
+  const agentsP = allAgentPaths();
+
+  // 1. Refuse before any deploy/migration if an agent settings file is invalid.
+  for (const ap of agentsP) settingsOrEmptyForWrite(ap);
+
+  // 2. ALWAYS deploy the canonical .js to the CENTER (overwrite; repo wins).
+  fs.mkdirSync(central.hooksDir, { recursive: true });
+  atomicWrite(central.hookJs, fs.readFileSync(repo.hookSourceJs, 'utf8'));
+
+  // 3. Establish the single central baseline.md (seed/migrate/keep).
+  const baselineState = ensureCentralBaseline(agentsP);
+
+  // 4. Resolve the runtime; a native runtime deploys the exe into the center.
   const { runtime, exePath, report } = resolveRuntime(opts.runtime);
-  const command = exePath ? exeCommand() : jsCommand();
+  const native = !!exePath;
 
-  // 4. Wire settings.json with the chosen command.
-  const wired = wireSettings(command);
+  // 5. For each agent: link the center in, then wire settings to the agent's
+  //    own (linked) hook path so CLAUDE_CONFIG_DIR-relative resolution holds.
+  const perAgent = [];
+  for (const ap of agentsP) {
+    const jsMech = linkInto(central.hookJs, ap.hookJs);
+    let exeMech = null;
+    if (native) {
+      exeMech = linkInto(central.hookExe, ap.hookExe);
+    } else {
+      removeIfLinkOrFile(ap.hookExe); // drop a stale native link on a js install
+    }
+    const baseMech = linkBaselineSafe(ap);
+    const command = native ? exeCommand(ap) : jsCommand(ap);
+    const wired = wireSettings(ap, command);
+    perAgent.push({ name: ap.name, configDir: ap.configDir, jsMech, exeMech, baseMech, wired });
+  }
 
   console.log('[baseline] install complete');
-  if (exePath) {
+  console.log('  central     : ' + central.root);
+  if (native) {
     const label = runtime === 'prebuilt' ? 'prebuilt native binary' : 'native binary (built locally with zig)';
     console.log('  runtime     : ' + label + ' (fast start)');
-    console.log('  hook binary : ' + paths.hookDeployedExe + ' (' + (report.size || fileSize(paths.hookDeployedExe)) + ' bytes, wired)');
-    console.log('  hook .js    : ' + paths.hookDeployedJs + ' (also deployed, as fallback/reference)');
+    console.log('  hook binary : ' + central.hookExe + ' (' + (report.size || fileSize(central.hookExe)) + ' bytes)');
   } else {
     console.log('  runtime     : node js' + (report.reason ? ' (' + report.reason + ')' : ''));
-    console.log('  hook .js    : ' + paths.hookDeployedJs + ' (deployed, wired)');
   }
-  console.log('  baseline.md : ' + paths.baseline + (seeded ? ' (seeded from template)' : ' (kept existing — not overwritten)'));
-  console.log('  settings    : UserPromptSubmit hook ' + wired);
+  console.log('  hook .js    : ' + central.hookJs);
+  console.log('  baseline.md : ' + central.baseline + ' (' + baselineState + ')');
+  for (const a of perAgent) {
+    const bits = ['baseline.md=' + a.baseMech, 'hook.js=' + a.jsMech];
+    if (a.exeMech) bits.push('exe=' + a.exeMech);
+    console.log('  agent ' + a.name + ' : settings ' + a.wired + '; links ' + bits.join(', ') + ' @ ' + a.configDir);
+  }
   console.log('  next step   : open /hooks once (or restart) so Claude Code reloads settings.');
 }
 
 function cmdUninstall() {
-  let wired;
-  try {
-    wired = unwireSettings();
-  } catch (e) {
-    fail('uninstall: ' + e.message, 1);
-  }
-  let jsGone = false, exeGone = false;
-  try { fs.unlinkSync(paths.hookDeployedJs); jsGone = true; } catch (e) {}
-  try { fs.unlinkSync(paths.hookDeployedExe); exeGone = true; } catch (e) {}
+  const agentsP = allAgentPaths();
   console.log('[baseline] uninstall');
-  console.log('  settings    : ' + wired);
-  console.log('  hook .js    : ' + (jsGone ? 'deleted' : 'absent'));
-  console.log('  hook binary : ' + (exeGone ? 'deleted' : 'absent'));
-  console.log('  baseline.md : KEPT at ' + paths.baseline + ' (delete by hand if you want it gone)');
+  for (const ap of agentsP) {
+    let wired;
+    try { wired = unwireSettings(ap); }
+    catch (e) { fail('uninstall: ' + e.message, 1); }
+    const jsGone = removeOurLink(ap.hookJs, central.hookJs);
+    const exeGone = removeOurLink(ap.hookExe, central.hookExe);
+    const baseGone = removeOurLink(ap.baseline, central.baseline);
+    console.log('  agent ' + ap.name + ' @ ' + ap.configDir);
+    console.log('    settings    : ' + wired);
+    console.log('    hook .js    : ' + (jsGone ? 'unlinked' : 'absent'));
+    console.log('    hook binary : ' + (exeGone ? 'unlinked' : 'absent'));
+    console.log('    baseline.md : ' + (baseGone ? 'unlinked (central kept)' : 'left as-is'));
+  }
+  console.log('  central baseline.md : KEPT at ' + central.baseline + ' (delete by hand if you want it gone)');
 }
 
 function cmdStatus() {
-  const { settings, error } = settingsForRead();
-  const ourHook = findOurHook(settings);
-  const wired = !!ourHook;
-  const wiredRuntime = ourHook ? runtimeFromCommand(ourHook.command) : 'none';
+  const agentsP = allAgentPaths();
 
-  const jsExists = fs.existsSync(paths.hookDeployedJs);
+  const jsExists = fs.existsSync(central.hookJs);
   let inSync = false;
   if (jsExists) {
-    try {
-      inSync = fs.readFileSync(paths.hookDeployedJs, 'utf8') === fs.readFileSync(paths.hookSourceJs, 'utf8');
-    } catch (e) {}
+    try { inSync = fs.readFileSync(central.hookJs, 'utf8') === fs.readFileSync(repo.hookSourceJs, 'utf8'); }
+    catch (e) {}
   }
-  const exeExists = fs.existsSync(paths.hookDeployedExe);
-  const exeSize = exeExists ? fileSize(paths.hookDeployedExe) : 0;
+  const exeExists = fs.existsSync(central.hookExe);
+  const exeSize = exeExists ? fileSize(central.hookExe) : 0;
   let exeSync = 'not present';
   if (exeExists) {
     try {
       const key = platformKey();
       const expected = key ? expectedPrebuiltHash(prebuiltBinaryName(key)) : null;
-      const actual = sha256File(paths.hookDeployedExe);
+      const actual = sha256File(central.hookExe);
       exeSync = expected
         ? (actual === expected ? 'sha256 matches checked-in prebuilt' : 'sha256 DIFFERS from checked-in prebuilt')
         : 'sha256 ' + actual + ' (no checked-in prebuilt for this platform)';
@@ -565,17 +771,30 @@ function cmdStatus() {
       exeSync = 'present, sha256 unavailable: ' + e.message;
     }
   }
-  const baselineExists = fs.existsSync(paths.baseline);
+  const baselineExists = fs.existsSync(central.baseline);
 
   console.log('[baseline] status');
-  console.log('  config dir     : ' + baseDir);
-  if (error) console.log('  settings       : INVALID JSON (' + error.message + ')');
-  console.log('  settings wired : ' + (wired ? 'yes (runtime: ' + wiredRuntime + ')' : 'no'));
-  console.log('  hook binary    : ' + (exeExists ? 'present (' + exeSize + ' bytes; ' + exeSync + ')' : 'not present'));
+  console.log('  central root   : ' + central.root);
   console.log('  hook .js       : ' + (jsExists
     ? 'present' + (inSync ? ' (byte-identical to repo source)' : ' (DIFFERS from repo source — run install to refresh)')
     : 'not present'));
+  console.log('  hook binary    : ' + (exeExists ? 'present (' + exeSize + ' bytes; ' + exeSync + ')' : 'not present'));
   console.log('  baseline.md    : ' + (baselineExists ? 'present' : 'missing (install will seed it)'));
+
+  for (const ap of agentsP) {
+    const { settings, error } = settingsForRead(ap);
+    const ourHook = error ? null : findOurHook(settings, ap);
+    const wired = !!ourHook;
+    const wiredRuntime = ourHook ? runtimeFromCommand(ourHook.command, ap) : 'none';
+    console.log('  agent ' + ap.name + ' @ ' + ap.configDir);
+    if (error) console.log('    settings     : INVALID settings.json (' + error.message + ')');
+    console.log('    settings     : ' + (wired ? 'wired (runtime: ' + wiredRuntime + ')' : 'not wired'));
+    console.log('    hook .js     : ' + describeLink(linkState(ap.hookJs, central.hookJs)));
+    console.log('    baseline.md  : ' + describeLink(linkState(ap.baseline, central.baseline)));
+    if (wiredRuntime === 'native exe') {
+      console.log('    hook binary  : ' + describeLink(linkState(ap.hookExe, central.hookExe)));
+    }
+  }
 
   if (baselineExists) {
     const { interval, prefix, rules } = parseBaseline(readBaselineRaw());
@@ -586,24 +805,23 @@ function cmdStatus() {
   }
 }
 
-// Functional check — drive the ACTUALLY-WIRED runtime with synthetic stdin for
-// `interval` prompts and confirm it stays silent until the Nth, then fires with
-// additionalContext. Cleans the synthetic counter afterwards. Spawns with an
-// args array (no shell) so it is cross-platform.
+// Functional check — drive the ACTUALLY-WIRED runtime (of the first agent) with
+// synthetic stdin for `interval` prompts and confirm it stays silent until the
+// Nth, then fires with additionalContext. Cleans the synthetic counter after.
 function cmdVerify() {
-  const sr = settingsForRead();
+  const ap = allAgentPaths()[0];
+  const sr = settingsForRead(ap);
   if (sr.error) {
     console.log('[baseline] verify: FAIL — invalid settings.json: ' + sr.error.message);
     process.exit(1);
   }
-  const settings = sr.settings;
-  const ourHook = findOurHook(settings);
+  const ourHook = findOurHook(sr.settings, ap);
   if (!ourHook) {
     console.log('[baseline] verify: FAIL — no baseline hook wired in settings. Run install.');
     process.exit(1);
   }
 
-  const info = commandInfo(ourHook.command);
+  const info = commandInfo(ourHook.command, ap);
   const wiredRuntime = info.runtime;
   if (!info.argv) {
     console.log('[baseline] verify: FAIL — cannot parse wired command.');
@@ -631,10 +849,10 @@ function cmdVerify() {
 
   // Clean our synthetic counter entry so verify never pollutes real session state.
   try {
-    const cr = readJson(paths.counters);
+    const cr = readJson(ap.counters);
     if (cr.ok && cr.value && typeof cr.value === 'object') {
       delete cr.value[sid];
-      atomicWrite(paths.counters, JSON.stringify(cr.value));
+      atomicWrite(ap.counters, JSON.stringify(cr.value));
     }
   } catch (e) {}
 
@@ -649,14 +867,15 @@ function cmdVerify() {
   if (!ok) process.exit(1);
 }
 
-// Re-deploy the hook + re-wire settings from the CURRENT repo source, keeping
-// the runtime already in use (or --runtime <x> if given). Refreshes a stale
-// deployed .js/binary after the repo files change. git pull is left to the
-// wrapper script; this only redeploys what is on disk now.
+// Re-deploy the central hook + re-wire settings from the CURRENT repo source,
+// keeping the runtime already in use (or --runtime <x> if given). Refreshes a
+// stale central .js/binary and re-points the per-agent links. git pull is left
+// to the wrapper script; this only redeploys what is on disk now.
 function cmdUpdate(opts) {
-  const { settings } = settingsForRead();
-  const ourHook = findOurHook(settings);
-  const wiredRuntime = ourHook ? runtimeFromCommand(ourHook.command) : 'none';
+  const ap0 = allAgentPaths()[0];
+  const { settings } = settingsForRead(ap0);
+  const ourHook = findOurHook(settings, ap0);
+  const wiredRuntime = ourHook ? runtimeFromCommand(ourHook.command, ap0) : 'none';
 
   // A native install redeploys via the verified prebuilt; everything else is js.
   const runtime = opts.runtime || (wiredRuntime === 'native exe' ? 'prebuilt' : 'js');
@@ -666,10 +885,6 @@ function cmdUpdate(opts) {
   try {
     cmdInstall({ runtime });
   } catch (e) {
-    // Native redeploy can fail on a host without the prebuilt/zig — fall back to
-    // the always-available js runtime rather than leaving the user broken. Only
-    // a runtime-resolution failure is recoverable this way; rethrow anything else
-    // (e.g. invalid settings, write errors) so it is not masked as "unavailable".
     if (runtime !== 'js' && /runtime unavailable/i.test(e.message)) {
       console.log('[baseline] update: ' + runtime + ' runtime unavailable (' + e.message + '); falling back to js.');
       console.log('');
@@ -685,59 +900,74 @@ function cmdUpdate(opts) {
 // repair it. Shared by `doctor` (report) and `doctor --fix` (repair + recheck).
 function doctorChecks() {
   const checks = [];
-  const sr = settingsForRead();
-  const settings = sr.settings;
 
-  if (sr.error) {
-    checks.push({ name: 'settings.json', level: 'fail', detail: 'INVALID JSON (' + sr.error.message + ') — fix by hand; install refuses to rewrite it', fixable: false });
-  } else {
-    checks.push({ name: 'settings.json', level: 'ok', detail: 'valid JSON' });
-  }
-
-  const ourHook = sr.error ? null : findOurHook(settings);
-  if (ourHook) {
-    checks.push({ name: 'settings wiring', level: 'ok', detail: 'hook wired (runtime: ' + runtimeFromCommand(ourHook.command) + ')' });
-  } else {
-    checks.push({ name: 'settings wiring', level: sr.error ? 'warn' : 'fail', detail: sr.error ? 'cannot check (invalid settings)' : 'baseline hook NOT wired', fixable: !sr.error });
-  }
-
-  const jsExists = fs.existsSync(paths.hookDeployedJs);
+  // Central source-of-truth checks.
+  const jsExists = fs.existsSync(central.hookJs);
   if (!jsExists) {
-    checks.push({ name: 'hook .js', level: 'fail', detail: 'not deployed at ' + paths.hookDeployedJs, fixable: true });
+    checks.push({ name: 'central hook .js', level: 'fail', detail: 'not deployed at ' + central.hookJs, fixable: true });
   } else {
     let inSync = false;
-    try { inSync = fs.readFileSync(paths.hookDeployedJs, 'utf8') === fs.readFileSync(paths.hookSourceJs, 'utf8'); } catch (e) {}
+    try { inSync = fs.readFileSync(central.hookJs, 'utf8') === fs.readFileSync(repo.hookSourceJs, 'utf8'); } catch (e) {}
     checks.push(inSync
-      ? { name: 'hook .js', level: 'ok', detail: 'byte-identical to repo source' }
-      : { name: 'hook .js', level: 'warn', detail: 'DIFFERS from repo source (stale — update will refresh)', fixable: true });
+      ? { name: 'central hook .js', level: 'ok', detail: 'byte-identical to repo source' }
+      : { name: 'central hook .js', level: 'warn', detail: 'DIFFERS from repo source (stale — update will refresh)', fixable: true });
   }
 
-  // The binary only matters when settings are wired to it. On a js install any
-  // deployed exe is unused, so it is never a problem update needs to fix.
-  const exeExists = fs.existsSync(paths.hookDeployedExe);
-  const wiredNative = ourHook && runtimeFromCommand(ourHook.command) === 'native exe';
-  if (!wiredNative) {
-    checks.push({ name: 'hook binary', level: 'ok', detail: exeExists ? 'present but unused (js runtime)' : 'not present (js runtime — expected)' });
-  } else if (!exeExists) {
-    checks.push({ name: 'hook binary', level: 'fail', detail: 'settings wired to native exe but binary is MISSING', fixable: true });
-  } else {
-    const key = platformKey();
-    const expected = key ? expectedPrebuiltHash(prebuiltBinaryName(key)) : null;
-    let actual = null;
-    try { actual = sha256File(paths.hookDeployedExe); } catch (e) {}
-    if (expected && actual === expected) {
-      checks.push({ name: 'hook binary', level: 'ok', detail: 'sha256 matches checked-in prebuilt' });
-    } else if (expected) {
-      checks.push({ name: 'hook binary', level: 'warn', detail: 'sha256 DIFFERS from checked-in prebuilt (update will refresh)', fixable: true });
+  const baselineExists = fs.existsSync(central.baseline);
+  checks.push(baselineExists
+    ? { name: 'central baseline.md', level: 'ok', detail: 'present at ' + central.baseline }
+    : { name: 'central baseline.md', level: 'warn', detail: 'missing (install will seed from template)', fixable: true });
+
+  // Per-agent checks.
+  for (const ap of allAgentPaths()) {
+    const sr = settingsForRead(ap);
+    if (sr.error) {
+      checks.push({ name: 'settings.json', level: 'fail', detail: 'invalid settings.json (' + sr.error.message + ') — fix by hand; install refuses to rewrite it', fixable: false });
     } else {
-      checks.push({ name: 'hook binary', level: 'warn', detail: 'present, cannot verify (no checked-in prebuilt for this platform)', fixable: false });
+      checks.push({ name: 'settings.json', level: 'ok', detail: 'valid JSON' });
+    }
+
+    const ourHook = sr.error ? null : findOurHook(sr.settings, ap);
+    if (ourHook) {
+      checks.push({ name: 'settings wiring', level: 'ok', detail: 'hook wired (runtime: ' + runtimeFromCommand(ourHook.command, ap) + ')' });
+    } else {
+      checks.push({ name: 'settings wiring', level: sr.error ? 'warn' : 'fail', detail: sr.error ? 'cannot check (invalid settings)' : 'baseline hook NOT wired', fixable: !sr.error });
+    }
+
+    const js = linkState(ap.hookJs, central.hookJs);
+    if (js.ok && js.mechanism !== 'copy') {
+      checks.push({ name: 'hook .js', level: 'ok', detail: 'linked to center (' + js.mechanism + ')' });
+    } else if (js.ok) {
+      checks.push({ name: 'hook .js', level: 'warn', detail: 'degraded copy (edits will not propagate; install will relink)', fixable: true });
+    } else {
+      checks.push({ name: 'hook .js', level: 'fail', detail: js.mechanism + ' — not linked to ' + central.hookJs, fixable: true });
+    }
+
+    const base = linkState(ap.baseline, central.baseline);
+    if (base.ok && base.mechanism !== 'copy') {
+      checks.push({ name: 'baseline.md', level: 'ok', detail: 'linked to center (' + base.mechanism + ')' });
+    } else if (base.ok) {
+      checks.push({ name: 'baseline.md', level: 'warn', detail: 'degraded copy (edits will not propagate; install will relink)', fixable: true });
+    } else if (!baselineExists) {
+      checks.push({ name: 'baseline.md', level: 'warn', detail: 'central baseline missing — install will seed + link', fixable: true });
+    } else {
+      checks.push({ name: 'baseline.md', level: 'fail', detail: base.mechanism + ' — not linked to ' + central.baseline, fixable: true });
+    }
+
+    const wiredNative = ourHook && runtimeFromCommand(ourHook.command, ap) === 'native exe';
+    if (wiredNative) {
+      const exe = linkState(ap.hookExe, central.hookExe);
+      if (exe.ok && exe.mechanism !== 'copy') {
+        checks.push({ name: 'hook binary', level: 'ok', detail: 'linked to center (' + exe.mechanism + ')' });
+      } else if (exe.ok) {
+        checks.push({ name: 'hook binary', level: 'warn', detail: 'degraded copy (install will relink)', fixable: true });
+      } else {
+        checks.push({ name: 'hook binary', level: 'fail', detail: 'settings wired to native exe but link is ' + exe.mechanism, fixable: true });
+      }
+    } else {
+      checks.push({ name: 'hook binary', level: 'ok', detail: 'not used (js runtime)' });
     }
   }
-
-  const baselineExists = fs.existsSync(paths.baseline);
-  checks.push(baselineExists
-    ? { name: 'baseline.md', level: 'ok', detail: 'present at ' + paths.baseline }
-    : { name: 'baseline.md', level: 'warn', detail: 'missing (install will seed from template)', fixable: true });
 
   return checks;
 }
@@ -751,7 +981,7 @@ function printDoctorChecks(checks) {
 
 function cmdDoctor(opts) {
   console.log('[baseline] doctor — scanning installation');
-  console.log('  config dir : ' + baseDir);
+  console.log('  central root : ' + central.root);
   console.log('');
   let checks = doctorChecks();
   printDoctorChecks(checks);
@@ -773,8 +1003,7 @@ function cmdDoctor(opts) {
   }
 
   // --fix: re-deploy from repo, preserving the wired runtime, then re-scan.
-  // Refuse to touch anything while settings.json is invalid — a repair pass
-  // would mutate hook/baseline files but still fail at the broken settings.
+  // Refuse to touch anything while settings.json is invalid.
   if (checks.some(c => c.name === 'settings.json' && c.level === 'fail')) {
     console.log('');
     console.log('[baseline] doctor: settings.json is invalid JSON — fix it by hand first, then rerun --fix. Nothing was changed.');
@@ -814,11 +1043,11 @@ function printHelp() {
   console.log('');
   console.log('Usage:');
   console.log('  node scripts/manage.js status      Report what is installed vs the repo source.');
-  console.log('  node scripts/manage.js install     Deploy the hook, seed baseline.md, wire settings.json.');
+  console.log('  node scripts/manage.js install     Deploy the hook centrally, seed baseline.md, link agents, wire settings.json.');
   console.log('  node scripts/manage.js verify      Functionally test the wired hook (fires on turn N?).');
   console.log('  node scripts/manage.js update      Redeploy hook + settings from the repo, keeping the wired runtime.');
   console.log('  node scripts/manage.js doctor      Scan the installation and report health. --fix repairs it.');
-  console.log('  node scripts/manage.js uninstall   Remove the settings wiring + deployed hook (keeps baseline.md).');
+  console.log('  node scripts/manage.js uninstall   Remove the settings wiring + per-agent links (keeps central baseline.md).');
   console.log('  node scripts/manage.js help        Show this help.');
   console.log('');
   console.log('install options:');
@@ -830,7 +1059,8 @@ function printHelp() {
   console.log('  (default)                       Use the canonical Node .js hook.');
   console.log('                                  Native options are opt-in and fail if unavailable.');
   console.log('');
-  console.log('Config dir: CLAUDE_CONFIG_DIR if set, otherwise ~/.claude.');
+  console.log('Central install root: OMNE_HOME if set, otherwise ~/.omne.');
+  console.log('Agent config dir: CLAUDE_CONFIG_DIR if set, otherwise ~/.claude.');
 }
 
 // Parse install flags from argv (everything after the subcommand). cmd names the
@@ -881,7 +1111,11 @@ switch (cmd) {
     }
     break;
   case 'uninstall':
-    cmdUninstall();
+    try {
+      cmdUninstall();
+    } catch (e) {
+      fail('uninstall: ' + e.message, 1);
+    }
     break;
   case 'status':
     cmdStatus();
