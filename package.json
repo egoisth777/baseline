@@ -1,0 +1,15 @@
+{
+  "name": "baseline-recital",
+  "version": "1.0.0",
+  "private": true,
+  "description": "baseline-recital UserPromptSubmit hook + cross-platform manager (TypeScript source compiled to scripts/).",
+  "license": "MIT",
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "test": "tsc -p tsconfig.json && node scripts/test.js"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.2",
+    "typescript": "^5.7.2"
+  }
+}

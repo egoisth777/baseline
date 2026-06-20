@@ -30,12 +30,12 @@ mkdir -p bin
 
 echo "Building Windows x64 binary..."
 rm -f baseline-recital.exe
-zig build-exe -O ReleaseSmall -target x86_64-windows-gnu --name baseline-recital scripts/baseline-recital.zig
+zig build-exe -O ReleaseSmall -target x86_64-windows-gnu --name baseline-recital src/baseline-recital.zig
 mv baseline-recital.exe bin/baseline-recital-windows-x64.exe
 
 echo "Building Linux x64 binary..."
 rm -f baseline-recital
-zig build-exe -O ReleaseSmall -target x86_64-linux-gnu --name baseline-recital scripts/baseline-recital.zig
+zig build-exe -O ReleaseSmall -target x86_64-linux-gnu --name baseline-recital src/baseline-recital.zig
 mv baseline-recital bin/baseline-recital-linux-x64
 
 # Drop the debug/object leftovers Zig emits next to the binaries.

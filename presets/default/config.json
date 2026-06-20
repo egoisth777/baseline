@@ -1,0 +1,7 @@
+{
+  "version": 1,
+  "routes": [
+    { "id": "baseline", "event": "UserPromptSubmit", "freq": 5, "doc": "docs/baseline.md" },
+    { "id": "compact-resume", "event": "SessionStart", "matcher": "compact", "freq": 1, "doc": "docs/compact-resume.md" }
+  ]
+}

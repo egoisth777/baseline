@@ -23,13 +23,13 @@ if (-not (Test-Path "bin")) {
 
 Write-Host "Building Windows x64 binary..."
 Remove-Item -LiteralPath "baseline-recital.exe" -Force -ErrorAction SilentlyContinue
-& zig build-exe -O ReleaseSmall -target x86_64-windows-gnu --name baseline-recital scripts/baseline-recital.zig
+& zig build-exe -O ReleaseSmall -target x86_64-windows-gnu --name baseline-recital src/baseline-recital.zig
 if ($LASTEXITCODE -ne 0) { throw "Windows build failed (zig exited $LASTEXITCODE)." }
 Move-Item -LiteralPath "baseline-recital.exe" -Destination "bin\baseline-recital-windows-x64.exe" -Force
 
 Write-Host "Building Linux x64 binary..."
 Remove-Item -LiteralPath "baseline-recital" -Force -ErrorAction SilentlyContinue
-& zig build-exe -O ReleaseSmall -target x86_64-linux-gnu --name baseline-recital scripts/baseline-recital.zig
+& zig build-exe -O ReleaseSmall -target x86_64-linux-gnu --name baseline-recital src/baseline-recital.zig
 if ($LASTEXITCODE -ne 0) { throw "Linux build failed (zig exited $LASTEXITCODE)." }
 Move-Item -LiteralPath "baseline-recital" -Destination "bin\baseline-recital-linux-x64" -Force
 

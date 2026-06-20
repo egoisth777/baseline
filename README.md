@@ -9,35 +9,33 @@
   <a href="resources/logo.txt">plain text logo</a>
 </p>
 
-A drift-correction system for [Claude Code](https://claude.com/claude-code). Over a long session the agent forgets standing rules (e.g. "route file operations through subagents, don't do them inline"). This installs a hook that periodically forces the agent to recite a small baseline of standing rules before continuing. Reciting both re-aligns the agent (generating the rule primes the next action) and exposes drift (you see in the recital whether it got the rules right).
+A drift-correction system for [Claude Code](https://claude.com/claude-code). Over a long session the agent forgets standing rules (e.g. "route file operations through subagents, don't do them inline"). baseline periodically injects small, trusted text into the model's context at chosen hook events — most often a **recital**: every Nth user prompt the agent must open its reply with a fixed prefix line and restate the rules verbatim before continuing. Reciting both re-aligns the agent (generating the rule primes the next action) and exposes drift (you see in the recital whether it got the rules right).
 
 Inspired by the Blade Runner 2049 baseline test.
 
 ## What it is
 
-Claude Code sessions can run for hundreds of turns across hours of work. As context fills, the agent drifts from instructions you gave it — especially behavioral rules like "delegate file operations to subagents" or "always update the task tracker after changes." This package installs a `UserPromptSubmit` hook that, every Nth user prompt, injects a baseline recital: the agent must open its reply with a fixed prefix line and restate each rule verbatim before continuing.
+baseline generalizes "recite the rules every N prompts" into **user-configurable injection routes**. A route binds a trusted **doc** (the verbatim text to inject) to a hook **event**, on its own **frequency**, optionally scoped to a session phase, a tool, or a working directory. You can run the classic recital every 5 prompts, drop compact-resume instructions on session resume, or remind the agent before certain tool calls — each independently.
 
-The recital keeps the agent aligned. The rules are pithy, one per line, and live in a single editable file. You tune them, the interval, and the prefix line in that file; changes apply on the next prompt with no reinstall. Because this file is injected into future model context, treat it as trusted configuration.
+Two things are kept strictly separate:
 
-This package targets Claude Code. The engine is designed so adapters for other agent harnesses could be added later, but none ship today.
+- **Docs** (`docs/*.md`) hold *what* is injected — the exact text, verbatim. No wrapper is added by code, so any "open with this line, restate verbatim" scaffolding lives inside the doc.
+- **`config.json`** holds *when/where* — routing only: which doc fires at which event, how often, and under what scope. It carries no injected text.
+
+This package targets Claude Code. The engine is shaped so adapters for other harnesses could be added later, but none ship today.
 
 ## How it works
 
-A small hook program runs on every prompt submit. It reads `session_id` from the JSON the harness passes on stdin, keeps a per-session turn counter in `~/.claude/.baseline-counters.json`, and on every Nth turn prints a JSON object whose `additionalContext` field Claude Code injects into the model's context as a system reminder. The agent sees the recital text and is prompted to open its reply with the prefix line followed by the rules.
+One small **dispatcher** runs on each wired hook event. It reads the event JSON the harness passes on stdin, loads `cfg/baseline/config.json`, selects the routes matching the `(event, matcher, cwd)`, bumps each route's own per-session counter, and on a route's Nth match prints a JSON object whose `additionalContext` field Claude Code injects into the model's context as a system reminder. The dispatcher carries **zero baked content**: if the config or docs are gone it injects nothing and exits clean, and `doctor` reports the fault.
 
-All tunable parameters (the rules, interval, and prefix) live in the central
-`~/.omne/baseline.md` file. Each agent config links its local `baseline.md` to
-that central file. With a symlink or hardlink, the hook reads central edits live
-on every fire; with a plain-copy fallback, rerun `install` or `update` after
-editing.
+Supported injecting events: `UserPromptSubmit`, `SessionStart` (lifecycle phase matcher), `PreToolUse` / `PostToolUse` (tool-name regex matcher).
 
 ## Requirements
 
 - **Claude Code** — the CLI agent harness
-- **Node.js** — used by the installer/manager and the default hook runtime
-- **Zig 0.16.x** (optional) — only if you want to compile the native hook yourself
+- **Node.js** — runs the installer/manager and the dispatcher
 
-**Platforms:** The default JS runtime works anywhere Claude Code and Node.js work. Prebuilt native binaries ship for Windows x64 and Linux x64 only.
+**Platforms:** the dispatcher is Node-only and works anywhere Claude Code and Node.js work. A native Zig port is paused for this feature (see `docs/adr/0001-node-canonical-zig-optional.md`) and will be a fast-follow.
 
 ## Install
 
@@ -53,138 +51,80 @@ Run the installer for your platform:
 bash install.sh
 ```
 
-Both scripts delegate to `node scripts/manage.js install`, which:
-1. Deploys the canonical hook + the single editable `baseline.md` to a **central
-   store**, `~/.omne` (JS runtime by default)
-2. **Links** each agent's config dir back into the center —
-   `~/.claude/hooks/baseline-recital.js` → `~/.omne/hooks/baseline-recital.js`
-   and `~/.claude/baseline.md` → `~/.omne/baseline.md`
-3. Wires the hook into `~/.claude/settings.json` under `UserPromptSubmit`
+Both delegate to `node scripts/manage.js install`, which:
+1. Deploys the canonical dispatcher to a **central store**, `~/.omne/hooks/baseline-recital.js`.
+2. Seeds the editable **config folder** `~/.omne/cfg/baseline/` (`config.json` + `docs/`) from a repo **preset** — `minimal` by default (`--preset default` for the author's curated baseline).
+3. **Links** each agent's config dir back into the center — `~/.claude/hooks/baseline-recital.js` → central dispatcher, and `~/.claude/cfg/baseline/` → central config folder.
+4. Wires `~/.claude/settings.json` for **exactly** the events the config's routes use, and unwires events no route references.
 
-When `status` reports a symlink or hardlink, editing the central
-`~/.omne/baseline.md` changes the live rules for wired agents at once. If the
-link layer had to fall back to a plain copy, rerun `install` or `update` after
-editing the central file.
+When `status` reports a symlink, editing the central `~/.omne/cfg/baseline/*` changes live behavior for every wired agent at once. On Windows without symlink privilege the link layer degrades to a hardlink (dispatcher) or a plain copy (config folder); `status`/`doctor` report which mechanism is in effect, and a copy needs a reinstall/update after central edits.
 
-The central root is `~/.omne` by default; override it with the `OMNE_HOME`
-environment variable. On Windows without symlink privilege the link layer
-degrades automatically to a hardlink (then a plain copy as a last resort);
-`status`/`doctor` report which mechanism is in effect.
+The central root is `~/.omne` by default; override it with `OMNE_HOME`. After install, open `/hooks` in Claude Code once (or restart) so settings reload.
 
-After install, open `/hooks` in Claude Code once (or restart Claude Code) so the settings reload.
+## The config folder (the everyday task)
 
-## Runtime options
+Everything you tune lives under `~/.omne/cfg/baseline/`:
 
-The hook runs as the canonical Node.js script by default. Native runtimes are explicit because they execute on every prompt.
-
-### Default: JavaScript
-
-```bash
-node scripts/manage.js install
+```text
+~/.omne/cfg/baseline/
+  config.json     # routes: when/where/how-often/which doc
+  docs/           # the verbatim text each route injects
+    baseline.md
+  README.md       # editing guidance (never injected — no route points at it)
 ```
 
-This deploys and wires `scripts/baseline-recital.js`, the source of truth.
+Edit a **doc** to change what is injected (takes effect on the next firing — no reinstall). Edit **`config.json`** to add a route, change a route's `event`/`matcher`/`freq`/`cwd`, or point it at a different doc. After changing the *set of events* your routes use, rerun `install`/`update` so settings wiring stays in sync.
 
-### Optional: prebuilt binaries
+A route is one entry in `config.json` `routes[]`:
 
-The repo ships checked prebuilt native hooks:
-- `bin/baseline-recital-windows-x64.exe` (Windows)
-- `bin/baseline-recital-linux-x64` (Linux)
-- `bin/SHA256SUMS` (verified before install)
-
-No Zig compiler required. macOS has no shipped prebuilt.
-
-To explicitly request the prebuilt binary:
-```bash
-bash install.sh --runtime prebuilt
+```json
+{
+  "version": 1,
+  "routes": [
+    { "id": "baseline", "event": "UserPromptSubmit", "freq": 5, "doc": "docs/baseline.md" }
+  ]
+}
 ```
 
-### Optional: compile from source
+- `id` — required, unique, slug-shaped (`^[a-z0-9][a-z0-9-]*$`). Keys the route's counter.
+- `event` — required, one of `UserPromptSubmit`, `SessionStart`, `PreToolUse`, `PostToolUse`.
+- `doc` — required, path relative to the config folder; must stay inside it.
+- `freq` — optional positive integer, default `1`. Fires when `count % freq == 0`.
+- `matcher` — optional. `SessionStart`: lifecycle phase (`startup`/`resume`/`clear`/`compact`). `PreToolUse`/`PostToolUse`: a tool-name regex. Ignored for `UserPromptSubmit`.
+- `cwd` — optional path prefix. Fires only when the session working directory is at or under it.
 
-If you have Zig 0.16.x installed, you can compile the hook from source.
+To add a new injection, copy a pair from `assets/route-templates/` (a doc + its matching route) or ask the plugin to author one. See `~/.omne/cfg/baseline/README.md` for the runtime caps.
 
-**Compile for your host platform:**
-```bash
-# Linux/macOS
-bash install.sh --build
+### Presets
 
-# Windows (PowerShell)
-.\install.ps1 -build
-```
+`install` deploys exactly one preset into the config folder if none exists:
 
-This compiles `scripts/baseline-recital.zig` for your host and deploys it to the
-central `~/.omne/hooks/` store, then links the agent hook path to it.
+- `presets/minimal/` — the neutral floor: one `baseline` / `UserPromptSubmit` / `freq 5` route with project-agnostic guardrails. Applied by a plain `install`.
+- `presets/default/` — the author's personal curated baseline (multi-route). Opt-in: `install --preset default`.
 
-**Regenerate both committed prebuilts via cross-compilation:**
-```bash
-# Linux/macOS
-bash build.sh
+`install` never overwrites an existing config folder without `--force` (which replaces it wholesale — your edits are lost).
 
-# Windows (PowerShell)
-.\build.ps1
-```
-
-This regenerates `bin/baseline-recital-windows-x64.exe`, `bin/baseline-recital-linux-x64`, and `bin/SHA256SUMS` from the native port.
-
-To explicitly request the JS runtime:
-```bash
-bash install.sh --runtime js
-```
-
-## Editing the baseline (the everyday task)
-
-Edit `~/.omne/baseline.md`. This is the file you'll touch most often. The agent
-path `~/.claude/baseline.md` links back to it after install.
-
-**Example:**
-```markdown
----
-interval: 5
-prefix: BASELINE ALIGNED:
----
-# Comments and blank lines are ignored. One rule per line below.
-File read/write/search -> subagent (cavecrew-investigator/builder, Explore), not inline. Save main ctx.
-Update task tracker (arca/scheduler) after changes. Frontmatter time-modified required.
-Never commit without explicit user request.
-```
-
-**Fields:**
-- `interval:` — Fire every Nth prompt (integer). Lower = tighter leash, more tokens.
-- `prefix:` — The literal line the agent opens its reply with when reciting.
-- **Body** — One rule per line. Keep rules short (they're injected into context every fire). Lines starting with `#` and blank lines are ignored.
-
-**Changes apply on the next prompt** when `status` reports a symlink or hardlink.
-If it reports a plain-copy fallback, rerun `install` or `update`.
-
-After editing, confirm what's live with:
-```bash
-node scripts/manage.js status
-```
-
-## Managing the hook
-
-The manager script provides these commands:
+## Managing baseline
 
 | Command | Description |
 |---------|-------------|
-| `status` | Shows what's installed, whether it's in sync with the canonical source, and the current rules. |
-| `verify` | Functional test: confirms the hook fires on turn N as expected. |
-| `install` | Deploys the hook + `baseline.md` to the central `~/.omne`, links each agent dir to it, and wires `settings.json`. Idempotent. Migrates a pre-existing real `baseline.md` into the center without clobbering edits. |
-| `update` | Redeploys the central hook and re-wires settings + re-links from the current repo source, keeping the runtime already in use (native falls back to JS if unavailable). |
-| `doctor` | Scans the installation and reports each check as OK/WARN/FAIL — including whether each agent link resolves to the center. `--fix` repairs the auto-fixable issues and re-scans. |
-| `uninstall` | Unwires the hook from settings and removes the per-agent links. Preserves the central `~/.omne/baseline.md`. |
+| `status` | Shows the central root, dispatcher sync, config folder, every route, and per-agent per-event wiring + link health. |
+| `install [--preset <n>] [--force]` | Deploys the dispatcher, seeds the config preset, links each agent, wires settings for the config's events. Idempotent. |
+| `verify` | Functional test: drives the wired dispatcher and confirms a route fires with `additionalContext`. |
+| `update` | Redeploys the dispatcher and re-syncs settings wiring from the current config (keeps the config folder). |
+| `doctor` | Validates `config.json` + every route + per-event wiring; reports OK/WARN/FAIL and exits nonzero on any fault. `--fix` repairs and re-scans. |
+| `uninstall` | Unwires baseline across all events and removes per-agent links. Preserves the central config folder. |
 
-**Run with Node.js:**
 ```bash
 node scripts/manage.js status
-node scripts/manage.js install
+node scripts/manage.js install            # --preset default to seed the curated baseline
 node scripts/manage.js verify
 node scripts/manage.js update
-node scripts/manage.js doctor          # add --fix to repair
+node scripts/manage.js doctor             # add --fix to repair
 node scripts/manage.js uninstall
 ```
 
-**Or via the platform wrapper scripts** (Windows `.ps1`, Linux/macOS `.sh`):
+Or via the platform wrappers:
 ```bash
 bash update.sh        # pulls latest if a git checkout, then redeploys
 bash doctor.sh --fix  # scan + repair
@@ -196,61 +136,67 @@ bash uninstall.sh
 .\uninstall.ps1
 ```
 
-All commands are idempotent and preserve any co-resident `UserPromptSubmit` hooks (e.g. other skills). Settings edits are surgical. `install` and `uninstall` refuse to rewrite malformed `settings.json`; fix the JSON first so existing hooks are not lost.
+All commands are idempotent and preserve any co-resident hooks (e.g. other skills). Settings edits are surgical. `install`/`uninstall` refuse to rewrite malformed `settings.json`; fix the JSON first so existing hooks are not lost.
 
 ## Repository layout
 
 ```
 baseline/
 ├── install.sh / install.ps1     # Installer (bash / PowerShell)
-├── update.sh / update.ps1       # Pull latest + redeploy hook (bash / PowerShell)
-├── doctor.sh / doctor.ps1       # Scan + repair installation; --fix / -fix (bash / PowerShell)
-├── uninstall.sh / uninstall.ps1 # Remove hook, keep baseline.md (bash / PowerShell)
-├── build.sh                 # Cross-compile both prebuilts (bash)
-├── build.ps1                # Cross-compile both prebuilts (PowerShell)
-├── scripts/
-│   ├── manage.js            # Manager: install, update, doctor, status, verify, uninstall
-│   ├── baseline-recital.js  # Hook source (canonical, default)
-│   ├── baseline-recital.zig # Optional native port; mirrors JS behavior
-│   └── test.js              # Isolated manager/hook regression tests
+├── update.sh / update.ps1       # Pull latest + redeploy (bash / PowerShell)
+├── doctor.sh / doctor.ps1       # Scan + repair installation; --fix / -fix
+├── uninstall.sh / uninstall.ps1 # Remove wiring + links, keep central config
+├── build.sh / build.ps1         # Cross-compile native prebuilts (paused for routes)
+├── package.json                 # TypeScript devDeps + build/test scripts
+├── tsconfig.json                # tsc: src/*.ts → scripts/*.js
+├── src/                         # TypeScript source of truth (edit here, then npm run build)
+│   ├── manage.ts                # Manager source
+│   ├── baseline-recital.ts      # Dispatcher source (canonical)
+│   ├── baseline-recital.zig     # Optional native port (paused; mirrors JS behavior)
+│   └── test.ts                  # Test source
+├── scripts/                     # Committed compiled output deployed by the manager
+│   ├── manage.js
+│   ├── baseline-recital.js
+│   └── test.js
+├── presets/
+│   ├── minimal/                 # Neutral floor preset (config.json + docs + README)
+│   └── default/                 # Author's curated preset (opt-in)
+├── assets/route-templates/      # Doc+route authoring references (never deployed/injected)
 ├── bin/
 │   ├── baseline-recital-windows-x64.exe
 │   ├── baseline-recital-linux-x64
 │   └── SHA256SUMS
-├── assets/
-│   └── baseline.template.md # Seeded as ~/.omne/baseline.md if missing
+├── docs/adr/                    # Architecture decision records
 ├── resources/
-│   ├── logo.png             # Repository image / preview source
-│   ├── logo.svg             # Scalable logo source
-│   ├── logo.txt             # Plain text ASM logo
-│   └── logo.ans             # ANSI ASM logo
-├── references/
-│   └── architecture.md      # Internals: counting, injection, hardening
-├── SKILL.md                 # Skill manifest for Claude Code
-└── README.md                # This file
+│   ├── logo.png                 # Repository image / preview source
+│   ├── logo.svg                 # Scalable logo source
+│   ├── logo.txt                 # Plain text ASM logo
+│   └── logo.ans                 # ANSI ASM logo
+├── references/architecture.md   # Internals: routing, counting, injection, hardening
+├── SKILL.md                     # Skill manifest for Claude Code
+└── README.md                    # This file
 ```
 
-## Uninstall
+## Trust boundary
+
+Doc bytes enter the model's context, so treat every `docs/*.md` as trusted configuration: inspect edits, keep docs short, never paste untrusted text. The dispatcher caps `config.json` and each doc at 64 KiB and routes at 64, resolves each `doc` strictly inside the config folder (no `..` escapes), and always exits 0 — a hook fault never blocks the agent. Counters are auto-pruned after 7 days of inactivity.
+
+## Develop
+
+The dispatcher and manager are TypeScript under `src/`, compiled to the committed `scripts/*.js` (what installs and the deployed dispatcher actually run — no build step needed just to install). After editing anything in `src/`, rebuild and commit the regenerated `scripts/*.js`:
 
 ```bash
-node scripts/manage.js uninstall
+npm install      # one-time: TypeScript + @types/node
+npm run build    # tsc: src/*.ts → scripts/*.js
 ```
-
-This unwires the hook from `~/.claude/settings.json` and removes the per-agent links from `~/.claude/hooks/` and `~/.claude/baseline.md`. The central `~/.omne/baseline.md` is preserved (delete `~/.omne` by hand if you want it gone).
-
-## How firing is counted
-
-The hook fires on turns N, 2N, 3N, … where N is the interval. Specifically, it fires when `turn_count % interval == 0`. When N > 1 the first fire is on turn N (turn 1 is silent); when N is 1 every turn fires. Counters are auto-pruned after 7 days of inactivity.
-
-The hook always exits with code 0, even on internal errors, so it never blocks prompt submission. Hot-path reads are bounded: stdin and counters are capped at 1 MiB, `baseline.md` at 64 KiB, and injected rules at 50 lines of 500 characters each.
 
 ## Test
 
 ```bash
-node scripts/test.js
+npm test         # runs tsc, then node scripts/test.js
 ```
 
-The tests use temporary `CLAUDE_CONFIG_DIR` directories and do not touch your real Claude settings.
+The tests use temporary `CLAUDE_CONFIG_DIR` / `OMNE_HOME` directories and do not touch your real config.
 
 ## License
 

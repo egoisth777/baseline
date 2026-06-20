@@ -1,0 +1,6 @@
+{
+  "version": 1,
+  "routes": [
+    { "id": "baseline", "event": "UserPromptSubmit", "freq": 5, "doc": "docs/baseline.md" }
+  ]
+}
