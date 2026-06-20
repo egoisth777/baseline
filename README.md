@@ -35,7 +35,7 @@ Supported injecting events: `UserPromptSubmit`, `SessionStart` (lifecycle phase 
 - **Claude Code** — the CLI agent harness
 - **Node.js** — runs the installer/manager and the dispatcher
 
-**Platforms:** the dispatcher is Node-only and works anywhere Claude Code and Node.js work. A native Zig port is paused for this feature (see `docs/adr/0001-node-canonical-zig-optional.md`) and will be a fast-follow.
+**Platforms:** the dispatcher is Node-only and works anywhere Claude Code and Node.js work. A native Zig port is paused for this feature and will be a fast-follow.
 
 ## Install
 
@@ -166,7 +166,6 @@ baseline/
 │   ├── baseline-recital-windows-x64.exe
 │   ├── baseline-recital-linux-x64
 │   └── SHA256SUMS
-├── docs/adr/                    # Architecture decision records
 ├── resources/
 │   ├── logo.png                 # Repository image / preview source
 │   ├── logo.svg                 # Scalable logo source
