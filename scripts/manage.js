@@ -28,7 +28,7 @@
 // - The config folder is seeded from a repo PRESET (presets/<name>/) and is never
 //   clobbered without --force. There is no legacy baseline.md migration — the
 //   system is pre-release and install seeds the new model fresh.
-// - Native Zig runtime is PAUSED for the routes feature (ADR-0001): the dispatcher
+// - Native Zig runtime is PAUSED for the routes feature: the dispatcher
 //   is Node-only for v1. `--runtime prebuilt|build` is refused.
 Object.defineProperty(exports, "__esModule", { value: true });
 const fs = require("fs");
@@ -997,7 +997,7 @@ function printHelp() {
     console.log('  --preset <minimal|default>   Which repo preset to seed when no config folder exists. Default: minimal.');
     console.log('  --force                      Replace an existing central config folder with the preset (DESTRUCTIVE — user edits lost).');
     console.log('');
-    console.log('Native Zig runtime is paused for the routes feature (ADR-0001); the dispatcher is Node-only in v1.');
+    console.log('Native Zig runtime is paused for the routes feature; the dispatcher is Node-only in v1.');
     console.log('Central install root: OMNE_HOME if set, otherwise ~/.omne.');
     console.log('Agent config dir: CLAUDE_CONFIG_DIR if set, otherwise ~/.claude.');
 }
@@ -1021,7 +1021,7 @@ function parseInstallOpts(argv, cmd) {
             opts.force = true;
         }
         else if (a === '--runtime' || a === '-runtime' || a.startsWith('--runtime=') || a === '--build' || a === '-build') {
-            fail(cmd + ': native runtime is paused for the routes feature (ADR-0001); the dispatcher is Node-only in v1.', 2);
+            fail(cmd + ': native runtime is paused for the routes feature; the dispatcher is Node-only in v1.', 2);
         }
     }
     return opts;

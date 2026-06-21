@@ -105,7 +105,7 @@ repo wins). The config folder `~/.omne/cfg/baseline/` is seeded from a repo **pr
 is **no legacy `baseline.md` migration** — the system is pre-release; install seeds the
 new model fresh and ignores any orphaned `baseline.md`.
 
-The native Zig port is **paused** (ADR-0001): the dispatcher is Node-only for v1, so a
+The native Zig port is **paused**: the dispatcher is Node-only for v1, so a
 native install would silently ignore routed config. `--runtime prebuilt|build` is
 refused until a fast-follow ports the stabilized dispatcher.
 

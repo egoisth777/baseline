@@ -24,7 +24,7 @@ Content and routing are kept separate: **docs** (`docs/*.md`) hold the verbatim 
 | Piece | Path | Role |
 |---|---|---|
 | Dispatcher (canonical) | `src/baseline-recital.ts` → `scripts/baseline-recital.js` | TypeScript source of truth; `npm run build` compiles it. Reads the event, loads `config.json`, selects routes, counts per route, injects due docs verbatim. |
-| Native port | `src/baseline-recital.zig` | Optional native mirror. **Paused** for the routes feature (ADR-0001). |
+| Native port | `src/baseline-recital.zig` | Optional native mirror. **Paused** for the routes feature. |
 | Central dispatcher | `~/.omne/hooks/baseline-recital.js` | Canonical deployed hook artifact. |
 | Agent dispatcher link | `~/.claude/hooks/baseline-recital.js` | Installed command path wired in settings; links to central. |
 | Config folder | `~/.omne/cfg/baseline/` (`config.json` + `docs/` + `README.md`) | **Everything tunable**: routes in `config.json`, injected text in `docs/`. Linked into each agent as a unit. |
@@ -41,7 +41,7 @@ For internals (route selection, counting, hardening) read `references/architectu
 
 ## Requirements and runtime
 
-Requires Claude Code and Node.js. Node runs the manager and the dispatcher. The dispatcher is **Node-only** for v1; the native Zig port is paused (ADR-0001), so `--runtime prebuilt|build` is refused.
+Requires Claude Code and Node.js. Node runs the manager and the dispatcher. The dispatcher is **Node-only** for v1; the native Zig port is paused, so `--runtime prebuilt|build` is refused.
 
 ## Trust boundary
 
