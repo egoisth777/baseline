@@ -14,19 +14,26 @@ function tempConfig(): string {
   return fs.mkdtempSync(path.join(os.tmpdir(), 'baseline-test-'));
 }
 
-// Each test gets an isolated central root alongside its config dir, so install
-// never touches the real ~/.omne. Deterministic: derived from the unique cfg.
-function omneFor(cfg: string): string {
-  return cfg + '-omne';
+// Each test gets an isolated install root alongside its config dir, so install
+// never touches the real ~/.baseline. Deterministic: derived from the unique cfg.
+function homeFor(cfg: string): string {
+  return cfg + '-home';
 }
 
-function run(args: string[], cfg: string, omne?: string) {
+function codexFor(cfg: string): string {
+  return cfg + '-codex';
+}
+
+// Run the manager with isolated install root + agent config dirs. extraEnv can set
+// BASELINE_CFG to exercise an external (symlinked) config folder.
+function run(args: string[], cfg: string, home?: string, extraEnv?: { [k: string]: string }) {
   return spawnSync(process.execPath, [manage].concat(args), {
     cwd: root,
     env: Object.assign({}, process.env, {
       CLAUDE_CONFIG_DIR: cfg,
-      OMNE_HOME: omne || omneFor(cfg)
-    }),
+      CODEX_HOME: codexFor(cfg),
+      BASELINE_HOME: home || homeFor(cfg)
+    }, extraEnv || {}),
     encoding: 'utf8'
   });
 }
@@ -36,7 +43,7 @@ function run(args: string[], cfg: string, omne?: string) {
 function hook(input: any, cfg: string) {
   return spawnSync(process.execPath, [dispatcher], {
     input: JSON.stringify(input),
-    env: Object.assign({}, process.env, { CLAUDE_CONFIG_DIR: cfg, OMNE_HOME: omneFor(cfg) }),
+    env: Object.assign({}, process.env, { CLAUDE_CONFIG_DIR: cfg, CODEX_HOME: codexFor(cfg), BASELINE_HOME: homeFor(cfg) }),
     encoding: 'utf8'
   });
 }
@@ -46,11 +53,12 @@ function write(file: string, text: string): void {
   fs.writeFileSync(file, text, 'utf8');
 }
 
-// Overwrite the central config + docs (edits propagate to agents through the link).
-function setCentralConfig(omne: string, routes: any[], docs: { [name: string]: string }): void {
-  write(path.join(omne, 'cfg', 'baseline', 'config.json'), JSON.stringify({ version: 1, routes }, null, 2));
+// Overwrite the config folder contents (edits propagate to agents through the link).
+// Config is flat under <installRoot>/cfg: config.json + docs/ (no cfg/baseline nesting).
+function setCentralConfig(home: string, routes: any[], docs: { [name: string]: string }): void {
+  write(path.join(home, 'cfg', 'config.json'), JSON.stringify({ version: 1, routes }, null, 2));
   for (const name of Object.keys(docs)) {
-    write(path.join(omne, 'cfg', 'baseline', name), docs[name]);
+    write(path.join(home, 'cfg', name), docs[name]);
   }
 }
 
@@ -81,36 +89,53 @@ function testDefaultInstallAndVerify(): void {
 
 function testCentralInstallAndAgentLinks(): void {
   const cfg = tempConfig();
-  const omne = omneFor(cfg);
+  const home = homeFor(cfg);
   const install = run(['install'], cfg);
   assert.strictEqual(install.status, 0, install.stderr || install.stdout);
 
-  assert.ok(fs.existsSync(path.join(omne, 'hooks', 'baseline-recital.js')), 'central dispatcher missing');
-  assert.ok(fs.existsSync(path.join(omne, 'cfg', 'baseline', 'config.json')), 'central config.json missing');
-  assert.ok(fs.existsSync(path.join(omne, 'cfg', 'baseline', 'docs', 'baseline.md')), 'central doc missing');
+  assert.ok(fs.existsSync(path.join(home, 'hooks', 'baseline-recital.js')), 'central dispatcher missing');
+  assert.ok(fs.existsSync(path.join(home, 'cfg', 'config.json')), 'central config.json missing');
+  assert.ok(fs.existsSync(path.join(home, 'cfg', 'docs', 'baseline.md')), 'central doc missing');
 
   const agentJs = path.join(cfg, 'hooks', 'baseline-recital.js');
   const agentConfig = path.join(cfg, 'cfg', 'baseline', 'config.json');
   assert.ok(fs.existsSync(agentJs), 'agent dispatcher not linked');
-  assert.strictEqual(readThrough(agentJs), readThrough(path.join(omne, 'hooks', 'baseline-recital.js')),
+  assert.strictEqual(readThrough(agentJs), readThrough(path.join(home, 'hooks', 'baseline-recital.js')),
     'agent dispatcher does not resolve to central content');
-  assert.strictEqual(readThrough(agentConfig), readThrough(path.join(omne, 'cfg', 'baseline', 'config.json')),
+  assert.strictEqual(readThrough(agentConfig), readThrough(path.join(home, 'cfg', 'config.json')),
     'agent config.json does not resolve to central content');
 
   const status = run(['status'], cfg);
   assert.strictEqual(status.status, 0, status.stderr || status.stdout);
-  assert.match(status.stdout, /central root\s+: /);
+  assert.match(status.stdout, /install root\s+: /);
   assert.match(status.stdout, /baseline: event=UserPromptSubmit, freq=5/);
+}
+
+function testCodexInstallAndAgentLinks(): void {
+  const cfg = tempConfig();
+  const codex = codexFor(cfg);
+  const install = run(['install'], cfg);
+  assert.strictEqual(install.status, 0, install.stderr || install.stdout);
+
+  const hooksJson = JSON.parse(fs.readFileSync(path.join(codex, 'hooks.json'), 'utf8'));
+  const command = hooksJson.hooks.UserPromptSubmit[0].hooks[0].command;
+  assert.ok(command.includes('baseline-recital.js'), command);
+  assert.ok(command.includes('--agent-config'), command);
+  assert.ok(command.includes(codex), command);
+
+  const agentConfig = path.join(codex, 'cfg', 'baseline', 'config.json');
+  assert.strictEqual(readThrough(agentConfig), readThrough(path.join(homeFor(cfg), 'cfg', 'config.json')),
+    'codex config.json does not resolve to central content');
 }
 
 function testCentralEditPropagatesToAgent(): void {
   const cfg = tempConfig();
-  const omne = omneFor(cfg);
+  const home = homeFor(cfg);
   assert.strictEqual(run(['install'], cfg).status, 0);
 
   // Edit the central doc; the agent path must reflect it (single source).
   const edited = 'EDITED RULE BODY\n';
-  fs.writeFileSync(path.join(omne, 'cfg', 'baseline', 'docs', 'baseline.md'), edited, 'utf8');
+  fs.writeFileSync(path.join(home, 'cfg', 'docs', 'baseline.md'), edited, 'utf8');
   assert.strictEqual(readThrough(path.join(cfg, 'cfg', 'baseline', 'docs', 'baseline.md')), edited,
     'central edit not visible through the agent link');
 }
@@ -126,23 +151,23 @@ function testIdempotentReinstall(): void {
 
 function testForceReplacesConfigKeepWithout(): void {
   const cfg = tempConfig();
-  const omne = omneFor(cfg);
+  const home = homeFor(cfg);
   assert.strictEqual(run(['install'], cfg).status, 0);
 
   // Operator edit to the central config.
   const marker = 'OPERATOR EDIT MARKER\n';
-  fs.writeFileSync(path.join(omne, 'cfg', 'baseline', 'docs', 'baseline.md'), marker, 'utf8');
+  fs.writeFileSync(path.join(home, 'cfg', 'docs', 'baseline.md'), marker, 'utf8');
 
   // Plain reinstall keeps the edit.
   assert.strictEqual(run(['install'], cfg).status, 0);
-  assert.strictEqual(fs.readFileSync(path.join(omne, 'cfg', 'baseline', 'docs', 'baseline.md'), 'utf8'), marker,
+  assert.strictEqual(fs.readFileSync(path.join(home, 'cfg', 'docs', 'baseline.md'), 'utf8'), marker,
     'plain reinstall clobbered the operator config');
 
   // --force replaces it wholesale from the preset.
   const forced = run(['install', '--force'], cfg);
   assert.strictEqual(forced.status, 0, forced.stderr || forced.stdout);
   assert.match(forced.stdout, /\(replaced, preset: minimal\)/);
-  assert.notStrictEqual(fs.readFileSync(path.join(omne, 'cfg', 'baseline', 'docs', 'baseline.md'), 'utf8'), marker,
+  assert.notStrictEqual(fs.readFileSync(path.join(home, 'cfg', 'docs', 'baseline.md'), 'utf8'), marker,
     '--force did not replace the operator config');
 }
 
@@ -162,20 +187,20 @@ function testNativeRuntimePaused(): void {
 
 function testInvalidSettingsFailsClosed(): void {
   const cfg = tempConfig();
-  const omne = omneFor(cfg);
+  const home = homeFor(cfg);
   const settings = path.join(cfg, 'settings.json');
   write(settings, '{ invalid json');
 
   const install = run(['install'], cfg);
   assert.notStrictEqual(install.status, 0, 'install unexpectedly succeeded');
   assert.strictEqual(fs.readFileSync(settings, 'utf8'), '{ invalid json');
-  assert.ok(!fs.existsSync(path.join(omne, 'hooks', 'baseline-recital.js')), 'invalid settings should not deploy dispatcher');
-  assert.ok(!fs.existsSync(path.join(omne, 'cfg', 'baseline', 'config.json')), 'invalid settings should not seed config');
+  assert.ok(!fs.existsSync(path.join(home, 'hooks', 'baseline-recital.js')), 'invalid settings should not deploy dispatcher');
+  assert.ok(!fs.existsSync(path.join(home, 'cfg', 'config.json')), 'invalid settings should not seed config');
 }
 
 function testInvalidSettingsShapeFailsClosed(): void {
   const cfg = tempConfig();
-  const omne = omneFor(cfg);
+  const home = homeFor(cfg);
   const settings = path.join(cfg, 'settings.json');
   const invalidShape = JSON.stringify({ hooks: { UserPromptSubmit: { hooks: [] } } }, null, 2) + '\n';
   write(settings, invalidShape);
@@ -184,18 +209,32 @@ function testInvalidSettingsShapeFailsClosed(): void {
   assert.notStrictEqual(install.status, 0, 'install unexpectedly succeeded');
   assert.match(install.stderr, /hooks\.UserPromptSubmit must be an array/);
   assert.strictEqual(fs.readFileSync(settings, 'utf8'), invalidShape);
-  assert.ok(!fs.existsSync(path.join(omne, 'cfg', 'baseline', 'config.json')), 'invalid shape should not seed config');
+  assert.ok(!fs.existsSync(path.join(home, 'cfg', 'config.json')), 'invalid shape should not seed config');
 
   const doctor = run(['doctor'], cfg);
   assert.notStrictEqual(doctor.status, 0, 'doctor unexpectedly succeeded on invalid settings shape');
-  assert.match(doctor.stdout, /invalid settings\.json/);
+  assert.match(doctor.stdout, /settings\.json invalid/);
+}
+
+function testInvalidNullHookGroupFailsClosed(): void {
+  const cfg = tempConfig();
+  const home = homeFor(cfg);
+  const settings = path.join(cfg, 'settings.json');
+  const invalidShape = JSON.stringify({ hooks: { UserPromptSubmit: [null] } }, null, 2) + '\n';
+  write(settings, invalidShape);
+
+  const install = run(['install'], cfg);
+  assert.notStrictEqual(install.status, 0, 'install unexpectedly succeeded');
+  assert.match(install.stderr, /hooks\.UserPromptSubmit\[0\] must be an object/);
+  assert.strictEqual(fs.readFileSync(settings, 'utf8'), invalidShape);
+  assert.ok(!fs.existsSync(path.join(home, 'cfg', 'config.json')), 'invalid group should not seed config');
 }
 
 // --- config-driven wiring ---------------------------------------------------
 
 function testConfigDrivenWiringAndUnwire(): void {
   const cfg = tempConfig();
-  const omne = omneFor(cfg);
+  const home = homeFor(cfg);
 
   // default preset uses UserPromptSubmit + SessionStart → both wired, others not.
   const install = run(['install', '--preset', 'default'], cfg);
@@ -206,7 +245,7 @@ function testConfigDrivenWiringAndUnwire(): void {
   assert.ok(!settings.hooks.PreToolUse, 'PreToolUse wired but no route uses it');
 
   // Remove the SessionStart route from central config; update must unwire it.
-  setCentralConfig(omne, [
+  setCentralConfig(home, [
     { id: 'baseline', event: 'UserPromptSubmit', freq: 5, doc: 'docs/baseline.md' }
   ], {});
   const update = run(['update'], cfg);
@@ -236,6 +275,29 @@ function testCoResidentHookPreserved(): void {
   assert.deepStrictEqual(left, ['echo theirs'], 'uninstall did not preserve exactly the co-resident hook');
 }
 
+function testBaselineHookDoesNotInheritMatcher(): void {
+  const cfg = tempConfig();
+  const home = homeFor(cfg);
+  setCentralConfig(home, [
+    { id: 'bash', event: 'PreToolUse', matcher: '^Bash$', freq: 1, doc: 'docs/bash.md' }
+  ], { 'docs/bash.md': 'BASH\n' });
+  write(path.join(cfg, 'settings.json'), JSON.stringify({
+    hooks: { PreToolUse: [{ matcher: 'Read', hooks: [{ type: 'command', command: 'echo theirs', timeout: 3 }] }] }
+  }, null, 2) + '\n');
+
+  const install = run(['install'], cfg);
+  assert.strictEqual(install.status, 0, install.stderr || install.stdout);
+  const settings = JSON.parse(fs.readFileSync(path.join(cfg, 'settings.json'), 'utf8'));
+  const groups = settings.hooks.PreToolUse;
+  assert.ok(groups.some((g: any) => g.matcher === 'Read' && g.hooks.some((h: any) => h.command === 'echo theirs')),
+    'co-resident matched group was not preserved');
+  assert.ok(groups.some((g: any) => g.matcher === undefined && g.hooks.some((h: any) => h.command.includes('baseline-recital.js'))),
+    'baseline hook should be installed in its own matcher-free group');
+
+  const verify = run(['verify'], cfg);
+  assert.strictEqual(verify.status, 0, verify.stderr || verify.stdout);
+}
+
 // --- dispatcher behavior (drive the deployed hook directly) -----------------
 
 function fireBodies(res: { stdout: string }): string | null {
@@ -246,9 +308,9 @@ function fireBodies(res: { stdout: string }): string | null {
 
 function testPerRouteCountersIndependent(): void {
   const cfg = tempConfig();
-  const omne = omneFor(cfg);
+  const home = homeFor(cfg);
   assert.strictEqual(run(['install'], cfg).status, 0);
-  setCentralConfig(omne, [
+  setCentralConfig(home, [
     { id: 'two', event: 'UserPromptSubmit', freq: 2, doc: 'docs/two.md' },
     { id: 'three', event: 'UserPromptSubmit', freq: 3, doc: 'docs/three.md' }
   ], { 'docs/two.md': 'TWO\n', 'docs/three.md': 'THREE\n' });
@@ -266,13 +328,28 @@ function testPerRouteCountersIndependent(): void {
   assert.ok(fired[6] && fired[6].includes('TWO') && fired[6].includes('THREE'), 'turn6: both due, joined');
 }
 
+function testMalformedCounterArrayDoesNotBreakFrequency(): void {
+  const cfg = tempConfig();
+  const home = homeFor(cfg);
+  assert.strictEqual(run(['install'], cfg).status, 0);
+  setCentralConfig(home, [
+    { id: 'two', event: 'UserPromptSubmit', freq: 2, doc: 'docs/two.md' }
+  ], { 'docs/two.md': 'TWO\n' });
+  write(path.join(cfg, '.baseline-counters.json'), '[]');
+
+  assert.strictEqual(fireBodies(hook({ session_id: 'array', hook_event_name: 'UserPromptSubmit', cwd: cfg }, cfg)), null,
+    'first turn should not fire');
+  assert.ok(fireBodies(hook({ session_id: 'array', hook_event_name: 'UserPromptSubmit', cwd: cfg }, cfg))?.includes('TWO'),
+    'second turn should fire even after malformed array counters');
+}
+
 function testMatcherSemantics(): void {
   const cfg = tempConfig();
-  const omne = omneFor(cfg);
+  const home = homeFor(cfg);
   assert.strictEqual(run(['install'], cfg).status, 0);
   const scoped = path.join(cfg, 'scoped-tree');
 
-  setCentralConfig(omne, [
+  setCentralConfig(home, [
     { id: 'compact', event: 'SessionStart', matcher: 'compact', freq: 1, doc: 'docs/c.md' },
     { id: 'bash', event: 'PreToolUse', matcher: '^Bash$', freq: 1, doc: 'docs/b.md' },
     { id: 'scoped', event: 'UserPromptSubmit', cwd: scoped, freq: 1, doc: 'docs/s.md' }
@@ -307,9 +384,9 @@ function testFailOpenMissingConfig(): void {
 
 function testMalformedConfigInjectsNothing(): void {
   const cfg = tempConfig();
-  const omne = omneFor(cfg);
+  const home = homeFor(cfg);
   assert.strictEqual(run(['install'], cfg).status, 0);
-  fs.writeFileSync(path.join(omne, 'cfg', 'baseline', 'config.json'), '{ not json', 'utf8');
+  fs.writeFileSync(path.join(home, 'cfg', 'config.json'), '{ not json', 'utf8');
   const r = hook({ session_id: 'y', hook_event_name: 'UserPromptSubmit', cwd: cfg }, cfg);
   assert.strictEqual(r.status, 0, 'dispatcher should not crash on malformed config');
   assert.strictEqual((r.stdout || '').trim(), '', 'malformed config should inject nothing');
@@ -317,9 +394,9 @@ function testMalformedConfigInjectsNothing(): void {
 
 function testBadRouteSkippedOthersFire(): void {
   const cfg = tempConfig();
-  const omne = omneFor(cfg);
+  const home = homeFor(cfg);
   assert.strictEqual(run(['install'], cfg).status, 0);
-  setCentralConfig(omne, [
+  setCentralConfig(home, [
     { id: 'BadId!', event: 'UserPromptSubmit', freq: 1, doc: 'docs/x.md' },         // invalid id → skipped
     { id: 'missingdoc', event: 'UserPromptSubmit', freq: 1, doc: 'docs/gone.md' },  // doc absent → skipped at read
     { id: 'good', event: 'UserPromptSubmit', freq: 1, doc: 'docs/good.md' }
@@ -331,11 +408,11 @@ function testBadRouteSkippedOthersFire(): void {
 
 function testDocPathTraversalRejected(): void {
   const cfg = tempConfig();
-  const omne = omneFor(cfg);
+  const home = homeFor(cfg);
   assert.strictEqual(run(['install'], cfg).status, 0);
   // Plant a secret outside cfg/baseline and try to escape to it.
-  write(path.join(omne, 'secret.md'), 'SECRET\n');
-  setCentralConfig(omne, [
+  write(path.join(home, 'secret.md'), 'SECRET\n');
+  setCentralConfig(home, [
     { id: 'escape', event: 'UserPromptSubmit', freq: 1, doc: '../../secret.md' }
   ], {});
   const r = hook({ session_id: 'esc', hook_event_name: 'UserPromptSubmit', cwd: cfg }, cfg);
@@ -344,6 +421,45 @@ function testDocPathTraversalRejected(): void {
   const doctor = run(['doctor'], cfg);
   assert.notStrictEqual(doctor.status, 0, 'doctor should fail on out-of-range doc');
   assert.match(doctor.stdout, /out-of-range doc/);
+}
+
+function testDocSymlinkEscapeRejected(): void {
+  const cfg = tempConfig();
+  const home = homeFor(cfg);
+  assert.strictEqual(run(['install'], cfg).status, 0);
+  write(path.join(home, 'secret.md'), 'SECRET\n');
+  const link = path.join(home, 'cfg', 'docs', 'link.md');
+  try {
+    fs.symlinkSync(path.join(home, 'secret.md'), link);
+  } catch (e) {
+    return; // Windows without symlink privilege: covered where the platform allows it.
+  }
+  setCentralConfig(home, [
+    { id: 'link', event: 'UserPromptSubmit', freq: 1, doc: 'docs/link.md' }
+  ], {});
+
+  const r = hook({ session_id: 'sym', hook_event_name: 'UserPromptSubmit', cwd: cfg }, cfg);
+  assert.strictEqual((r.stdout || '').trim(), '', 'doc symlink escape must be rejected');
+
+  const doctor = run(['doctor'], cfg);
+  assert.notStrictEqual(doctor.status, 0, 'doctor should fail on symlink escape');
+  assert.match(doctor.stdout, /resolves outside the config folder/);
+}
+
+function testOversizeDocSkipped(): void {
+  const cfg = tempConfig();
+  const home = homeFor(cfg);
+  assert.strictEqual(run(['install'], cfg).status, 0);
+  setCentralConfig(home, [
+    { id: 'big', event: 'UserPromptSubmit', freq: 1, doc: 'docs/big.md' }
+  ], { 'docs/big.md': 'x'.repeat(10_001) });
+
+  const r = hook({ session_id: 'big', hook_event_name: 'UserPromptSubmit', cwd: cfg }, cfg);
+  assert.strictEqual((r.stdout || '').trim(), '', 'oversize doc should not produce non-verbatim fallback output');
+
+  const doctor = run(['doctor'], cfg);
+  assert.notStrictEqual(doctor.status, 0, 'doctor should fail on doc over context cap');
+  assert.match(doctor.stdout, /10,000 character context cap/);
 }
 
 // --- doctor / verify --------------------------------------------------------
@@ -369,9 +485,9 @@ function testDoctorReportsAndFixes(): void {
 
 function testDoctorDetectsMissingDoc(): void {
   const cfg = tempConfig();
-  const omne = omneFor(cfg);
+  const home = homeFor(cfg);
   assert.strictEqual(run(['install'], cfg).status, 0);
-  fs.unlinkSync(path.join(omne, 'cfg', 'baseline', 'docs', 'baseline.md'));
+  fs.unlinkSync(path.join(home, 'cfg', 'docs', 'baseline.md'));
   const doctor = run(['doctor'], cfg);
   assert.notStrictEqual(doctor.status, 0, 'doctor should fail on missing doc');
   assert.match(doctor.stdout, /doc not readable/);
@@ -384,6 +500,37 @@ function testDoctorFixRefusesInvalidSettings(): void {
   const fixed = run(['doctor', '--fix'], cfg);
   assert.notStrictEqual(fixed.status, 0, 'doctor --fix unexpectedly succeeded on invalid settings');
   assert.strictEqual(fs.readFileSync(settings, 'utf8'), '{ invalid json');
+}
+
+function testVerifyRequiresSelectedRouteEvent(): void {
+  const cfg = tempConfig();
+  const home = homeFor(cfg);
+  setCentralConfig(home, [
+    { id: 'read', event: 'PreToolUse', matcher: '^Read$', freq: 1, doc: 'docs/read.md' }
+  ], { 'docs/read.md': 'READ\n' });
+  assert.strictEqual(run(['install'], cfg).status, 0);
+
+  let settings = JSON.parse(fs.readFileSync(path.join(cfg, 'settings.json'), 'utf8'));
+  const command = settings.hooks.PreToolUse[0].hooks[0].command;
+  settings = { hooks: { UserPromptSubmit: [{ hooks: [{ type: 'command', command, timeout: 5 }] }] } };
+  write(path.join(cfg, 'settings.json'), JSON.stringify(settings, null, 2) + '\n');
+
+  const verify = run(['verify'], cfg);
+  assert.notStrictEqual(verify.status, 0, 'verify should fail when selected route event is not wired');
+  assert.match(verify.stdout, /no baseline hook wired for PreToolUse/);
+}
+
+function testVerifyUsesMatchingToolName(): void {
+  const cfg = tempConfig();
+  const home = homeFor(cfg);
+  setCentralConfig(home, [
+    { id: 'read', event: 'PreToolUse', matcher: '^Read$', freq: 1, doc: 'docs/read.md' }
+  ], { 'docs/read.md': 'READ\n' });
+  assert.strictEqual(run(['install'], cfg).status, 0);
+
+  const verify = run(['verify'], cfg);
+  assert.strictEqual(verify.status, 0, verify.stderr || verify.stdout);
+  assert.match(verify.stdout, /verify: PASS/);
 }
 
 function testUpdateRedeploysDispatcher(): void {
@@ -402,7 +549,7 @@ function testUpdateRedeploysDispatcher(): void {
 
 function testUninstallKeepsCentralConfig(): void {
   const cfg = tempConfig();
-  const omne = omneFor(cfg);
+  const home = homeFor(cfg);
   assert.strictEqual(run(['install'], cfg).status, 0);
 
   const uninstall = run(['uninstall'], cfg);
@@ -412,7 +559,7 @@ function testUninstallKeepsCentralConfig(): void {
   assert.ok(!settings.hooks || !settings.hooks.UserPromptSubmit || settings.hooks.UserPromptSubmit.length === 0,
     'uninstall left a wired hook');
   assert.ok(!fs.existsSync(path.join(cfg, 'hooks', 'baseline-recital.js')), 'agent dispatcher link not removed');
-  assert.ok(fs.existsSync(path.join(omne, 'cfg', 'baseline', 'config.json')), 'central config was wrongly removed');
+  assert.ok(fs.existsSync(path.join(home, 'cfg', 'config.json')), 'central config was wrongly removed');
 }
 
 // --- repo invariants --------------------------------------------------------
@@ -484,14 +631,122 @@ function testDocsDescribeRoutesModel(): void {
   const readme = fs.readFileSync(path.join(root, 'README.md'), 'utf8');
   const skill = fs.readFileSync(path.join(root, 'SKILL.md'), 'utf8');
   const architecture = fs.readFileSync(path.join(root, 'references', 'architecture.md'), 'utf8');
+  assert.ok(fs.existsSync(path.join(root, 'references', 'ubi_lang.md')), 'tracked vocabulary reference is missing');
+  assertGitVisible(path.join('references', 'ubi_lang.md'));
   for (const [name, text] of [['README', readme], ['SKILL', skill], ['architecture', architecture]] as const) {
     assert.match(text, /cfg\/baseline/, name + ' should describe the cfg/baseline config folder');
     assert.match(text, /config\.json/, name + ' should mention config.json');
     assert.match(text, /route/i, name + ' should describe routes');
   }
+  assert.ok(!skill.includes('.arca/'), 'SKILL should not reference ignored .arca files');
+}
+
+function testCodexPluginManifest(): void {
+  const manifestPath = path.join(root, '.codex-plugin', 'plugin.json');
+  assert.ok(fs.existsSync(manifestPath), 'Codex plugin manifest missing');
+  const manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf8'));
+  assert.strictEqual(manifest.name, 'baseline');
+  assert.strictEqual(manifest.skills, './skills/');
+  assert.ok(fs.existsSync(path.join(root, 'skills', 'baseline', 'SKILL.md')), 'Codex plugin skill wrapper missing');
+}
+
+function testClaudePluginManifest(): void {
+  const manifestPath = path.join(root, '.claude-plugin', 'plugin.json');
+  assert.ok(fs.existsSync(manifestPath), 'Claude plugin manifest missing');
+  const manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf8'));
+  assert.strictEqual(manifest.name, 'baseline');
+  // Skill-only plugin: it must NOT declare hooks. baseline's hook wiring lives in
+  // settings.json and is managed by the installer, additive to any plugin hooks.
+  assert.ok(!('hooks' in manifest), 'Claude plugin manifest must not declare hooks (skill-only)');
+  // Top-level SKILL.md is exposed via "skills": ["./"].
+  assert.ok(Array.isArray(manifest.skills) && manifest.skills.indexOf('./') !== -1,
+    'Claude plugin manifest should expose the top-level skill via "skills": ["./"]');
+}
+
+// install deploys a Claude skills-dir plugin (baseline@skills-dir): a central payload
+// linked into the Claude agent's skills dir, skill-only, Claude-only, and removed on
+// uninstall while the central payload is kept.
+function testClaudeSkillPluginDeployed(): void {
+  const cfg = tempConfig();
+  const home = homeFor(cfg);
+  const codex = codexFor(cfg);
+  assert.strictEqual(run(['install'], cfg).status, 0);
+
+  // Central payload (manifest + generated SKILL.md wrapper) exists.
+  assert.ok(fs.existsSync(path.join(home, 'skills', 'baseline', '.claude-plugin', 'plugin.json')), 'central skill manifest missing');
+  assert.ok(fs.existsSync(path.join(home, 'skills', 'baseline', 'SKILL.md')), 'central skill SKILL.md missing');
+
+  // Linked into the Claude agent skills dir so Claude loads it as baseline@skills-dir.
+  const agentManifest = path.join(cfg, 'skills', 'baseline', '.claude-plugin', 'plugin.json');
+  const agentSkill = path.join(cfg, 'skills', 'baseline', 'SKILL.md');
+  assert.ok(fs.existsSync(agentManifest), 'Claude skill plugin not linked into the agent skills dir');
+  assert.strictEqual(JSON.parse(readThrough(agentManifest)).name, 'baseline');
+  const skillBody = readThrough(agentSkill);
+  assert.match(skillBody, /name:\s*baseline/, 'deployed skill missing name frontmatter');
+  assert.ok(skillBody.includes(root), 'deployed skill should record the repo root so the manager can be found');
+
+  // Codex uses .codex-plugin, not a skills dir — it must NOT get one.
+  assert.ok(!fs.existsSync(path.join(codex, 'skills', 'baseline')), 'Codex should not get a skills-dir plugin');
+
+  // status + doctor report the skill link healthy.
+  const status = run(['status'], cfg);
+  assert.match(status.stdout, /skill plugin : OK/, 'status should report the agent skill link');
+  const doctor = run(['doctor'], cfg);
+  assert.strictEqual(doctor.status, 0, doctor.stdout);
+  assert.match(doctor.stdout, /skill plugin: central payload deployed/);
+  assert.match(doctor.stdout, /skill link: claude-code linked to center/);
+
+  // uninstall removes the per-agent link but keeps the central payload.
+  assert.strictEqual(run(['uninstall'], cfg).status, 0);
+  assert.ok(!fs.existsSync(path.join(cfg, 'skills', 'baseline')), 'uninstall should remove the agent skill link');
+  assert.ok(fs.existsSync(path.join(home, 'skills', 'baseline')), 'uninstall should keep the central skill payload');
+}
+
+// install with BASELINE_CFG set: config lives FLAT in the external folder, the install
+// root holds only artifacts, <installRoot>/cfg symlinks to the external folder, agents
+// read through the chain, and --force refuses to clobber the (tracked) external config.
+function testExternalConfigLocation(): void {
+  const cfg = tempConfig();
+  const home = homeFor(cfg);
+  const external = cfg + '-extcfg';
+  const env = { BASELINE_CFG: external };
+
+  const install = run(['install'], cfg, undefined, env);
+  assert.strictEqual(install.status, 0, install.stderr || install.stdout);
+
+  // Config files live FLAT in the external folder; no artifacts leak into it.
+  assert.ok(fs.existsSync(path.join(external, 'config.json')), 'external config.json missing');
+  assert.ok(fs.existsSync(path.join(external, 'docs', 'baseline.md')), 'external doc missing');
+  assert.ok(!fs.existsSync(path.join(external, 'hooks')), 'external config must not hold artifacts (hooks)');
+  assert.ok(!fs.existsSync(path.join(external, 'skills')), 'external config must not hold artifacts (skills)');
+
+  // <installRoot>/cfg is a symlink to the external folder; agents read through the chain.
+  assert.ok(fs.lstatSync(path.join(home, 'cfg')).isSymbolicLink(), '<installRoot>/cfg should symlink to BASELINE_CFG');
+  assert.ok(fs.existsSync(path.join(cfg, 'cfg', 'baseline', 'config.json')), 'agent cannot read external config via link chain');
+
+  // doctor healthy + reports the external config location; verify fires.
+  const doctor = run(['doctor'], cfg, undefined, env);
+  assert.strictEqual(doctor.status, 0, doctor.stdout);
+  assert.match(doctor.stdout, /config location: external/);
+  assert.strictEqual(run(['verify'], cfg, undefined, env).status, 0, 'verify should pass with external config');
+
+  // --force must refuse to delete tracked external config.
+  const forced = run(['install', '--force'], cfg, undefined, env);
+  assert.notStrictEqual(forced.status, 0, '--force should refuse on external config');
+  assert.match(forced.stderr, /refusing --force/);
+  assert.ok(fs.existsSync(path.join(external, 'config.json')), '--force must not delete external config');
+}
+
+function testShellWrappersExecutable(): void {
+  for (const file of ['install.sh', 'update.sh', 'doctor.sh', 'uninstall.sh', 'build.sh']) {
+    const r = spawnSync('git', ['ls-files', '--stage', '--', file], { cwd: root, encoding: 'utf8' });
+    assert.strictEqual(r.status, 0, r.stderr);
+    assert.match(r.stdout, /^100755 /, file + ' should be executable in git');
+  }
 }
 
 testCentralInstallAndAgentLinks();
+testCodexInstallAndAgentLinks();
 testCentralEditPropagatesToAgent();
 testIdempotentReinstall();
 testForceReplacesConfigKeepWithout();
@@ -500,21 +755,33 @@ testNativeRuntimePaused();
 testDefaultInstallAndVerify();
 testInvalidSettingsFailsClosed();
 testInvalidSettingsShapeFailsClosed();
+testInvalidNullHookGroupFailsClosed();
 testConfigDrivenWiringAndUnwire();
 testCoResidentHookPreserved();
+testBaselineHookDoesNotInheritMatcher();
 testPerRouteCountersIndependent();
+testMalformedCounterArrayDoesNotBreakFrequency();
 testMatcherSemantics();
 testFailOpenMissingConfig();
 testMalformedConfigInjectsNothing();
 testBadRouteSkippedOthersFire();
 testDocPathTraversalRejected();
+testDocSymlinkEscapeRejected();
+testOversizeDocSkipped();
 testDoctorReportsAndFixes();
 testDoctorDetectsMissingDoc();
 testDoctorFixRefusesInvalidSettings();
+testVerifyRequiresSelectedRouteEvent();
+testVerifyUsesMatchingToolName();
 testUpdateRedeploysDispatcher();
 testUninstallKeepsCentralConfig();
+testClaudeSkillPluginDeployed();
+testClaudePluginManifest();
+testExternalConfigLocation();
 testChecksumsMatchBinaries();
 testPresetsAreValid();
 testBrandAssetsAndReadme();
 testDocsDescribeRoutesModel();
+testCodexPluginManifest();
+testShellWrappersExecutable();
 console.log('baseline tests passed');

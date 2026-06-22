@@ -1,0 +1,28 @@
+{
+  "name": "baseline",
+  "version": "1.0.0",
+  "description": "Drift-correction routes that inject trusted baseline docs through Claude Code and Codex hooks.",
+  "author": {
+    "name": "baseline maintainers"
+  },
+  "license": "MIT",
+  "keywords": [
+    "hooks",
+    "skills",
+    "drift-correction",
+    "baseline"
+  ],
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "baseline",
+    "shortDescription": "Manage baseline hook injection routes.",
+    "longDescription": "baseline installs and manages trusted doc injection routes for Claude Code and Codex hook events.",
+    "developerName": "baseline maintainers",
+    "category": "Productivity",
+    "capabilities": [
+      "Hooks",
+      "Skills"
+    ],
+    "defaultPrompt": "Check baseline status."
+  }
+}

@@ -18,5 +18,5 @@ compacted. Re-state the current task and what is left, then resume.">
 ```
 
 Valid `matcher` values: `startup`, `resume`, `clear`, `compact`. Omit `matcher` to fire
-on every session start. Verify `compact` against your Claude Code version before relying
+on every session start. Verify `compact` against your agent version before relying
 on it.

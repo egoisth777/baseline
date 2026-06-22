@@ -1,15 +1,16 @@
 # Route template: inject on a tool call
 
-`PreToolUse` / `PostToolUse` routes inject a doc around matching tool calls. The
-`matcher` is an **unanchored, case-sensitive regex** tested against the tool name.
-These fire on every matching call, so bound the volume with `matcher` and `freq`.
-Tool routes only ever add context; they never deny a tool.
+`PreToolUse` / `PostToolUse` routes inject a doc around matching tool calls for the
+next model turn. The `matcher` is an **unanchored, case-sensitive regex** tested
+against the tool name. These fire on every matching call, so bound the volume with
+`matcher` and `freq`. Tool routes only ever add context; they never deny or rewrite
+the current tool call.
 
 ## docs/<name>.md (injected verbatim)
 
 ```text
-<reminder relevant to this tool, e.g. "Before this Bash call: prefer the dedicated
-file tools over shell for reading/searching.">
+<reminder relevant after this tool is observed, e.g. "After Bash output: verify the
+result before reporting the work done.">
 ```
 
 ## config.json route

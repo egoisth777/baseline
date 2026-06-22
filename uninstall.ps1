@@ -17,7 +17,7 @@ $code = $LASTEXITCODE
 
 if ($code -eq 0) {
 	Write-Host ""
-	Write-Host "Done. Open /hooks once (or restart Claude Code) so the removed hook is picked up."
+	Write-Host "Done. Open /hooks once in each agent (or restart) so the removed hook is picked up."
 }
 
 exit $code

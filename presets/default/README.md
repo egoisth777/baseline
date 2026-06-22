@@ -33,13 +33,14 @@ A route is one entry in `config.json` `routes[]`:
 - `cwd` — optional, path prefix. The route fires only when the session working directory
   is at or under it.
 
-Add the doc under `docs/`, add the route, then **re-run install/update** so settings
+Add the doc under `docs/`, add the route, then **re-run install/update** so hook
 wiring stays in sync with the events your routes use. See `assets/route-templates/`
 in the baseline repo for ready-to-copy doc+route pairs, or ask the plugin to author one.
 
 ## Runtime caps
 
 - `config.json` ≤ 64 KiB; at most 64 routes.
-- each doc ≤ 64 KiB (an over-cap doc is skipped, others still fire).
+- each doc ≤ 64 KiB and ≤ 10,000 characters (an over-cap doc is skipped, others still fire).
+- combined hook context ≤ 10,000 characters.
 - the dispatcher is fail-open: a missing/malformed config or a broken route injects
   nothing and never blocks the agent. Run `doctor` to see faults.

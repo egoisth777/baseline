@@ -31,7 +31,7 @@ $code = $LASTEXITCODE
 
 if ($code -eq 0) {
 	Write-Host ""
-	Write-Host "Done. Open /hooks once (or restart Claude Code) so the new settings are picked up."
+	Write-Host "Done. Open /hooks once in each agent (or restart) so the new hook config is picked up."
 }
 
 exit $code

@@ -33,4 +33,4 @@ fi
 node "$SCRIPT_DIR/scripts/manage.js" update "$@"
 
 echo
-echo "Done. Open /hooks once (or restart Claude Code) so the refreshed hook is picked up."
+echo "Done. Open /hooks once in each agent (or restart) so the refreshed hook is picked up."

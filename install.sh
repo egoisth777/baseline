@@ -28,4 +28,4 @@ fi
 node "$SCRIPT_DIR/scripts/manage.js" install "$@"
 
 echo
-echo "Done. Open /hooks once (or restart Claude Code) so the new settings are picked up."
+echo "Done. Open /hooks once in each agent (or restart) so the new hook config is picked up."

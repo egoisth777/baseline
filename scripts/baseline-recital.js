@@ -35,15 +35,34 @@ const PRUNE_MS = 7 * 24 * 60 * 60 * 1000;
 const MAX_STDIN_BYTES = 1024 * 1024;
 const MAX_CONFIG_BYTES = 64 * 1024;
 const MAX_DOC_BYTES = 64 * 1024;
+const MAX_DOC_CHARS = 10_000;
 const MAX_COUNTER_BYTES = 1024 * 1024;
 const MAX_ROUTES = 64;
-const claudeDir = process.env.CLAUDE_CONFIG_DIR || path.join(os.homedir(), '.claude');
-// The agent's config folder links back to the central cfg/baseline, so reading
-// here is transparently reading the central config — the dispatcher knows nothing
-// about OMNE_HOME.
-const cfgDir = path.join(claudeDir, 'cfg', 'baseline');
+const MAX_LOCK_WAIT_MS = 2000;
+const LOCK_RETRY_MS = 10;
+const STALE_LOCK_MS = 5000;
+function argValue(name) {
+    for (let i = 2; i < process.argv.length; i++) {
+        const arg = process.argv[i];
+        if (arg === name)
+            return process.argv[i + 1] || null;
+        if (arg.startsWith(name + '='))
+            return arg.slice(name.length + 1) || null;
+    }
+    return null;
+}
+const agentDir = process.env.BASELINE_AGENT_CONFIG_DIR ||
+    argValue('--agent-config') ||
+    process.env.CLAUDE_CONFIG_DIR ||
+    process.env.CODEX_HOME ||
+    path.join(os.homedir(), '.claude');
+// The agent's config folder links back to <install root>/cfg, so reading here is
+// transparently reading the configured config folder — the dispatcher resolves only
+// via the agent dir and knows nothing about BASELINE_HOME / BASELINE_CFG.
+const cfgDir = path.join(agentDir, 'cfg', 'baseline');
 const configPath = path.join(cfgDir, 'config.json');
-const counterPath = path.join(claudeDir, '.baseline-counters.json');
+const counterPath = path.join(agentDir, '.baseline-counters.json');
+const counterLockPath = counterPath + '.lock';
 // Resolve a route's `doc` against the config dir and require it to stay inside
 // cfg/baseline. Doc bytes are trusted context, so this is a trust boundary:
 // reject absolute paths and `..` escapes. Returns the absolute path or null.
@@ -57,6 +76,23 @@ function safeDocPath(doc) {
     if (rel === '' || rel.startsWith('..') || path.isAbsolute(rel))
         return null;
     return resolved;
+}
+function pathInside(base, candidate) {
+    const rel = path.relative(base, candidate);
+    return rel === '' || (!!rel && !rel.startsWith('..') && !path.isAbsolute(rel));
+}
+function safeRealDocPath(doc) {
+    const p = safeDocPath(doc);
+    if (!p)
+        return null;
+    try {
+        const realBase = fs.realpathSync(cfgDir);
+        const realDoc = fs.realpathSync(p);
+        return pathInside(realBase, realDoc) ? p : null;
+    }
+    catch (e) {
+        return null;
+    }
 }
 // Load and validate config.json into the routes the dispatcher will act on.
 // Fail-open: any fatal problem (missing/oversize/malformed config, bad version,
@@ -161,7 +197,7 @@ function cwdMatches(route, data) {
 // Read a route's doc, bounded. Returns the verbatim body, or null to skip (missing,
 // unreadable, over-cap, or — defensively — out of range).
 function readDoc(doc) {
-    const p = safeDocPath(doc);
+    const p = safeRealDocPath(doc);
     if (!p)
         return null;
     try {
@@ -170,6 +206,8 @@ function readDoc(doc) {
             return null;
         const body = fs.readFileSync(p, 'utf8');
         if (Buffer.byteLength(body, 'utf8') > MAX_DOC_BYTES)
+            return null;
+        if (body.length > MAX_DOC_CHARS)
             return null;
         return body;
     }
@@ -187,7 +225,7 @@ function readCounters() {
         if (st.size > MAX_COUNTER_BYTES)
             return {};
         const obj = JSON.parse(fs.readFileSync(counterPath, 'utf8'));
-        return (obj && typeof obj === 'object') ? obj : {};
+        return (obj && typeof obj === 'object' && !Array.isArray(obj)) ? obj : {};
     }
     catch (e) {
         return {};
@@ -203,13 +241,45 @@ function writeCounters(counters) {
         // ENOENT — fine, file will be created.
     }
     try {
-        const tmp = counterPath + '.tmp';
+        const tmp = counterPath + '.' + process.pid + '.' + Date.now() + '.' + Math.random().toString(16).slice(2) + '.tmp';
         fs.writeFileSync(tmp, JSON.stringify(counters), 'utf8');
         fs.renameSync(tmp, counterPath); // atomic replace
     }
     catch (e) {
         // Best-effort; never break the agent over counter I/O.
     }
+}
+function sleep(ms) {
+    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+}
+function acquireCounterLock() {
+    const start = Date.now();
+    while ((Date.now() - start) <= MAX_LOCK_WAIT_MS) {
+        try {
+            fs.mkdirSync(counterLockPath);
+            return true;
+        }
+        catch (e) {
+            if (!e || e.code !== 'EEXIST')
+                return false;
+            try {
+                const st = fs.statSync(counterLockPath);
+                if ((Date.now() - st.mtimeMs) > STALE_LOCK_MS)
+                    fs.rmSync(counterLockPath, { recursive: true, force: true });
+            }
+            catch (staleErr) {
+                // Another process may have removed it.
+            }
+            sleep(LOCK_RETRY_MS);
+        }
+    }
+    return false;
+}
+function releaseCounterLock() {
+    try {
+        fs.rmdirSync(counterLockPath);
+    }
+    catch (e) { }
 }
 let input = '';
 let inputBytes = 0;
@@ -238,27 +308,34 @@ process.stdin.on('end', () => {
         const selected = loadValidRoutes().filter(r => r.event === event && matcherMatches(r, data) && cwdMatches(r, data));
         if (!selected.length)
             return;
-        const now = Date.now();
-        const counters = readCounters();
-        // Prune stale sessions so the map can't grow without bound.
-        for (const key of Object.keys(counters)) {
-            const entry = counters[key];
-            if (!entry || typeof entry.ts !== 'number' || (now - entry.ts) > PRUNE_MS) {
-                delete counters[key];
-            }
-        }
-        // Bump each selected route's per-route counter; collect the ones now due. The
-        // counter domain is "matching invocations", so only selected routes count.
         const due = [];
-        for (const r of selected) {
-            const key = sessionId + ':' + r.id;
-            const prev = counters[key] && typeof counters[key].count === 'number' ? counters[key].count : 0;
-            const count = prev + 1;
-            counters[key] = { count: count, ts: now };
-            if (count % r.freq === 0)
-                due.push(r);
+        if (!acquireCounterLock())
+            return;
+        try {
+            const now = Date.now();
+            const counters = readCounters();
+            // Prune stale sessions so the map can't grow without bound.
+            for (const key of Object.keys(counters)) {
+                const entry = counters[key];
+                if (!entry || typeof entry.ts !== 'number' || (now - entry.ts) > PRUNE_MS) {
+                    delete counters[key];
+                }
+            }
+            // Bump each selected route's per-route counter; collect the ones now due.
+            // The counter domain is "matching invocations", so only selected routes count.
+            for (const r of selected) {
+                const key = sessionId + ':' + r.id;
+                const prev = counters[key] && typeof counters[key].count === 'number' ? counters[key].count : 0;
+                const count = prev + 1;
+                counters[key] = { count: count, ts: now };
+                if (count % r.freq === 0)
+                    due.push(r);
+            }
+            writeCounters(counters);
         }
-        writeCounters(counters);
+        finally {
+            releaseCounterLock();
+        }
         if (!due.length)
             return;
         // Concatenate the due doc bodies in config routes[] order (selected/due both
@@ -267,7 +344,10 @@ process.stdin.on('end', () => {
         const bodies = [];
         for (const r of due) {
             const body = readDoc(r.doc);
-            if (body !== null)
+            if (body === null)
+                continue;
+            const joined = bodies.length ? bodies.join('\n\n') + '\n\n' + body : body;
+            if (joined.length <= MAX_DOC_CHARS)
                 bodies.push(body);
         }
         if (!bodies.length)

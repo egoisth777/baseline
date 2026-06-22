@@ -1,0 +1,19 @@
+{
+  "$schema": "https://anthropic.com/claude-code/plugin.schema.json",
+  "name": "baseline",
+  "version": "1.0.0",
+  "description": "Drift-correction routes that inject trusted baseline docs through Claude Code and Codex hooks.",
+  "author": {
+    "name": "baseline maintainers"
+  },
+  "license": "MIT",
+  "keywords": [
+    "hooks",
+    "skills",
+    "drift-correction",
+    "baseline"
+  ],
+  "skills": [
+    "./"
+  ]
+}

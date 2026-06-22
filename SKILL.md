@@ -1,16 +1,17 @@
 ---
 name: baseline
 description: >-
-  Control surface for the baseline drift-correction system: a Claude Code
+  Control surface for the baseline drift-correction system: a Claude Code/Codex
   dispatcher that injects trusted docs at configurable hook events via
-  user-configurable injection routes in ~/.omne/cfg/baseline/config.json, so the
-  agent recites or receives standing rules before continuing. Use when the user
-  asks to view, edit, add, or remove baseline docs or routes; change an
-  injection's event, frequency, matcher, or cwd scope; install, verify, check
-  status, repair, or uninstall the baseline hook; or manage
-  ~/.omne/cfg/baseline/. Trigger on qualified phrases like "baseline-recital",
-  "baseline rules", "baseline hook", "baseline drift", "baseline route", "change
-  baseline frequency", or "make the agent recite X every N turns".
+  user-configurable injection routes in the baseline config folder (config.json +
+  docs/, at BASELINE_CFG, else ~/.baseline/cfg), so the agent recites or receives
+  standing rules before continuing. Use when the user asks to view, edit, add, or
+  remove baseline docs or routes; change an injection's event, frequency, matcher,
+  or cwd scope; install, verify, check status, repair, or uninstall the baseline
+  hook; or manage the baseline config folder. Trigger on qualified phrases like
+  "baseline-recital", "baseline rules", "baseline hook", "baseline drift",
+  "baseline route", "change baseline frequency", or "make the agent recite X every
+  N turns".
 ---
 
 # baseline
@@ -25,33 +26,35 @@ Content and routing are kept separate: **docs** (`docs/*.md`) hold the verbatim 
 |---|---|---|
 | Dispatcher (canonical) | `src/baseline-recital.ts` → `scripts/baseline-recital.js` | TypeScript source of truth; `npm run build` compiles it. Reads the event, loads `config.json`, selects routes, counts per route, injects due docs verbatim. |
 | Native port | `src/baseline-recital.zig` | Optional native mirror. **Paused** for the routes feature. |
-| Central dispatcher | `~/.omne/hooks/baseline-recital.js` | Canonical deployed hook artifact. |
-| Agent dispatcher link | `~/.claude/hooks/baseline-recital.js` | Installed command path wired in settings; links to central. |
-| Config folder | `~/.omne/cfg/baseline/` (`config.json` + `docs/` + `README.md`) | **Everything tunable**: routes in `config.json`, injected text in `docs/`. Linked into each agent as a unit. |
-| Agent config link | `~/.claude/cfg/baseline/` | Links to the central config folder. Read live via symlink; a copy fallback needs install/update after edits. |
-| Counter state | `~/.claude/.baseline-counters.json` | Per-session, per-route firing state keyed `"<session>:<routeId>"`. Auto-pruned. Never edit by hand. |
-| Wiring | `~/.claude/settings.json` | Our dispatcher command wired into exactly the events the config uses. `install`/`uninstall` manage it. |
-| Manager | `src/manage.ts` → `scripts/manage.js` | install / update / doctor / verify / status / uninstall. Run from repo root. |
-| Presets | `presets/minimal/`, `presets/default/` | Repo-shipped config payloads `install` seeds from. `minimal` is the default floor; `default` is the author's curated baseline. |
+| Install root | `BASELINE_HOME`, else `~/.baseline` | Holds regenerable artifacts only: deployed dispatcher (`hooks/`) + skill payload (`skills/`), plus `cfg` → your config folder. |
+| Deployed dispatcher | `~/.baseline/hooks/baseline-recital.js` | Canonical deployed hook artifact. |
+| Agent dispatcher link | `~/.claude/hooks/baseline-recital.js`, `~/.codex/hooks/baseline-recital.js` | Installed command path wired in hook config; links to the install root. |
+| Config folder | `BASELINE_CFG`, else `~/.baseline/cfg` (`config.json` + `docs/` + `README.md`) | **Everything tunable**: routes in `config.json`, injected text in `docs/`. Pure config — no artifacts. `~/.baseline/cfg` symlinks here when `BASELINE_CFG` is set. |
+| Agent config link | `~/.claude/cfg/baseline/`, `~/.codex/cfg/baseline/` | Links to `~/.baseline/cfg` (your config folder). Read live via symlink; a copy fallback needs install/update after edits. |
+| Skill plugin | `~/.baseline/skills/baseline/` → `~/.claude/skills/baseline/` | Claude-only skills-dir plugin (`baseline@skills-dir`): `.claude-plugin/plugin.json` + a `SKILL.md` wrapper, linked into Claude's skills dir so Claude recognizes baseline and loads this skill. Carries no hooks; Codex uses `.codex-plugin/` instead. |
+| Counter state | `<agent-config>/.baseline-counters.json` | Per-session, per-route firing state keyed `"<session>:<routeId>"`. Auto-pruned. Never edit by hand. |
+| Wiring | `~/.claude/settings.json`, `~/.codex/hooks.json` | Our dispatcher command wired into exactly the events the config uses. `install`/`uninstall` manage it. |
+| Manager | `src/manage.ts` → `scripts/manage.js` | install / update / doctor / verify / status / uninstall. Run from the baseline plugin/repo root. |
+| Presets | `presets/minimal/`, `presets/default/` | Repo-shipped config payloads `install` seeds from. `minimal` is the default floor; `default` is the curated baseline. |
 | Route templates | `assets/route-templates/*.md` | Doc+route authoring references. Never deployed or injected. |
 
-**Key split:** routes/docs are *data* in `cfg/baseline/` (edit anytime; takes effect next firing). The dispatcher is *mechanism* (only changes when you alter how selection/counting/injection works → redeploy via `install`).
+**Key split:** routes/docs are *data* in your config folder (`BASELINE_CFG`, else `~/.baseline/cfg`) — pure config you can keep in a dotfiles repo (edit anytime; takes effect next firing). The dispatcher + skill payload are *mechanism/artifacts* under the install root `~/.baseline` (regenerated by `install`); config and artifacts never share a directory.
 
 For internals (route selection, counting, hardening) read `references/architecture.md`.
 
 ## Requirements and runtime
 
-Requires Claude Code and Node.js. Node runs the manager and the dispatcher. The dispatcher is **Node-only** for v1; the native Zig port is paused, so `--runtime prebuilt|build` is refused.
+Requires Claude Code or Codex, plus Node.js. Node runs the manager and the dispatcher. The dispatcher is **Node-only** for v1; the native Zig port is paused, so `--runtime prebuilt|build` is refused.
 
 ## Trust boundary
 
-Every `docs/*.md` is injected into model context, so treat docs as trusted configuration: inspect edits, keep them short, never paste untrusted text. The dispatcher caps `config.json`/each doc at 64 KiB and routes at 64, resolves each `doc` strictly inside the config folder, and fails open. If `status` reports a copy fallback for the config link, rerun install/update after central edits.
+Every `docs/*.md` is injected into model context, so treat docs as trusted configuration: inspect edits, keep them short, never paste untrusted text. The dispatcher caps `config.json`/each doc at 64 KiB, skips docs over 10,000 characters, caps the combined hook context at 10,000 characters, limits routes to 64, resolves each `doc` strictly inside the config folder after realpath checks, and fails open. If `status` reports a copy fallback for the config link, rerun install/update after editing the config folder.
 
 ## The two most common tasks
 
 ### Edit what is injected, or add a route — usually no reinstall
 
-The config folder is `~/.omne/cfg/baseline/`:
+The config folder is `BASELINE_CFG` (else `~/.baseline/cfg`):
 
 ```json
 {
@@ -63,32 +66,34 @@ The config folder is `~/.omne/cfg/baseline/`:
 ```
 
 - **Change injected text:** edit the doc the route points at (`docs/baseline.md`). The body is injected verbatim — the prefix/restate scaffolding lives inside the doc. Takes effect next firing.
-- **Add a route:** add a `docs/<name>.md` and a `routes[]` entry. Follow `assets/route-templates/`. Then rerun `install`/`update` so settings wiring matches the events your routes use.
+- **Add a route:** add a `docs/<name>.md` and a `routes[]` entry. Follow `assets/route-templates/`. Then rerun `install`/`update` so hook wiring matches the events your routes use.
 - **Change frequency/scope:** edit `freq` / `matcher` / `cwd` on the route.
 - Editing only doc text needs no reinstall when `status` reports a symlink. Adding/removing an *event* requires install/update so wiring re-syncs.
 
 ### Manage the hook itself
 
-Run the manager from the repo root:
+First resolve the baseline repo root, then run the manager from there. When this skill loaded as the Claude skills-dir plugin (`baseline@skills-dir`), its wrapper `SKILL.md` records the repo root explicitly and points here — use that recorded path (note `$CLAUDE_SKILL_DIR` points at the deployed wrapper, not the repo). In Codex, use the plugin root that contains this `SKILL.md`, `.codex-plugin/`, and `scripts/`.
 
 ```bash
-node scripts/manage.js status      # central root, dispatcher sync, routes, per-event wiring
+cd "$BASELINE_REPO"
+node scripts/manage.js status      # install root, config folder, dispatcher sync, routes, wiring
 node scripts/manage.js install     # deploy dispatcher + seed preset + link agent + wire settings
 node scripts/manage.js verify      # functional: confirm a route fires
 node scripts/manage.js update      # redeploy + re-sync wiring from current config
 node scripts/manage.js doctor      # validate config + wiring; --fix to repair
-node scripts/manage.js uninstall   # unwire all events + remove agent links (keeps central config)
+node scripts/manage.js uninstall   # unwire all events + remove agent links (keeps config folder)
 ```
 
-`install --preset default` seeds the author's curated baseline; `--force` replaces an existing config folder (destructive). Or use the platform installers (`./install.sh`, `.\install.ps1`). Commands are idempotent and preserve co-resident hooks — settings edits are surgical.
+`install --preset default` seeds the curated baseline; `--force` replaces an existing config folder (destructive). Or use the platform installers (`./install.sh`, `.\install.ps1`) from the same baseline root. Commands are idempotent and preserve co-resident hooks — hook-config edits are surgical.
 
 ## Workflow guidance for the agent using this skill
 
 1. **Identify the intent.** Editing docs/routes → it's a `cfg/baseline/` edit. Installing/repairing/removing → it's a `manage.js` run. Adding or removing an *event* always needs install/update afterward (wiring re-sync).
-2. **For data edits:** read the relevant doc or `config.json`, make the change, keep docs short, keep `config.json` routing-only (never put injected text in it). Then run `node scripts/manage.js status` to show the live result.
-3. **For mechanism changes** (how selection/counting/injection works): edit `src/baseline-recital.ts` first, then `npm run build` to regenerate `scripts/baseline-recital.js`. The Zig port is paused — don't touch it until the dispatcher stabilizes.
-4. **Always end with `npm test`** (runs `tsc` then `node scripts/test.js`) **plus `status` or `verify`** so the user sees ground truth. After any settings change, remind them: open `/hooks` once or restart so Claude Code reloads settings.
+2. **Resolve the baseline root before any command.** Do not assume the current working directory is this repo/plugin; users invoke skills from their own projects.
+3. **For data edits:** read the relevant doc or `config.json`, make the change, keep docs short, keep `config.json` routing-only (never put injected text in it). Then run `node scripts/manage.js status` from the baseline root to show the live result.
+4. **For mechanism changes** (how selection/counting/injection works): edit `src/baseline-recital.ts` first, then run `npm test` from the baseline root to regenerate and verify `scripts/*.js`. The Zig port is paused — don't touch it until the dispatcher stabilizes.
+5. **For config-only changes:** do not run the user's project tests. End with `status` or `verify` from the baseline root. After any hook-config change, remind them: open `/hooks` once in the relevant agent, or restart, so hook config reloads.
 
 ## Vocabulary
 
-Project terms (route, doc, dispatcher, freq, matcher, cwd scope, preset, route template, config folder, central root) are defined in `.arca/baseline-sp/ubi_lang.md`. Reuse those terms; add a genuinely new concept there first. Never hand-edit the generated `scripts/*.js` or the deployed copy in `~/.omne/hooks/`.
+Project terms (route, doc, dispatcher, freq, matcher, cwd scope, preset, route template, config folder, install root, skill plugin) are defined in `references/ubi_lang.md`. Reuse those terms; add a genuinely new concept there first. Never hand-edit the generated `scripts/*.js` or the deployed copy in `~/.baseline/hooks/`.

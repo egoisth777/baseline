@@ -20,4 +20,4 @@ fi
 node "$SCRIPT_DIR/scripts/manage.js" uninstall
 
 echo
-echo "Done. Open /hooks once (or restart Claude Code) so the removed hook is picked up."
+echo "Done. Open /hooks once in each agent (or restart) so the removed hook is picked up."
