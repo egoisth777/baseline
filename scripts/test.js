@@ -467,6 +467,13 @@ function assertGitVisible(file) {
     const r = (0, child_process_1.spawnSync)('git', ['check-ignore', '-q', '--', file], { cwd: root, encoding: 'utf8' });
     assert.strictEqual(r.status, 1, file + ' should be visible to git; git check-ignore status=' + r.status);
 }
+// Inverse of assertGitVisible: the path must be gitignored (git check-ignore exits 0
+// when a path is ignored). The .arca/<proj>-sp/ knowledge database is local-only and
+// must never be visible to git.
+function assertGitIgnored(file) {
+    const r = (0, child_process_1.spawnSync)('git', ['check-ignore', '-q', '--', file], { cwd: root, encoding: 'utf8' });
+    assert.strictEqual(r.status, 0, file + ' should be gitignored; git check-ignore status=' + r.status);
+}
 function testChecksumsMatchBinaries() {
     const sumsPath = path.join(root, 'bin', 'SHA256SUMS');
     assert.ok(fs.existsSync(sumsPath), 'bin/SHA256SUMS is missing');
@@ -525,15 +532,17 @@ function testBrandAssetsAndReadme() {
 function testDocsDescribeRoutesModel() {
     const readme = fs.readFileSync(path.join(root, 'README.md'), 'utf8');
     const skill = fs.readFileSync(path.join(root, 'SKILL.md'), 'utf8');
-    const architecture = fs.readFileSync(path.join(root, 'references', 'architecture.md'), 'utf8');
-    assert.ok(fs.existsSync(path.join(root, 'references', 'ubi_lang.md')), 'tracked vocabulary reference is missing');
-    assertGitVisible(path.join('references', 'ubi_lang.md'));
-    for (const [name, text] of [['README', readme], ['SKILL', skill], ['architecture', architecture]]) {
+    // Knowledge/reference docs (architecture.md, ubi_lang.md) live in the persistent
+    // knowledge database under .arca/<proj>-sp/, which is intentionally gitignored —
+    // git must never see the knowledge files. Assert that invariant instead of the old
+    // tracked references/ location.
+    assertGitIgnored(path.join('.arca', 'baseline-sp', 'architecture.md'));
+    assertGitIgnored(path.join('.arca', 'baseline-sp', 'ubi_lang.md'));
+    for (const [name, text] of [['README', readme], ['SKILL', skill]]) {
         assert.match(text, /cfg\/baseline/, name + ' should describe the cfg/baseline config folder');
         assert.match(text, /config\.json/, name + ' should mention config.json');
         assert.match(text, /route/i, name + ' should describe routes');
     }
-    assert.ok(!skill.includes('.arca/'), 'SKILL should not reference ignored .arca files');
 }
 function testCodexPluginManifest() {
     const manifestPath = path.join(root, '.codex-plugin', 'plugin.json');

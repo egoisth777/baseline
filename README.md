@@ -174,7 +174,7 @@ baseline/
 │   ├── logo.svg                 # Scalable logo source
 │   ├── logo.txt                 # Plain text ASM logo
 │   └── logo.ans                 # ANSI ASM logo
-├── references/architecture.md   # Internals: routing, counting, injection, hardening
+├── .arca/baseline-sp/           # Persistent knowledge DB (gitignored, local): architecture.md, ubi_lang.md
 ├── .claude-plugin/plugin.json   # Claude plugin manifest (skill-only; deployed as baseline@skills-dir)
 ├── .codex-plugin/plugin.json    # Codex plugin manifest
 ├── skills/baseline/SKILL.md     # Codex plugin skill wrapper
