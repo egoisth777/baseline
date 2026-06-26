@@ -11,7 +11,13 @@ const root = path.resolve(__dirname, '..');
 const manage = path.join(root, 'scripts', 'manage.js');
 const dispatcher = path.join(root, 'scripts', 'baseline-recital.js');
 function tempConfig() {
-    return fs.mkdtempSync(path.join(os.tmpdir(), 'baseline-test-'));
+    const cfg = fs.mkdtempSync(path.join(os.tmpdir(), 'baseline-test-'));
+    // Detection is by config-dir existence (CLAUDE_CONFIG_DIR / CODEX_HOME). mkdtemp
+    // already created the claude config dir; create the codex one too so BOTH agents are
+    // detected by default and the both-agent tests keep wiring both. Detection tests that
+    // need an agent ABSENT remove its config dir explicitly before installing.
+    fs.mkdirSync(codexFor(cfg), { recursive: true });
+    return cfg;
 }
 // Each test gets an isolated install root alongside its config dir, so install
 // never touches the real ~/.baseline. Deterministic: derived from the unique cfg.
@@ -702,45 +708,225 @@ function testShellWrappersExecutable() {
         assert.match(r.stdout, /^100755 /, file + ' should be executable in git');
     }
 }
-testCentralInstallAndAgentLinks();
-testCodexInstallAndAgentLinks();
-testCentralEditPropagatesToAgent();
-testIdempotentReinstall();
-testForceReplacesConfigKeepWithout();
-testUnknownPresetFails();
-testNativeRuntimePaused();
-testDefaultInstallAndVerify();
-testMinimalPresetWiresOnlyUserPromptSubmit();
-testDefaultPresetWiresBaseEventsBothAgents();
-testInvalidSettingsFailsClosed();
-testInvalidSettingsShapeFailsClosed();
-testInvalidNullHookGroupFailsClosed();
-testConfigDrivenWiringAndUnwire();
-testCoResidentHookPreserved();
-testBaselineHookDoesNotInheritMatcher();
-testPerRouteCountersIndependent();
-testMalformedCounterArrayDoesNotBreakFrequency();
-testEventNameSemantics();
-testFailOpenMissingConfig();
-testMalformedConfigInjectsNothing();
-testBadRouteSkippedOthersFire();
-testDocPathTraversalRejected();
-testDocSymlinkEscapeRejected();
-testOversizeDocSkipped();
-testDoctorReportsAndFixes();
-testDoctorDetectsMissingDoc();
-testDoctorFixRefusesInvalidSettings();
-testVerifyRequiresSelectedRouteEvent();
-testVerifyToolEventFires();
-testUpdateRedeploysDispatcher();
-testUninstallKeepsCentralConfig();
-testClaudeSkillPluginDeployed();
-testClaudePluginManifest();
-testExternalConfigLocation();
-testChecksumsMatchBinaries();
-testPresetsAreValid();
-testBrandAssetsAndReadme();
-testDocsDescribeRoutesModel();
-testCodexPluginManifest();
-testShellWrappersExecutable();
-console.log('baseline tests passed');
+// --- guided agent selection on install (R-004) -----------------------------
+// --agents selects a subset: only claude-code is wired, codex is left alone, and
+// the selected set is recorded verbatim in <installRoot>/state.json.
+function testAgentsFlagSelectsSubset() {
+    const cfg = tempConfig();
+    const home = homeFor(cfg);
+    const codex = codexFor(cfg);
+    const install = run(['install', '--agents', 'claude-code'], cfg);
+    assert.strictEqual(install.status, 0, install.stderr || install.stdout);
+    const settings = JSON.parse(fs.readFileSync(path.join(cfg, 'settings.json'), 'utf8'));
+    assert.ok(settings.hooks && settings.hooks.UserPromptSubmit, 'claude-code should be wired');
+    assert.ok(!fs.existsSync(path.join(codex, 'hooks.json')), 'codex must not be wired when not selected');
+    const state = JSON.parse(fs.readFileSync(path.join(home, 'state.json'), 'utf8'));
+    assert.deepStrictEqual(state, { agents: ['claude-code'] }, 'state.json should record exactly the selected set');
+}
+// --agents with the full comma list wires both agents and records both.
+function testAgentsFlagBothExplicit() {
+    const cfg = tempConfig();
+    const home = homeFor(cfg);
+    const codex = codexFor(cfg);
+    const install = run(['install', '--agents', 'claude-code,codex'], cfg);
+    assert.strictEqual(install.status, 0, install.stderr || install.stdout);
+    const settings = JSON.parse(fs.readFileSync(path.join(cfg, 'settings.json'), 'utf8'));
+    assert.ok(settings.hooks && settings.hooks.UserPromptSubmit, 'claude-code should be wired');
+    const hooks = JSON.parse(fs.readFileSync(path.join(codex, 'hooks.json'), 'utf8'));
+    assert.ok(hooks.hooks && hooks.hooks.UserPromptSubmit, 'codex should be wired');
+    const state = JSON.parse(fs.readFileSync(path.join(home, 'state.json'), 'utf8'));
+    assert.deepStrictEqual(state.agents.slice().sort(), ['claude-code', 'codex'], 'state.json should record both');
+}
+// An unknown agent name is a hard error (non-zero exit) that names the offender.
+function testUnknownAgentErrors() {
+    const cfg = tempConfig();
+    const install = run(['install', '--agents', 'bogus'], cfg);
+    assert.notStrictEqual(install.status, 0, 'unknown agent should be a hard error');
+    assert.match((install.stderr || '') + (install.stdout || ''), /bogus/, 'error should name the bad agent');
+}
+// Selecting an agent whose config dir does not exist is a hard error (D2: strictly
+// limited to detected agents).
+function testNotDetectedAgentErrors() {
+    const cfg = tempConfig();
+    const codex = codexFor(cfg);
+    fs.rmSync(codex, { recursive: true, force: true });
+    const install = run(['install', '--agents', 'codex'], cfg);
+    assert.notStrictEqual(install.status, 0, 'selecting a not-detected agent should fail');
+    assert.match((install.stderr || '') + (install.stdout || ''), /codex/, 'error should name the not-detected agent');
+}
+// Non-interactive (spawnSync is not a TTY) with no --agents selects ALL detected.
+function testNonTtyWiresAllDetected() {
+    const cfg = tempConfig();
+    const home = homeFor(cfg);
+    const codex = codexFor(cfg);
+    const install = run(['install'], cfg);
+    assert.strictEqual(install.status, 0, install.stderr || install.stdout);
+    assert.ok(fs.existsSync(path.join(cfg, 'settings.json')), 'claude-code should be wired');
+    assert.ok(fs.existsSync(path.join(codex, 'hooks.json')), 'codex should be wired');
+    const state = JSON.parse(fs.readFileSync(path.join(home, 'state.json'), 'utf8'));
+    assert.deepStrictEqual(state.agents.slice().sort(), ['claude-code', 'codex'], 'state.json should record both detected');
+}
+// Selection is strictly limited to detected agents: with the codex config dir
+// removed, a plain install wires only claude-code and records only it.
+function testStrictlyDetectedOnly() {
+    const cfg = tempConfig();
+    const home = homeFor(cfg);
+    const codex = codexFor(cfg);
+    fs.rmSync(codex, { recursive: true, force: true });
+    const install = run(['install'], cfg);
+    assert.strictEqual(install.status, 0, install.stderr || install.stdout);
+    assert.ok(fs.existsSync(path.join(cfg, 'settings.json')), 'claude-code should be wired');
+    assert.ok(!fs.existsSync(path.join(codex, 'hooks.json')), 'codex must not be wired when its config dir is absent');
+    const state = JSON.parse(fs.readFileSync(path.join(home, 'state.json'), 'utf8'));
+    assert.deepStrictEqual(state.agents, ['claude-code'], 'state.json should record only the detected agent');
+}
+// Zero detected agents => non-zero exit with guidance; nothing wired or recorded.
+function testZeroDetectedErrors() {
+    const cfg = tempConfig();
+    const home = homeFor(cfg);
+    const codex = codexFor(cfg);
+    fs.rmSync(cfg, { recursive: true, force: true });
+    fs.rmSync(codex, { recursive: true, force: true });
+    const install = run(['install'], cfg);
+    assert.notStrictEqual(install.status, 0, 'zero detected agents should fail');
+    assert.match((install.stderr || '') + (install.stdout || ''), /no supported agents detected/i, 'should print guidance');
+    assert.ok(!fs.existsSync(path.join(home, 'state.json')), 'nothing should be recorded on zero-detected');
+}
+// update honors the recorded set: a claude-only install stays claude-only on update
+// even after the codex config dir appears (D6).
+function testUpdateScopesToRecordedSet() {
+    const cfg = tempConfig();
+    const home = homeFor(cfg);
+    const codex = codexFor(cfg);
+    assert.strictEqual(run(['install', '--agents', 'claude-code'], cfg).status, 0);
+    fs.mkdirSync(codex, { recursive: true }); // codex now detectable, but not recorded
+    const update = run(['update'], cfg);
+    assert.strictEqual(update.status, 0, update.stderr || update.stdout);
+    assert.ok(!fs.existsSync(path.join(codex, 'hooks.json')), 'update must not wire an agent outside the recorded set');
+    const state = JSON.parse(fs.readFileSync(path.join(home, 'state.json'), 'utf8'));
+    assert.deepStrictEqual(state.agents, ['claude-code'], 'recorded set must be preserved across update');
+}
+// A legacy install with no state.json infers the set from the currently-wired
+// agents on first update, persists it, and never silently unwires (D6).
+function testUpdateMigrationInfersFromWired() {
+    const cfg = tempConfig();
+    const home = homeFor(cfg);
+    const codex = codexFor(cfg);
+    assert.strictEqual(run(['install'], cfg).status, 0);
+    fs.rmSync(path.join(home, 'state.json'), { force: true }); // simulate a legacy install
+    const update = run(['update'], cfg);
+    assert.strictEqual(update.status, 0, update.stderr || update.stdout);
+    const state = JSON.parse(fs.readFileSync(path.join(home, 'state.json'), 'utf8'));
+    assert.deepStrictEqual(state.agents.slice().sort(), ['claude-code', 'codex'], 'update should recreate state.json from the wired set');
+    const settings = JSON.parse(fs.readFileSync(path.join(cfg, 'settings.json'), 'utf8'));
+    assert.ok(settings.hooks && settings.hooks.UserPromptSubmit, 'claude-code must remain wired');
+    const hooks = JSON.parse(fs.readFileSync(path.join(codex, 'hooks.json'), 'utf8'));
+    assert.ok(hooks.hooks && hooks.hooks.UserPromptSubmit, 'codex must remain wired');
+}
+// uninstall scopes to the recorded set: a claude-only install's uninstall removes
+// claude wiring and never touches codex (D6).
+function testUninstallScopesToRecordedSet() {
+    const cfg = tempConfig();
+    const codex = codexFor(cfg);
+    assert.strictEqual(run(['install', '--agents', 'claude-code'], cfg).status, 0);
+    const uninstall = run(['uninstall'], cfg);
+    assert.strictEqual(uninstall.status, 0, uninstall.stderr || uninstall.stdout);
+    const settings = JSON.parse(fs.readFileSync(path.join(cfg, 'settings.json'), 'utf8'));
+    assert.ok(!settings.hooks || !settings.hooks.UserPromptSubmit || !settings.hooks.UserPromptSubmit.length, 'uninstall should remove claude-code wiring');
+    assert.ok(!fs.existsSync(path.join(codex, 'hooks.json')), 'uninstall scoped to [claude-code] must not create/touch codex hooks.json');
+}
+// A recorded agent whose config dir later vanishes is dropped GRACEFULLY on update
+// (exit 0) with a notice — never a hard error — and the recorded set narrows to what
+// remains (D6: drop-with-notice, not silent and not a hard error). The hard error is
+// reserved for an explicit user-supplied --agents (D1).
+function testUpdateDropsVanishedRecordedAgent() {
+    const cfg = tempConfig();
+    const home = homeFor(cfg);
+    const codex = codexFor(cfg);
+    assert.strictEqual(run(['install', '--agents', 'claude-code,codex'], cfg).status, 0);
+    // codex disappears (config dir removed) after being recorded + wired.
+    fs.rmSync(codex, { recursive: true, force: true });
+    const update = run(['update'], cfg);
+    assert.strictEqual(update.status, 0, update.stderr || update.stdout);
+    assert.match(update.stdout, /recorded agent "codex" no longer detected/, 'update should announce the dropped agent');
+    assert.match(update.stdout, /dropped from selection/, 'notice should say the agent was dropped');
+    const state = JSON.parse(fs.readFileSync(path.join(home, 'state.json'), 'utf8'));
+    assert.deepStrictEqual(state.agents, ['claude-code'], 'recorded set should narrow to the surviving agent');
+    const settings = JSON.parse(fs.readFileSync(path.join(cfg, 'settings.json'), 'utf8'));
+    assert.ok(settings.hooks && settings.hooks.UserPromptSubmit, 'claude-code must remain wired');
+    assert.ok(!fs.existsSync(path.join(codex, 'hooks.json')), 'dropped codex must not be wired');
+}
+// --- runner -----------------------------------------------------------------
+const TESTS = [
+    ['testCentralInstallAndAgentLinks', testCentralInstallAndAgentLinks],
+    ['testCodexInstallAndAgentLinks', testCodexInstallAndAgentLinks],
+    ['testCentralEditPropagatesToAgent', testCentralEditPropagatesToAgent],
+    ['testIdempotentReinstall', testIdempotentReinstall],
+    ['testForceReplacesConfigKeepWithout', testForceReplacesConfigKeepWithout],
+    ['testUnknownPresetFails', testUnknownPresetFails],
+    ['testNativeRuntimePaused', testNativeRuntimePaused],
+    ['testDefaultInstallAndVerify', testDefaultInstallAndVerify],
+    ['testMinimalPresetWiresOnlyUserPromptSubmit', testMinimalPresetWiresOnlyUserPromptSubmit],
+    ['testDefaultPresetWiresBaseEventsBothAgents', testDefaultPresetWiresBaseEventsBothAgents],
+    ['testInvalidSettingsFailsClosed', testInvalidSettingsFailsClosed],
+    ['testInvalidSettingsShapeFailsClosed', testInvalidSettingsShapeFailsClosed],
+    ['testInvalidNullHookGroupFailsClosed', testInvalidNullHookGroupFailsClosed],
+    ['testConfigDrivenWiringAndUnwire', testConfigDrivenWiringAndUnwire],
+    ['testCoResidentHookPreserved', testCoResidentHookPreserved],
+    ['testBaselineHookDoesNotInheritMatcher', testBaselineHookDoesNotInheritMatcher],
+    ['testPerRouteCountersIndependent', testPerRouteCountersIndependent],
+    ['testMalformedCounterArrayDoesNotBreakFrequency', testMalformedCounterArrayDoesNotBreakFrequency],
+    ['testEventNameSemantics', testEventNameSemantics],
+    ['testFailOpenMissingConfig', testFailOpenMissingConfig],
+    ['testMalformedConfigInjectsNothing', testMalformedConfigInjectsNothing],
+    ['testBadRouteSkippedOthersFire', testBadRouteSkippedOthersFire],
+    ['testDocPathTraversalRejected', testDocPathTraversalRejected],
+    ['testDocSymlinkEscapeRejected', testDocSymlinkEscapeRejected],
+    ['testOversizeDocSkipped', testOversizeDocSkipped],
+    ['testDoctorReportsAndFixes', testDoctorReportsAndFixes],
+    ['testDoctorDetectsMissingDoc', testDoctorDetectsMissingDoc],
+    ['testDoctorFixRefusesInvalidSettings', testDoctorFixRefusesInvalidSettings],
+    ['testVerifyRequiresSelectedRouteEvent', testVerifyRequiresSelectedRouteEvent],
+    ['testVerifyToolEventFires', testVerifyToolEventFires],
+    ['testUpdateRedeploysDispatcher', testUpdateRedeploysDispatcher],
+    ['testUninstallKeepsCentralConfig', testUninstallKeepsCentralConfig],
+    ['testClaudeSkillPluginDeployed', testClaudeSkillPluginDeployed],
+    ['testClaudePluginManifest', testClaudePluginManifest],
+    ['testExternalConfigLocation', testExternalConfigLocation],
+    ['testChecksumsMatchBinaries', testChecksumsMatchBinaries],
+    ['testPresetsAreValid', testPresetsAreValid],
+    ['testBrandAssetsAndReadme', testBrandAssetsAndReadme],
+    ['testDocsDescribeRoutesModel', testDocsDescribeRoutesModel],
+    ['testCodexPluginManifest', testCodexPluginManifest],
+    ['testShellWrappersExecutable', testShellWrappersExecutable],
+    // guided agent selection (R-004)
+    ['testAgentsFlagSelectsSubset', testAgentsFlagSelectsSubset],
+    ['testAgentsFlagBothExplicit', testAgentsFlagBothExplicit],
+    ['testUnknownAgentErrors', testUnknownAgentErrors],
+    ['testNotDetectedAgentErrors', testNotDetectedAgentErrors],
+    ['testNonTtyWiresAllDetected', testNonTtyWiresAllDetected],
+    ['testStrictlyDetectedOnly', testStrictlyDetectedOnly],
+    ['testZeroDetectedErrors', testZeroDetectedErrors],
+    ['testUpdateScopesToRecordedSet', testUpdateScopesToRecordedSet],
+    ['testUpdateMigrationInfersFromWired', testUpdateMigrationInfersFromWired],
+    ['testUninstallScopesToRecordedSet', testUninstallScopesToRecordedSet],
+    ['testUpdateDropsVanishedRecordedAgent', testUpdateDropsVanishedRecordedAgent],
+];
+let passed = 0;
+let failed = 0;
+for (const [name, fn] of TESTS) {
+    try {
+        fn();
+        passed++;
+    }
+    catch (e) {
+        failed++;
+        console.error('FAIL ' + name + ': ' + ((e && e.message) ? e.message : String(e)));
+    }
+}
+if (failed) {
+    console.error('');
+    console.error(failed + ' failed, ' + passed + ' passed');
+    process.exit(1);
+}
+console.log('baseline tests passed (' + passed + ')');

@@ -4,7 +4,7 @@
 //
 // Usage (run with node from the repo root):
 //   node scripts/manage.js status              report what's installed vs the repo source + config
-//   node scripts/manage.js install [--preset <name>] [--force]
+//   node scripts/manage.js install [--preset <name>] [--force] [--agents <a,b>]
 //   node scripts/manage.js verify              functional check: does a route fire?
 //   node scripts/manage.js update              redeploy from repo, re-sync hook wiring
 //   node scripts/manage.js doctor [--fix]      validate config + wiring; --fix repairs
@@ -38,6 +38,7 @@
 import * as fs from 'fs';
 import * as path from 'path';
 import * as os from 'os';
+import * as readline from 'readline';
 import { spawnSync } from 'child_process';
 
 // --- types -----------------------------------------------------------------
@@ -108,6 +109,10 @@ interface Check {
 interface InstallOpts {
   preset: string;
   force: boolean;
+  // Explicit agent selection (--agents a,b). When set, every name must be a detected
+  // agent or install fails. Undefined => selection is resolved at install time
+  // (recorded set, interactive prompt, or all detected).
+  agents?: string[];
 }
 
 // --- constants -------------------------------------------------------------
@@ -240,6 +245,90 @@ function agentPaths(agent: Agent): AgentPaths {
 
 function allAgentPaths(): AgentPaths[] {
   return agentRegistry().map(agentPaths);
+}
+
+// --- agent detection + recorded selection (state.json) ---------------------
+
+// Detect which agents are present by config-dir existence (D2). Selection is STRICTLY
+// limited to this set — install never wires an agent whose config dir is absent.
+function detectedAgents(): AgentPaths[] {
+  return allAgentPaths().filter(ap => fs.existsSync(ap.configDir));
+}
+
+// The persisted record of which agents this install wired (D5), under the install root.
+function stateFile(): string {
+  return path.join(central.root, 'state.json');
+}
+
+// Read the recorded agent set, or null when absent/empty/corrupt so callers fall back
+// to inference or detection rather than wiring nothing.
+function readRecordedAgents(): string[] | null {
+  const r = readJson(stateFile());
+  if (!r.ok || r.missing) return null;
+  const v = r.value;
+  if (!v || typeof v !== 'object' || Array.isArray(v) || !Array.isArray(v.agents)) return null;
+  const names = v.agents.filter((x: any) => typeof x === 'string');
+  return names.length ? names : null;
+}
+
+// Persist the selected agent set as { "agents": [...] } via the atomic writer (D5).
+function writeRecordedAgents(names: string[]): void {
+  atomicWrite(stateFile(), JSON.stringify({ agents: names }, null, 2) + '\n');
+}
+
+// Infer the agent set from what is currently wired (D6 migration): an agent counts as
+// wired when our dispatcher command is present in its (readable) settings.
+function inferWiredAgentNames(): string[] {
+  const out: string[] = [];
+  for (const ap of allAgentPaths()) {
+    const { settings, error } = settingsForRead(ap);
+    if (error) continue;
+    if (findOurCommand(settings, ap)) out.push(ap.name);
+  }
+  return out;
+}
+
+// The agent set a post-install command (uninstall/doctor) operates on: the recorded set
+// wins; else infer from currently-wired; else fall back to all agents (D6).
+function scopedAgentNames(): string[] {
+  const recorded = readRecordedAgents();
+  if (recorded) return recorded;
+  const inferred = inferWiredAgentNames();
+  if (inferred.length) return inferred;
+  return allAgentPaths().map(ap => ap.name);
+}
+
+// Parse a --agents comma list into trimmed, non-empty names. An empty value is an error.
+function parseAgentList(value: string, cmd: string): string[] {
+  const names = value.split(',').map(s => s.trim()).filter(Boolean);
+  if (!names.length) fail(cmd + ': --agents needs at least one agent name (e.g. claude-code,codex).', 2);
+  return names;
+}
+
+// Interactive multi-select over the detected agents (D3) — only reached when stdin is a
+// TTY and neither --agents nor --force was given. A blank answer selects all detected;
+// numbers (or names) pick a subset.
+function promptAgentSelection(detected: AgentPaths[]): Promise<string[]> {
+  return new Promise((resolve) => {
+    const all = detected.map(ap => ap.name);
+    console.log('[baseline] multiple agents detected. Select which to wire:');
+    detected.forEach((ap, i) => console.log('  ' + (i + 1) + ') ' + ap.name + '  (' + ap.configDir + ')'));
+    const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+    rl.question('Enter numbers or names (comma-separated), or blank for all: ', (answer) => {
+      rl.close();
+      const tokens = (answer || '').split(',').map(s => s.trim()).filter(Boolean);
+      if (!tokens.length) { resolve(all); return; }
+      const picked: string[] = [];
+      for (const tok of tokens) {
+        let name: string | null = null;
+        const idx = Number(tok);
+        if (Number.isInteger(idx) && idx >= 1 && idx <= detected.length) name = detected[idx - 1].name;
+        else if (all.indexOf(tok) !== -1) name = tok;
+        if (name && picked.indexOf(name) === -1) picked.push(name);
+      }
+      resolve(picked.length ? picked : all);
+    });
+  });
 }
 
 function fail(message: string, code?: number): never {
@@ -815,10 +904,58 @@ function ensureCentralSkill(): void {
 
 // --- commands --------------------------------------------------------------
 
-function cmdInstall(opts: InstallOpts): void {
-  const agentsP = allAgentPaths();
+async function cmdInstall(opts: InstallOpts): Promise<void> {
+  // 0. Detect agents by config-dir existence; selection is strictly limited to these (D2).
+  const detected = detectedAgents();
+  if (!detected.length) {
+    const looked = allAgentPaths().map(ap => ap.name + ' (' + ap.configDir + ')').join(', ');
+    fail('no supported agents detected — looked for ' + looked +
+      '. Create one of these config dirs (or install the agent), then re-run.', 1);
+  }
+  const detectedNames = detected.map(ap => ap.name);
 
-  // 1. Refuse before any deploy if an agent hook config file is invalid.
+  // Resolve the SELECTED agent names.
+  let selected: string[];
+  if (opts.agents && opts.agents.length) {
+    // Explicit --agents (or update/uninstall passing a recorded set): every name must be
+    // a detected agent — an unknown OR not-detected name is a hard error (D1).
+    const requested = opts.agents;
+    for (const name of requested) {
+      if (detectedNames.indexOf(name) !== -1) continue;
+      const known = agentRegistry().some(a => a.name === name);
+      if (!known) {
+        fail('unknown agent "' + name + '" (known agents: ' + agentRegistry().map(a => a.name).join(', ') + ').', 2);
+      }
+      fail('agent "' + name + '" is not detected (no config dir at ' +
+        agentPaths(agentRegistry().find(a => a.name === name)!).configDir + '). Detected: ' + detectedNames.join(', ') + '.', 2);
+    }
+    selected = requested.filter((n, i) => requested.indexOf(n) === i);
+  } else {
+    const recorded = readRecordedAgents();
+    if (recorded) {
+      // Re-install/update path: honor the recorded set, intersected with detection so a
+      // now-absent agent is never wired (D2/D6). A recorded agent that is no longer
+      // detected is dropped GRACEFULLY with a notice (not silent, not a hard error — the
+      // hard error is reserved for an explicit --agents, D1); the narrowed set is then
+      // re-persisted below.
+      for (const n of recorded) {
+        if (detectedNames.indexOf(n) === -1) {
+          console.log('[baseline] recorded agent "' + n + '" no longer detected (config dir absent) — dropped from selection');
+        }
+      }
+      selected = recorded.filter(n => detectedNames.indexOf(n) !== -1);
+    } else if (process.stdin.isTTY && !opts.force) {
+      selected = await promptAgentSelection(detected);
+    } else {
+      // --force or non-TTY: all detected, no prompt (D3).
+      selected = detectedNames.slice();
+    }
+  }
+
+  const selectedSet = new Set(selected);
+  const agentsP = detected.filter(ap => selectedSet.has(ap.name));
+
+  // 1. Refuse before any deploy if a SELECTED agent's hook config file is invalid.
   for (const ap of agentsP) settingsOrEmptyForWrite(ap);
 
   // 2. ALWAYS deploy the canonical .js to the CENTER (overwrite; repo wins).
@@ -839,6 +976,9 @@ function cmdInstall(opts: InstallOpts): void {
 
   // 4. Read the config to learn which events to wire.
   const cfg = loadCentralConfig();
+
+  // 4b. Persist the selected agent set so update/doctor/uninstall scope to it (D5).
+  if (selected.length) writeRecordedAgents(selected);
 
   // 5. For each agent: link the center in, then wire hook config for the config's events.
   const perAgent = [];
@@ -870,7 +1010,9 @@ function cmdInstall(opts: InstallOpts): void {
 }
 
 function cmdUninstall(): void {
-  const agentsP = allAgentPaths();
+  // Operate on the recorded set (D6); fall back to inferred-from-wired, then all.
+  const scoped = new Set(scopedAgentNames());
+  const agentsP = allAgentPaths().filter(ap => scoped.has(ap.name));
   console.log('[baseline] uninstall');
   for (const ap of agentsP) {
     let unwired;
@@ -1007,10 +1149,19 @@ function cmdVerify(): void {
 
 // Re-deploy the central dispatcher + re-sync hook wiring from the CURRENT repo
 // source and central config. Keeps the existing config folder (no preset reseed).
-function cmdUpdate(): void {
+async function cmdUpdate(): Promise<void> {
   console.log('[baseline] update — redeploying dispatcher + re-syncing wiring from current config');
   console.log('');
-  cmdInstall({ preset: DEFAULT_PRESET, force: false });
+  // Ensure the recorded set exists (D6): a legacy install with no record infers it from
+  // the currently-wired agents and persists it, so the set is never silently lost. We
+  // then run install with NO explicit agents, so cmdInstall's recorded path narrows the
+  // set against detection GRACEFULLY (drop-with-notice + re-persist) rather than the
+  // explicit --agents hard-fail (D1), which is reserved for user-supplied selections.
+  if (!readRecordedAgents()) {
+    const inferred = inferWiredAgentNames();
+    if (inferred.length) writeRecordedAgents(inferred);
+  }
+  await cmdInstall({ preset: DEFAULT_PRESET, force: false });
 }
 
 // Inspect the installation and return a list of checks.
@@ -1073,7 +1224,9 @@ function doctorChecks(): Check[] {
     checks.push({ name: 'skill plugin', level: 'ok', detail: 'central payload deployed' });
   }
 
-  for (const ap of allAgentPaths()) {
+  // Scope the per-agent checks to the recorded set (D6); fall back to inferred, then all.
+  const scoped = new Set(scopedAgentNames());
+  for (const ap of allAgentPaths().filter(ap => scoped.has(ap.name))) {
     const sr = settingsForRead(ap);
     if (sr.error) {
       checks.push({ name: 'hook config', level: 'fail', detail: ap.name + ' ' + ap.settingsLabel + ' invalid (' + sr.error.message + ') — fix by hand; install refuses to rewrite it', fixable: false });
@@ -1124,7 +1277,7 @@ function printDoctorChecks(checks: Check[]): void {
   }
 }
 
-function cmdDoctor(fix: boolean): void {
+async function cmdDoctor(fix: boolean): Promise<void> {
   console.log('[baseline] doctor — scanning installation');
   console.log('  install root : ' + central.root);
   console.log('');
@@ -1162,7 +1315,7 @@ function cmdDoctor(fix: boolean): void {
   console.log('[baseline] doctor --fix: repairing via update...');
   console.log('');
   try {
-    cmdUpdate();
+    await cmdUpdate();
   } catch (e) {
     fail('doctor --fix: ' + e.message, 1);
   }
@@ -1187,7 +1340,7 @@ function printHelp(): void {
   console.log('');
   console.log('Usage:');
   console.log('  node scripts/manage.js status                  Report what is installed vs the repo source + config.');
-  console.log('  node scripts/manage.js install [--preset <n>]  Deploy the dispatcher, seed the config preset, link agents, wire hook config.');
+  console.log('  node scripts/manage.js install [--preset <n>] [--agents <a,b>]  Deploy the dispatcher, seed the config preset, link agents, wire hook config.');
   console.log('  node scripts/manage.js verify                  Functionally test a wired route (does it fire?).');
   console.log('  node scripts/manage.js update                  Redeploy dispatcher + re-sync hook wiring from current config.');
   console.log('  node scripts/manage.js doctor [--fix]          Validate config + wiring and report health; --fix repairs it.');
@@ -1197,7 +1350,9 @@ function printHelp(): void {
   console.log('install options:');
   console.log('  --preset <minimal|default>   Which repo preset to seed when no config folder exists. Default: minimal.');
   console.log('  --force                      Replace an existing central config folder with the preset (DESTRUCTIVE — user edits lost).');
+  console.log('  --agents <a,b>               Comma list of agents to wire (claude-code,codex). Each must be detected. Default: prompt on a TTY, else all detected.');
   console.log('');
+  console.log('Agents are detected by config-dir existence; an install/update/uninstall scopes to the agents recorded in <install root>/state.json.');
   console.log('Native Zig runtime is paused for the routes feature; the dispatcher is Node-only in v1.');
   console.log('A Claude skills-dir plugin (baseline@skills-dir) is deployed + linked so Claude recognizes baseline; it carries no hooks.');
   console.log('Install root (artifacts): BASELINE_HOME if set, otherwise ~/.baseline.');
@@ -1220,6 +1375,13 @@ function parseInstallOpts(argv: string[], cmd?: string): InstallOpts {
       if (!opts.preset) fail(cmd + ': --preset needs a value (e.g. minimal|default).', 2);
     } else if (a === '--force' || a === '-force') {
       opts.force = true;
+    } else if (a === '--agents' || a === '-agents') {
+      const val = argv[i + 1] || '';
+      i++;
+      if (!val) fail(cmd + ': --agents needs a comma-separated value (e.g. claude-code,codex).', 2);
+      opts.agents = parseAgentList(val, cmd);
+    } else if (a.startsWith('--agents=')) {
+      opts.agents = parseAgentList(a.slice(a.indexOf('=') + 1), cmd);
     } else if (a === '--runtime' || a === '-runtime' || a.startsWith('--runtime=') || a === '--build' || a === '-build') {
       fail(cmd + ': native runtime is paused for the routes feature; the dispatcher is Node-only in v1.', 2);
     }
@@ -1238,8 +1400,7 @@ if (!cmd || cmd === 'help' || cmd === '--help' || cmd === '-h') {
 
 switch (cmd) {
   case 'install':
-    try { cmdInstall(parseInstallOpts(process.argv.slice(3))); }
-    catch (e) { fail('install: ' + e.message, 1); }
+    cmdInstall(parseInstallOpts(process.argv.slice(3))).catch((e) => fail('install: ' + e.message, 1));
     break;
   case 'uninstall':
     try { cmdUninstall(); }
@@ -1252,14 +1413,12 @@ switch (cmd) {
     cmdVerify();
     break;
   case 'update':
-    try {
-      parseInstallOpts(process.argv.slice(3), 'update'); // reject native flags
-      cmdUpdate();
-    } catch (e) { fail('update: ' + e.message, 1); }
+    parseInstallOpts(process.argv.slice(3), 'update'); // reject native flags
+    cmdUpdate().catch((e) => fail('update: ' + e.message, 1));
     break;
   case 'doctor':
     parseInstallOpts(process.argv.slice(3), 'doctor'); // reject native flags
-    cmdDoctor(process.argv.slice(3).some(a => a === '--fix' || a === '-fix'));
+    cmdDoctor(process.argv.slice(3).some(a => a === '--fix' || a === '-fix')).catch((e) => fail('doctor: ' + e.message, 1));
     break;
   default:
     console.log('[baseline] unknown command "' + cmd + '".');
