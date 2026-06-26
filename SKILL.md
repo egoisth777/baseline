@@ -6,7 +6,7 @@ description: >-
   user-configurable injection routes in the baseline config folder (config.json +
   docs/, at BASELINE_CFG, else ~/.baseline/cfg), so the agent recites or receives
   standing rules before continuing. Use when the user asks to view, edit, add, or
-  remove baseline docs or routes; change an injection's event, frequency, matcher,
+  remove baseline docs or routes; change an injection's event, frequency,
   or cwd scope; install, verify, check status, repair, or uninstall the baseline
   hook; or manage the baseline config folder. Trigger on qualified phrases like
   "baseline-recital", "baseline rules", "baseline hook", "baseline drift",
@@ -67,7 +67,7 @@ The config folder is `BASELINE_CFG` (else `~/.baseline/cfg`):
 
 - **Change injected text:** edit the doc the route points at (`docs/baseline.md`). The body is injected verbatim — the prefix/restate scaffolding lives inside the doc. Takes effect next firing.
 - **Add a route:** add a `docs/<name>.md` and a `routes[]` entry. Follow `assets/route-templates/`. Then rerun `install`/`update` so hook wiring matches the events your routes use.
-- **Change frequency/scope:** edit `freq` / `matcher` / `cwd` on the route.
+- **Change frequency/scope:** edit `freq` / `cwd` on the route.
 - Editing only doc text needs no reinstall when `status` reports a symlink. Adding/removing an *event* requires install/update so wiring re-syncs.
 
 ### Manage the hook itself
@@ -96,4 +96,4 @@ node scripts/manage.js uninstall   # unwire all events + remove agent links (kee
 
 ## Vocabulary
 
-Project terms (route, doc, dispatcher, freq, matcher, cwd scope, preset, route template, config folder, install root, skill plugin) are defined in `.arca/baseline-sp/ubi_lang.md`. Reuse those terms; add a genuinely new concept there first. Never hand-edit the generated `scripts/*.js` or the deployed copy in `~/.baseline/hooks/`.
+Project terms (route, doc, dispatcher, freq, cwd scope, preset, route template, config folder, install root, skill plugin) are defined in `.arca/baseline-sp/ubi_lang.md`. Reuse those terms; add a genuinely new concept there first. Never hand-edit the generated `scripts/*.js` or the deployed copy in `~/.baseline/hooks/`.

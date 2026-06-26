@@ -24,12 +24,19 @@ function codexFor(cfg) {
 // Run the manager with isolated install root + agent config dirs. extraEnv can set
 // BASELINE_CFG to exercise an external (symlinked) config folder.
 function run(args, cfg, home, extraEnv) {
+    const baseHome = home || homeFor(cfg);
     return (0, child_process_1.spawnSync)(process.execPath, [manage].concat(args), {
         cwd: root,
         env: Object.assign({}, process.env, {
             CLAUDE_CONFIG_DIR: cfg,
             CODEX_HOME: codexFor(cfg),
-            BASELINE_HOME: home || homeFor(cfg)
+            BASELINE_HOME: baseHome,
+            // Isolate BASELINE_CFG too: pin it to this install root's own cfg dir so a real
+            // BASELINE_CFG in the developer's environment can never be read or clobbered. An
+            // override equal to <installRoot>/cfg is treated as "no override" (a real seeded
+            // folder), preserving the internal-config semantics the tests assume. Tests that
+            // exercise external config pass their own BASELINE_CFG via extraEnv, which wins.
+            BASELINE_CFG: path.join(baseHome, 'cfg')
         }, extraEnv || {}),
         encoding: 'utf8'
     });
@@ -64,16 +71,68 @@ function testDefaultInstallAndVerify() {
     const install = run(['install'], cfg);
     assert.strictEqual(install.status, 0, install.stderr || install.stdout);
     assert.match(install.stdout, /runtime\s+: node js/);
-    assert.match(install.stdout, /config folder : .*\(seeded, preset: minimal\)/);
+    // No --preset → DEFAULT_PRESET is now 'default'.
+    assert.match(install.stdout, /config folder : .*\(seeded, preset: default\)/);
     const settings = JSON.parse(fs.readFileSync(path.join(cfg, 'settings.json'), 'utf8'));
     const command = settings.hooks.UserPromptSubmit[0].hooks[0].command;
     assert.ok(command.includes('baseline-recital.js'), command);
-    // minimal preset uses only UserPromptSubmit — no other event group is wired.
-    assert.ok(!settings.hooks.SessionStart, 'unused SessionStart event should not be wired');
+    // default preset wires UserPromptSubmit + SessionStart (the 3 phase routes collapse to
+    // one native SessionStart hook); PreToolUse stays unwired.
+    assert.ok(settings.hooks.SessionStart, 'default preset should wire SessionStart');
     assert.ok(!settings.hooks.PreToolUse, 'unused PreToolUse event should not be wired');
     const verify = run(['verify'], cfg);
     assert.strictEqual(verify.status, 0, verify.stderr || verify.stdout);
     assert.match(verify.stdout, /verify: PASS/);
+}
+// The minimal preset is bare baseline only: one UserPromptSubmit route, nothing else.
+function testMinimalPresetWiresOnlyUserPromptSubmit() {
+    const cfg = tempConfig();
+    const install = run(['install', '--preset', 'minimal'], cfg);
+    assert.strictEqual(install.status, 0, install.stderr || install.stdout);
+    assert.match(install.stdout, /config folder : .*\(seeded, preset: minimal\)/);
+    const settings = JSON.parse(fs.readFileSync(path.join(cfg, 'settings.json'), 'utf8'));
+    assert.ok(settings.hooks.UserPromptSubmit, 'minimal must wire UserPromptSubmit');
+    assert.ok(!settings.hooks.SessionStart, 'minimal must not wire SessionStart');
+    assert.ok(!settings.hooks.PreToolUse, 'minimal must not wire PreToolUse');
+    assert.strictEqual(run(['verify'], cfg).status, 0);
+}
+// Slice-2 acceptance: installing the DEFAULT preset wires BOTH agents (claude-code and
+// codex) to EXACTLY the base events [UserPromptSubmit, SessionStart]. The three
+// SessionStart.<phase> routes collapse to ONE native SessionStart hook — no per-phase
+// hook entry and no matcher. The default config.json validates and passes doctor.
+// BASELINE_CFG is isolated by run() (pinned to this install root's cfg), so a real
+// external config in the developer's environment is never touched.
+function testDefaultPresetWiresBaseEventsBothAgents() {
+    const cfg = tempConfig();
+    const codex = codexFor(cfg);
+    const install = run(['install', '--preset', 'default'], cfg);
+    assert.strictEqual(install.status, 0, install.stderr || install.stdout);
+    // The default preset config parses/validates: version 1, baseline + 3 SessionStart routes.
+    const presetCfg = JSON.parse(fs.readFileSync(path.join(root, 'presets', 'default', 'config.json'), 'utf8'));
+    assert.strictEqual(presetCfg.version, 1, 'default config version must be 1');
+    assert.deepStrictEqual(presetCfg.routes.map((r) => r.id), ['baseline', 'sessionstart-startup', 'sessionstart-compact', 'sessionstart-clear'], 'default preset route ids changed');
+    assert.deepStrictEqual(presetCfg.routes.map((r) => r.event), ['UserPromptSubmit', 'SessionStart.startup', 'SessionStart.compact', 'SessionStart.clear'], 'default preset route events changed');
+    // Both agents wire EXACTLY [UserPromptSubmit, SessionStart]; the phase routes collapse
+    // to ONE native SessionStart hook with no per-phase entry and no matcher.
+    const agents = [
+        ['claude-code', path.join(cfg, 'settings.json')],
+        ['codex', path.join(codex, 'hooks.json')]
+    ];
+    for (const [label, file] of agents) {
+        const s = JSON.parse(fs.readFileSync(file, 'utf8'));
+        assert.deepStrictEqual(Object.keys(s.hooks).sort(), ['SessionStart', 'UserPromptSubmit'], label + ' should wire exactly [UserPromptSubmit, SessionStart]');
+        assert.ok(!Object.keys(s.hooks).some((k) => k.indexOf('.') !== -1), label + ' must not key a hook event by phase (e.g. SessionStart.compact)');
+        for (const ev of ['UserPromptSubmit', 'SessionStart']) {
+            assert.strictEqual(s.hooks[ev].length, 1, label + ' ' + ev + ' should have exactly one group');
+            assert.strictEqual(s.hooks[ev][0].hooks.length, 1, label + ' ' + ev + ' should have exactly one hook entry');
+            assert.strictEqual(s.hooks[ev][0].matcher, undefined, label + ' ' + ev + ' group must carry no matcher');
+            assert.ok(s.hooks[ev][0].hooks[0].command.includes('baseline-recital.js'), label + ' ' + ev + ' hook should be the baseline dispatcher');
+        }
+    }
+    // The seeded default config validates and passes doctor.
+    const doctor = run(['doctor'], cfg);
+    assert.strictEqual(doctor.status, 0, doctor.stdout);
+    assert.match(doctor.stdout, /config\.json: valid; 4 route\(s\) over \[UserPromptSubmit, SessionStart\]/);
 }
 function testCentralInstallAndAgentLinks() {
     const cfg = tempConfig();
@@ -120,7 +179,7 @@ function testIdempotentReinstall() {
     assert.strictEqual(run(['install'], cfg).status, 0);
     const second = run(['install'], cfg);
     assert.strictEqual(second.status, 0, second.stderr || second.stdout);
-    assert.match(second.stdout, /\(kept, preset: minimal\)/);
+    assert.match(second.stdout, /\(kept, preset: default\)/);
     assert.strictEqual(run(['verify'], cfg).status, 0);
 }
 function testForceReplacesConfigKeepWithout() {
@@ -136,7 +195,7 @@ function testForceReplacesConfigKeepWithout() {
     // --force replaces it wholesale from the preset.
     const forced = run(['install', '--force'], cfg);
     assert.strictEqual(forced.status, 0, forced.stderr || forced.stdout);
-    assert.match(forced.stdout, /\(replaced, preset: minimal\)/);
+    assert.match(forced.stdout, /\(replaced, preset: default\)/);
     assert.notStrictEqual(fs.readFileSync(path.join(home, 'cfg', 'docs', 'baseline.md'), 'utf8'), marker, '--force did not replace the operator config');
 }
 function testUnknownPresetFails() {
@@ -231,7 +290,7 @@ function testBaselineHookDoesNotInheritMatcher() {
     const cfg = tempConfig();
     const home = homeFor(cfg);
     setCentralConfig(home, [
-        { id: 'bash', event: 'PreToolUse', matcher: '^Bash$', freq: 1, doc: 'docs/bash.md' }
+        { id: 'bash', event: 'PreToolUse', freq: 1, doc: 'docs/bash.md' }
     ], { 'docs/bash.md': 'BASH\n' });
     write(path.join(cfg, 'settings.json'), JSON.stringify({
         hooks: { PreToolUse: [{ matcher: 'Read', hooks: [{ type: 'command', command: 'echo theirs', timeout: 3 }] }] }
@@ -284,25 +343,34 @@ function testMalformedCounterArrayDoesNotBreakFrequency() {
     assert.strictEqual(fireBodies(hook({ session_id: 'array', hook_event_name: 'UserPromptSubmit', cwd: cfg }, cfg)), null, 'first turn should not fire');
     assert.ok(fireBodies(hook({ session_id: 'array', hook_event_name: 'UserPromptSubmit', cwd: cfg }, cfg))?.includes('TWO'), 'second turn should fire even after malformed array counters');
 }
-function testMatcherSemantics() {
+// Slice-1 acceptance: the event NAME is the sole moment-resolver. A SessionStart
+// phase suffix (SessionStart.compact) fires only when stdin source matches; a bare
+// SessionStart route matches every phase; a bare non-session event matches; cwd
+// scope is still respected.
+function testEventNameSemantics() {
     const cfg = tempConfig();
     const home = homeFor(cfg);
     assert.strictEqual(run(['install'], cfg).status, 0);
     const scoped = path.join(cfg, 'scoped-tree');
     setCentralConfig(home, [
-        { id: 'compact', event: 'SessionStart', matcher: 'compact', freq: 1, doc: 'docs/c.md' },
-        { id: 'bash', event: 'PreToolUse', matcher: '^Bash$', freq: 1, doc: 'docs/b.md' },
+        { id: 'compact', event: 'SessionStart.compact', freq: 1, doc: 'docs/c.md' },
+        { id: 'anysession', event: 'SessionStart', freq: 1, doc: 'docs/a.md' },
+        { id: 'prompt', event: 'UserPromptSubmit', freq: 1, doc: 'docs/p.md' },
         { id: 'scoped', event: 'UserPromptSubmit', cwd: scoped, freq: 1, doc: 'docs/s.md' }
-    ], { 'docs/c.md': 'COMPACT\n', 'docs/b.md': 'BASH\n', 'docs/s.md': 'SCOPED\n' });
-    // SessionStart matcher: phase equality.
-    assert.ok(fireBodies(hook({ session_id: 's1', hook_event_name: 'SessionStart', source: 'compact', cwd: cfg }, cfg))?.includes('COMPACT'), 'compact route should fire on source=compact');
-    assert.strictEqual(fireBodies(hook({ session_id: 's2', hook_event_name: 'SessionStart', source: 'startup', cwd: cfg }, cfg)), null, 'compact route should not fire on source=startup');
-    // PreToolUse matcher: tool-name regex (anchored here).
-    assert.ok(fireBodies(hook({ session_id: 's3', hook_event_name: 'PreToolUse', tool_name: 'Bash', cwd: cfg }, cfg))?.includes('BASH'), 'bash route should fire on tool_name=Bash');
-    assert.strictEqual(fireBodies(hook({ session_id: 's4', hook_event_name: 'PreToolUse', tool_name: 'Read', cwd: cfg }, cfg)), null, 'bash route should not fire on tool_name=Read');
+    ], { 'docs/c.md': 'COMPACT\n', 'docs/a.md': 'ANYSESSION\n', 'docs/p.md': 'PROMPT\n', 'docs/s.md': 'SCOPED\n' });
+    // SessionStart.<phase>: the phase suffix must equal the stdin `source`.
+    const onCompact = fireBodies(hook({ session_id: 's1', hook_event_name: 'SessionStart', source: 'compact', cwd: cfg }, cfg));
+    assert.ok(onCompact?.includes('COMPACT'), 'SessionStart.compact route should fire on source=compact');
+    assert.ok(onCompact?.includes('ANYSESSION'), 'bare SessionStart route should also fire on source=compact');
+    // A different phase: the phased route stays silent; the bare route matches all phases.
+    const onStartup = fireBodies(hook({ session_id: 's2', hook_event_name: 'SessionStart', source: 'startup', cwd: cfg }, cfg));
+    assert.ok(!onStartup?.includes('COMPACT'), 'SessionStart.compact route should not fire on source=startup');
+    assert.ok(onStartup?.includes('ANYSESSION'), 'bare SessionStart route should fire on any phase');
+    // A bare non-session event matches its native event.
+    assert.ok(fireBodies(hook({ session_id: 's3', hook_event_name: 'UserPromptSubmit', cwd: cfg }, cfg))?.includes('PROMPT'), 'bare UserPromptSubmit route should fire');
     // cwd scope: only under the path.
-    assert.ok(fireBodies(hook({ session_id: 's5', hook_event_name: 'UserPromptSubmit', cwd: path.join(scoped, 'sub') }, cfg))?.includes('SCOPED'), 'scoped route should fire under its cwd');
-    assert.strictEqual(fireBodies(hook({ session_id: 's6', hook_event_name: 'UserPromptSubmit', cwd: cfg }, cfg)), null, 'scoped route should not fire outside its cwd');
+    assert.ok(fireBodies(hook({ session_id: 's4', hook_event_name: 'UserPromptSubmit', cwd: path.join(scoped, 'sub') }, cfg))?.includes('SCOPED'), 'scoped route should fire under its cwd');
+    assert.ok(!fireBodies(hook({ session_id: 's5', hook_event_name: 'UserPromptSubmit', cwd: path.join(cfg, 'elsewhere') }, cfg))?.includes('SCOPED'), 'scoped route should not fire outside its cwd');
 }
 function testFailOpenMissingConfig() {
     // Point the dispatcher at a config dir with no cfg/baseline at all.
@@ -419,7 +487,7 @@ function testVerifyRequiresSelectedRouteEvent() {
     const cfg = tempConfig();
     const home = homeFor(cfg);
     setCentralConfig(home, [
-        { id: 'read', event: 'PreToolUse', matcher: '^Read$', freq: 1, doc: 'docs/read.md' }
+        { id: 'read', event: 'PreToolUse', freq: 1, doc: 'docs/read.md' }
     ], { 'docs/read.md': 'READ\n' });
     assert.strictEqual(run(['install'], cfg).status, 0);
     let settings = JSON.parse(fs.readFileSync(path.join(cfg, 'settings.json'), 'utf8'));
@@ -430,13 +498,15 @@ function testVerifyRequiresSelectedRouteEvent() {
     assert.notStrictEqual(verify.status, 0, 'verify should fail when selected route event is not wired');
     assert.match(verify.stdout, /no baseline hook wired for PreToolUse/);
 }
-function testVerifyUsesMatchingToolName() {
+function testVerifyToolEventFires() {
     const cfg = tempConfig();
     const home = homeFor(cfg);
     setCentralConfig(home, [
-        { id: 'read', event: 'PreToolUse', matcher: '^Read$', freq: 1, doc: 'docs/read.md' }
-    ], { 'docs/read.md': 'READ\n' });
+        { id: 'tool', event: 'PreToolUse', freq: 1, doc: 'docs/tool.md' }
+    ], { 'docs/tool.md': 'TOOL\n' });
     assert.strictEqual(run(['install'], cfg).status, 0);
+    // Route matchers are gone: verify drives the PreToolUse route with the plain
+    // default synthetic tool name and the route fires for any tool.
     const verify = run(['verify'], cfg);
     assert.strictEqual(verify.status, 0, verify.stderr || verify.stdout);
     assert.match(verify.stdout, /verify: PASS/);
@@ -640,6 +710,8 @@ testForceReplacesConfigKeepWithout();
 testUnknownPresetFails();
 testNativeRuntimePaused();
 testDefaultInstallAndVerify();
+testMinimalPresetWiresOnlyUserPromptSubmit();
+testDefaultPresetWiresBaseEventsBothAgents();
 testInvalidSettingsFailsClosed();
 testInvalidSettingsShapeFailsClosed();
 testInvalidNullHookGroupFailsClosed();
@@ -648,7 +720,7 @@ testCoResidentHookPreserved();
 testBaselineHookDoesNotInheritMatcher();
 testPerRouteCountersIndependent();
 testMalformedCounterArrayDoesNotBreakFrequency();
-testMatcherSemantics();
+testEventNameSemantics();
 testFailOpenMissingConfig();
 testMalformedConfigInjectsNothing();
 testBadRouteSkippedOthersFire();
@@ -659,7 +731,7 @@ testDoctorReportsAndFixes();
 testDoctorDetectsMissingDoc();
 testDoctorFixRefusesInvalidSettings();
 testVerifyRequiresSelectedRouteEvent();
-testVerifyUsesMatchingToolName();
+testVerifyToolEventFires();
 testUpdateRedeploysDispatcher();
 testUninstallKeepsCentralConfig();
 testClaudeSkillPluginDeployed();

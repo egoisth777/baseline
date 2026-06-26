@@ -9,6 +9,24 @@ config.json   routing only: which doc fires at which event, how often, where
 docs/         the verbatim text each route injects (one doc per route)
 ```
 
+## This preset (default)
+
+The **default** preset seeds the baseline plus three `SessionStart` routes, so the
+baseline rules are re-asserted at every session boundary as well as periodically
+mid-session:
+
+```json
+{ "id": "baseline",             "event": "UserPromptSubmit",     "freq": 5, "doc": "docs/baseline.md" }
+{ "id": "sessionstart-startup", "event": "SessionStart.startup", "freq": 1, "doc": "docs/sessionstart-startup.md" }
+{ "id": "sessionstart-compact", "event": "SessionStart.compact", "freq": 1, "doc": "docs/sessionstart-compact.md" }
+{ "id": "sessionstart-clear",   "event": "SessionStart.clear",   "freq": 1, "doc": "docs/sessionstart-clear.md" }
+```
+
+The event name carries the moment: `SessionStart.<phase>` selects the phase
+(`startup`, `compact`, `clear`; `resume` is also accepted). The three `SessionStart.*`
+routes share ONE native `SessionStart` hook — the dispatcher resolves which docs fire
+from the event name alone, so there is no per-phase hook and no `matcher` field.
+
 ## Edit what is injected
 
 Open the doc a route points at (e.g. `docs/baseline.md`) and edit its text. The doc
@@ -21,15 +39,15 @@ take effect on the next firing; no reinstall is needed when you only edit doc te
 A route is one entry in `config.json` `routes[]`:
 
 ```json
-{ "id": "compact-resume", "event": "SessionStart", "matcher": "compact", "freq": 1, "doc": "docs/compact-resume.md" }
+{ "id": "my-route", "event": "SessionStart.compact", "freq": 1, "doc": "docs/my-route.md" }
 ```
 
 - `id` — required, unique, slug-shaped (`^[a-z0-9][a-z0-9-]*$`). Keys the route's counter.
 - `event` — required, one of `UserPromptSubmit`, `SessionStart`, `PreToolUse`, `PostToolUse`.
+  To target a session phase, suffix the event: `SessionStart.compact` (also `.startup` /
+  `.clear`; `.resume` is accepted but currently unused).
 - `doc` — required, path relative to this folder; must stay inside it (no `..`, no absolute paths).
 - `freq` — optional, positive integer, default `1`. The route fires when `count % freq == 0`.
-- `matcher` — optional. `SessionStart`: lifecycle phase (`startup`/`resume`/`clear`/`compact`).
-  `PreToolUse`/`PostToolUse`: a tool-name regex. Ignored for `UserPromptSubmit`.
 - `cwd` — optional, path prefix. The route fires only when the session working directory
   is at or under it.
 

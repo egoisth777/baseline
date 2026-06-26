@@ -26,9 +26,9 @@ This package targets Claude Code and Codex. Both use the same Node dispatcher an
 
 ## How it works
 
-One small **dispatcher** runs on each wired hook event. It reads the event JSON the harness passes on stdin, loads `cfg/baseline/config.json`, selects the routes matching the `(event, matcher, cwd)`, bumps each route's own per-session counter, and on a route's Nth match prints a JSON object whose `additionalContext` field the agent injects into the model's context as a system reminder. The dispatcher carries **zero baked content**: if the config or docs are gone it injects nothing and exits clean, and `doctor` reports the fault.
+One small **dispatcher** runs on each wired hook event. It reads the event JSON the harness passes on stdin, loads `cfg/baseline/config.json`, selects the routes matching the `(event, cwd)`, bumps each route's own per-session counter, and on a route's Nth match prints a JSON object whose `additionalContext` field the agent injects into the model's context as a system reminder. The dispatcher carries **zero baked content**: if the config or docs are gone it injects nothing and exits clean, and `doctor` reports the fault.
 
-Supported injecting events: `UserPromptSubmit`, `SessionStart` (lifecycle phase matcher), `PreToolUse` / `PostToolUse` (tool-name regex matcher).
+Supported injecting events: `UserPromptSubmit`, `SessionStart` (optionally a lifecycle phase via the event form `SessionStart.<phase>`, e.g. `SessionStart.compact`), `PreToolUse` / `PostToolUse`.
 
 ## Requirements
 
@@ -76,7 +76,7 @@ Everything you tune lives in your config folder — `BASELINE_CFG` if set, else 
 
 This folder holds **only configuration** — no install artifacts. The dispatcher and skill payload live separately under the install root (`~/.baseline`), so you can keep this folder in a dotfiles repo and sync it across machines.
 
-Edit a **doc** to change what is injected (takes effect on the next firing — no reinstall). Edit **`config.json`** to add a route, change a route's `event`/`matcher`/`freq`/`cwd`, or point it at a different doc. After changing the *set of events* your routes use, rerun `install`/`update` so hook wiring stays in sync.
+Edit a **doc** to change what is injected (takes effect on the next firing — no reinstall). Edit **`config.json`** to add a route, change a route's `event`/`freq`/`cwd`, or point it at a different doc. After changing the *set of events* your routes use, rerun `install`/`update` so hook wiring stays in sync.
 
 A route is one entry in `config.json` `routes[]`:
 
@@ -90,10 +90,9 @@ A route is one entry in `config.json` `routes[]`:
 ```
 
 - `id` — required, unique, slug-shaped (`^[a-z0-9][a-z0-9-]*$`). Keys the route's counter.
-- `event` — required, one of `UserPromptSubmit`, `SessionStart`, `PreToolUse`, `PostToolUse`.
+- `event` — required, one of `UserPromptSubmit`, `SessionStart`, `PreToolUse`, `PostToolUse`, and the sole resolver of *when* a route fires. To target a session phase, suffix the event — `SessionStart.startup` / `SessionStart.compact` / `SessionStart.clear` (`SessionStart.resume` is accepted but currently unused).
 - `doc` — required, path relative to the config folder; must stay inside it.
 - `freq` — optional positive integer, default `1`. Fires when `count % freq == 0`.
-- `matcher` — optional. `SessionStart`: lifecycle phase (`startup`/`resume`/`clear`/`compact`). `PreToolUse`/`PostToolUse`: a tool-name regex. Ignored for `UserPromptSubmit`.
 - `cwd` — optional path prefix. Fires only when the session working directory is at or under it.
 
 To add a new injection, copy a pair from `assets/route-templates/` (a doc + its matching route) or ask the plugin to author one. See the `README.md` in your config folder for the runtime caps.

@@ -78,7 +78,6 @@ interface LinkState {
 interface Route {
   id: string;
   event: string;
-  matcher?: string;
   freq: number;
   cwd?: string;
   doc: string;
@@ -114,13 +113,23 @@ interface InstallOpts {
 // --- constants -------------------------------------------------------------
 
 const SUPPORTED_EVENTS = ['UserPromptSubmit', 'SessionStart', 'PreToolUse', 'PostToolUse'];
+const SESSION_PHASES = ['startup', 'resume', 'clear', 'compact'];
 const SLUG = /^[a-z0-9][a-z0-9-]*$/;
-const KNOWN_ROUTE_KEYS = ['id', 'event', 'matcher', 'freq', 'cwd', 'doc'];
-const DEFAULT_PRESET = 'minimal';
+const KNOWN_ROUTE_KEYS = ['id', 'event', 'freq', 'cwd', 'doc'];
+const DEFAULT_PRESET = 'default';
 const MAX_CONFIG_BYTES = 64 * 1024;
 const MAX_DOC_BYTES = 64 * 1024;
 const MAX_DOC_CHARS = 10_000;
 const MAX_ROUTES = 64;
+
+// Split a route event into its base event and optional SessionStart phase suffix, on
+// the FIRST '.'. "SessionStart.compact" -> { base:'SessionStart', phase:'compact' };
+// a bare "UserPromptSubmit" -> { base:'UserPromptSubmit' }.
+function parseEvent(event: string): { base: string; phase?: string } {
+  const dot = event.indexOf('.');
+  if (dot === -1) return { base: event };
+  return { base: event.slice(0, dot), phase: event.slice(dot + 1) };
+}
 
 // --- platform + path resolution -------------------------------------------
 
@@ -649,7 +658,12 @@ function loadCentralConfig(): ConfigReport {
     const label = typeof r.id === 'string' ? '"' + r.id + '"' : where;
     if (typeof r.id !== 'string' || !SLUG.test(r.id)) { report.issues.push({ level: 'fail', msg: where + ' has an invalid id (must match ' + SLUG.source + ')' }); continue; }
     if (seen[r.id]) { report.issues.push({ level: 'fail', msg: 'duplicate route id ' + label + ' (later occurrence skipped)' }); continue; }
-    if (typeof r.event !== 'string' || SUPPORTED_EVENTS.indexOf(r.event) === -1) { report.issues.push({ level: 'fail', msg: 'route ' + label + ' has unsupported event ' + JSON.stringify(r.event) }); continue; }
+    if (typeof r.event !== 'string') { report.issues.push({ level: 'fail', msg: 'route ' + label + ' has unsupported event ' + JSON.stringify(r.event) }); continue; }
+    const ev = parseEvent(r.event);
+    if (SUPPORTED_EVENTS.indexOf(ev.base) === -1 ||
+        (ev.phase !== undefined && (ev.base !== 'SessionStart' || SESSION_PHASES.indexOf(ev.phase) === -1))) {
+      report.issues.push({ level: 'fail', msg: 'route ' + label + ' has unsupported event ' + JSON.stringify(r.event) }); continue;
+    }
     const docPath = safeDocPath(r.doc);
     if (!docPath) { report.issues.push({ level: 'fail', msg: 'route ' + label + ' has an invalid or out-of-range doc ' + JSON.stringify(r.doc) }); continue; }
     let freq = 1;
@@ -657,11 +671,7 @@ function loadCentralConfig(): ConfigReport {
       if (typeof r.freq !== 'number' || !Number.isInteger(r.freq) || r.freq < 1) { report.issues.push({ level: 'fail', msg: 'route ' + label + ' has a non-positive-integer freq' }); continue; }
       freq = r.freq;
     }
-    if (r.matcher !== undefined && typeof r.matcher !== 'string') { report.issues.push({ level: 'fail', msg: 'route ' + label + ' matcher must be a string' }); continue; }
     if (r.cwd !== undefined && typeof r.cwd !== 'string') { report.issues.push({ level: 'fail', msg: 'route ' + label + ' cwd must be a string' }); continue; }
-    if ((r.event === 'PreToolUse' || r.event === 'PostToolUse') && typeof r.matcher === 'string') {
-      try { new RegExp(r.matcher); } catch (e) { report.issues.push({ level: 'fail', msg: 'route ' + label + ' matcher is not a valid regex' }); continue; }
-    }
     // doc readability + size (a route past validation but whose doc is gone still fails doctor).
     try {
       const st = fs.statSync(docPath);
@@ -678,11 +688,16 @@ function loadCentralConfig(): ConfigReport {
       if (KNOWN_ROUTE_KEYS.indexOf(key) === -1) report.issues.push({ level: 'warn', msg: 'route ' + label + ' has unrecognized key "' + key + '"' });
     }
     seen[r.id] = true;
-    report.routes.push({ id: r.id, event: r.event, matcher: r.matcher, freq, cwd: r.cwd, doc: r.doc });
+    report.routes.push({ id: r.id, event: r.event, freq, cwd: r.cwd, doc: r.doc });
   }
 
+  // Wiring is keyed by NATIVE event, so a phase suffix folds into its base: three
+  // SessionStart.<phase> routes wire exactly one native SessionStart hook.
   const events: string[] = [];
-  for (const r of report.routes) if (events.indexOf(r.event) === -1) events.push(r.event);
+  for (const r of report.routes) {
+    const base = parseEvent(r.event).base;
+    if (events.indexOf(base) === -1) events.push(base);
+  }
   report.desiredEvents = events;
   return report;
 }
@@ -757,7 +772,7 @@ function skillWrapper(repoRootPath: string): string {
     '  user-configurable injection routes in the baseline config folder (config.json +',
     '  docs/, at BASELINE_CFG, else <install root>/cfg). Use when the user asks to view,',
     '  edit, add, or remove baseline docs or routes; change an injection event,',
-    '  frequency, matcher, or cwd scope; install, verify, check status, repair, or',
+    '  frequency, or cwd scope; install, verify, check status, repair, or',
     '  uninstall the baseline hook; or manage the baseline config folder. Trigger on',
     '  phrases like "baseline status", "baseline rules", "baseline hook", "baseline',
     '  route", "change baseline frequency", or "make the agent recite X every N turns".',
@@ -897,7 +912,6 @@ function cmdStatus(): void {
   console.log('  routes         : ' + cfg.routes.length);
   for (const r of cfg.routes) {
     const bits = ['event=' + r.event, 'freq=' + r.freq];
-    if (r.matcher !== undefined) bits.push('matcher=' + r.matcher);
     if (r.cwd !== undefined) bits.push('cwd=' + r.cwd);
     bits.push('doc=' + r.doc);
     console.log('    ' + r.id + ': ' + bits.join(', '));
@@ -924,24 +938,11 @@ function cmdStatus(): void {
 // Build synthetic hook stdin for a route's event so verify can drive the wired
 // dispatcher and confirm a route fires.
 function synthInput(route: Route, sessionId: string, cwd: string): string {
-  const data: any = { session_id: sessionId, hook_event_name: route.event, cwd };
-  if (route.event === 'SessionStart') data.source = route.matcher || 'startup';
-  if (route.event === 'PreToolUse' || route.event === 'PostToolUse') {
-    data.tool_name = syntheticToolName(route.matcher);
-  }
+  const { base, phase } = parseEvent(route.event);
+  const data: any = { session_id: sessionId, hook_event_name: base, cwd };
+  if (base === 'SessionStart') data.source = phase || 'startup';
+  if (base === 'PreToolUse' || base === 'PostToolUse') data.tool_name = 'Bash';
   return JSON.stringify(data);
-}
-
-function syntheticToolName(matcher?: string): string {
-  if (!matcher) return 'Bash';
-  const candidates = ['Bash', 'Read', 'Edit', 'Write', 'apply_patch', 'mcp__filesystem__read_file'];
-  try {
-    const re = new RegExp(matcher);
-    for (const candidate of candidates) if (re.test(candidate)) return candidate;
-  } catch (e) {
-    return 'Bash';
-  }
-  return /^[A-Za-z0-9_:-]+$/.test(matcher) ? matcher : 'Bash';
 }
 
 // Functional check — drive the ACTUALLY-WIRED dispatcher (of the first agent) with
@@ -959,7 +960,7 @@ function cmdVerify(): void {
     console.log('[baseline] verify: FAIL — config has no valid routes' + (cfg.fatal ? ' (' + cfg.fatal + ')' : '') + '.');
     process.exit(1);
   }
-  // Prefer a UserPromptSubmit route (matcher-free, deterministic); else the first.
+  // Prefer a UserPromptSubmit route (no phase, fires every turn — deterministic); else the first.
   const route = cfg.routes.filter(r => r.event === 'UserPromptSubmit')[0] || cfg.routes[0];
 
   const ourHook = findOurHookInGroups(sr.settings.hooks && sr.settings.hooks[route.event], ap);

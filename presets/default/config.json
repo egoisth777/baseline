@@ -1,7 +1,9 @@
 {
   "version": 1,
   "routes": [
-    { "id": "baseline", "event": "UserPromptSubmit", "freq": 5, "doc": "docs/baseline.md" },
-    { "id": "compact-resume", "event": "SessionStart", "matcher": "compact", "freq": 1, "doc": "docs/compact-resume.md" }
+    { "id": "baseline",             "event": "UserPromptSubmit",     "freq": 5, "doc": "docs/baseline.md" },
+    { "id": "sessionstart-startup", "event": "SessionStart.startup", "freq": 1, "doc": "docs/sessionstart-startup.md" },
+    { "id": "sessionstart-compact", "event": "SessionStart.compact", "freq": 1, "doc": "docs/sessionstart-compact.md" },
+    { "id": "sessionstart-clear",   "event": "SessionStart.clear",   "freq": 1, "doc": "docs/sessionstart-clear.md" }
   ]
 }

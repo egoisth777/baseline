@@ -19,6 +19,6 @@ continuing. If you broke one this turn, say so and fix it now.
 { "id": "<slug>", "event": "UserPromptSubmit", "freq": 5, "doc": "docs/<name>.md" }
 ```
 
-`freq` is how many user prompts between firings. `UserPromptSubmit` ignores `matcher`.
+`freq` is how many user prompts between firings.
 The whole doc body is injected as-is — the prefix/restate scaffolding lives in the doc,
 not in code.

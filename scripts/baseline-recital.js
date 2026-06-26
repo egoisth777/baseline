@@ -8,7 +8,7 @@
 //
 // This one dispatcher is wired into every event a route uses. On each invocation
 // it reads the hook event from stdin, loads cfg/baseline/config.json, selects the
-// routes matching the (event, matcher, cwd), bumps each one's per-route counter,
+// routes matching the (event, cwd), bumps each one's per-route counter,
 // and injects the docs that are due — verbatim, with NO wrapper added by code.
 //
 // Nothing operator-tunable is hardcoded here. Routes live in config.json; the
@@ -28,8 +28,20 @@ const path = require("path");
 const os = require("os");
 // Events this dispatcher can inject standing context into.
 const SUPPORTED_EVENTS = ['UserPromptSubmit', 'SessionStart', 'PreToolUse', 'PostToolUse'];
+// SessionStart lifecycle phases. An event may name one via a "SessionStart.<phase>"
+// suffix; the phase then resolves against the hook stdin `source`.
+const SESSION_PHASES = ['startup', 'resume', 'clear', 'compact'];
 // Route id shape — keys the counter and labels the route in status/doctor.
 const SLUG = /^[a-z0-9][a-z0-9-]*$/;
+// Split a route event into its base event and optional phase suffix, on the FIRST
+// '.'. "SessionStart.compact" -> { base:'SessionStart', phase:'compact' }; a bare
+// "UserPromptSubmit" -> { base:'UserPromptSubmit' }.
+function parseEvent(event) {
+    const dot = event.indexOf('.');
+    if (dot === -1)
+        return { base: event };
+    return { base: event.slice(0, dot), phase: event.slice(dot + 1) };
+}
 // Drop counter entries untouched for longer than this (stale sessions).
 const PRUNE_MS = 7 * 24 * 60 * 60 * 1000;
 const MAX_STDIN_BYTES = 1024 * 1024;
@@ -135,7 +147,12 @@ function loadValidRoutes() {
             continue;
         if (seen[r.id])
             continue; // duplicate id — first wins, never double-count
-        if (typeof r.event !== 'string' || SUPPORTED_EVENTS.indexOf(r.event) === -1)
+        if (typeof r.event !== 'string')
+            continue;
+        const ev = parseEvent(r.event);
+        if (SUPPORTED_EVENTS.indexOf(ev.base) === -1)
+            continue;
+        if (ev.phase !== undefined && (ev.base !== 'SessionStart' || SESSION_PHASES.indexOf(ev.phase) === -1))
             continue;
         if (!safeDocPath(r.doc))
             continue;
@@ -145,34 +162,22 @@ function loadValidRoutes() {
                 continue;
             freq = r.freq;
         }
-        if (r.matcher !== undefined && typeof r.matcher !== 'string')
-            continue;
         if (r.cwd !== undefined && typeof r.cwd !== 'string')
             continue;
         seen[r.id] = true;
-        out.push({ id: r.id, event: r.event, matcher: r.matcher, freq, cwd: r.cwd, doc: r.doc });
+        out.push({ id: r.id, event: r.event, freq, cwd: r.cwd, doc: r.doc });
     }
     return out;
 }
-// Does this route's matcher accept the invocation? Polymorphic by event:
-//   UserPromptSubmit         — matcher ignored, always matches.
-//   SessionStart             — exact-equality against stdin `source` (lifecycle phase).
-//   PreToolUse/PostToolUse   — unanchored, case-sensitive regex over the tool name.
-// Omitted matcher means "match all".
-function matcherMatches(route, data) {
-    if (route.matcher === undefined)
-        return true;
-    if (route.event === 'UserPromptSubmit')
-        return true;
-    if (route.event === 'SessionStart')
-        return data.source === route.matcher;
-    const tool = typeof data.tool_name === 'string' ? data.tool_name : '';
-    try {
-        return new RegExp(route.matcher).test(tool);
-    }
-    catch (e) {
+// Does this route's event name accept the invocation? The event is the sole
+// moment-resolver: its base must equal the native hook event, and a SessionStart
+// phase suffix (when present) must equal the stdin `source` lifecycle phase. A bare
+// event (no phase) matches every phase of its base event.
+function eventMatches(route, data) {
+    const { base, phase } = parseEvent(route.event);
+    if (base !== data.hook_event_name)
         return false;
-    }
+    return phase === undefined || data.source === phase;
 }
 // Is the session working directory at or under the route's cwd scope? Normalized
 // prefix match on path boundaries (/foo must not match /foobar), case-insensitive
@@ -304,8 +309,8 @@ process.stdin.on('end', () => {
         const event = data.hook_event_name;
         if (typeof event !== 'string' || SUPPORTED_EVENTS.indexOf(event) === -1)
             return;
-        // Select the routes this invocation activates (event + matcher + cwd).
-        const selected = loadValidRoutes().filter(r => r.event === event && matcherMatches(r, data) && cwdMatches(r, data));
+        // Select the routes this invocation activates (event name + cwd).
+        const selected = loadValidRoutes().filter(r => eventMatches(r, data) && cwdMatches(r, data));
         if (!selected.length)
             return;
         const due = [];
