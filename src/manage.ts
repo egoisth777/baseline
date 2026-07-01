@@ -13,16 +13,20 @@
 //
 // Design notes:
 // - Regenerable ARTIFACTS live in a per-skill install root, BASELINE_HOME or
-//   ~/.baseline: the deployed dispatcher (hooks/baseline-recital.js) and the Claude
-//   skill payload (skills/baseline/). The repo is the source of truth; install always
-//   overwrites these from it.
+//   ~/.baseline: the deployed dispatcher (hooks/baseline-recital.js + hooks/contracts.js), installed
+//   manager/source artifacts (scripts/), Claude skill payload (skills/baseline/),
+//   and Codex plugin payload (codex-plugin/baseline/). The repo is the source of
+//   truth; install always overwrites these from it.
 // - The editable CONFIG folder (config.json + docs/) lives separately, wherever the
 //   operator wants: BASELINE_CFG, else <install root>/cfg. <install root>/cfg is the
 //   canonical path agents link to — a symlink to BASELINE_CFG when set, else a real
 //   seeded folder. Config and artifacts never share a directory.
 // - Each agent's config dir (Claude: CLAUDE_CONFIG_DIR or ~/.claude; Codex:
 //   CODEX_HOME or ~/.codex) gets LINKS back into the center:
-//   hooks/baseline-recital.js → install root; cfg/baseline → <install root>/cfg.
+//   hooks/baseline-recital.js + hooks/contracts.js → install root; cfg/baseline → <install root>/cfg.
+//   Claude also gets skills/baseline → <install root>/skills/baseline; Codex gets
+//   plugins/cache/baseline/baseline/local → <install root>/codex-plugin/baseline
+//   plus an empty [plugins."baseline@baseline"] table in config.toml.
 //   Editing the config folder changes live behavior for every wired agent
 //   (when the link layer can use a symlink; copy fallback is degraded).
 // - Hook config and .baseline-counters.json stay REAL, per-agent files. Hook
@@ -40,6 +44,19 @@ import * as path from 'path';
 import * as os from 'os';
 import * as readline from 'readline';
 import { spawnSync } from 'child_process';
+import {
+  MAX_CONFIG_BYTES,
+  MAX_DOC_BYTES,
+  MAX_DOC_CHARS,
+  MAX_ROUTES,
+  Route,
+  SESSION_PHASES,
+  SLUG,
+  SUPPORTED_EVENTS,
+  parseEvent,
+  safeDocPath,
+  safeRealDocPath,
+} from './contracts';
 
 // --- types -----------------------------------------------------------------
 
@@ -51,10 +68,15 @@ interface AgentPaths {
   counters: string;
   hooksDir: string;
   hookJs: string;
+  hookContractsJs: string;
   cfgDir: string;
   // Where this agent's baseline skills-dir plugin links back to the center, or
   // null for agents that don't use Claude-style skills dirs (e.g. Codex).
   skillDir: string | null;
+  // Codex's real plugin loader is config-gated and cache-based. These are set
+  // only for Codex agents so install/update can materialize + activate the plugin.
+  codexPluginDir: string | null;
+  codexConfigToml: string | null;
 }
 
 interface ReadJsonResult {
@@ -74,14 +96,6 @@ interface HookEntry {
 interface LinkState {
   ok: boolean;
   mechanism: string;
-}
-
-interface Route {
-  id: string;
-  event: string;
-  freq: number;
-  cwd?: string;
-  doc: string;
 }
 
 interface RouteIssue {
@@ -117,24 +131,13 @@ interface InstallOpts {
 
 // --- constants -------------------------------------------------------------
 
-const SUPPORTED_EVENTS = ['UserPromptSubmit', 'SessionStart', 'PreToolUse', 'PostToolUse'];
-const SESSION_PHASES = ['startup', 'resume', 'clear', 'compact'];
-const SLUG = /^[a-z0-9][a-z0-9-]*$/;
 const KNOWN_ROUTE_KEYS = ['id', 'event', 'freq', 'cwd', 'doc'];
 const DEFAULT_PRESET = 'default';
-const MAX_CONFIG_BYTES = 64 * 1024;
-const MAX_DOC_BYTES = 64 * 1024;
-const MAX_DOC_CHARS = 10_000;
-const MAX_ROUTES = 64;
-
-// Split a route event into its base event and optional SessionStart phase suffix, on
-// the FIRST '.'. "SessionStart.compact" -> { base:'SessionStart', phase:'compact' };
-// a bare "UserPromptSubmit" -> { base:'UserPromptSubmit' }.
-function parseEvent(event: string): { base: string; phase?: string } {
-  const dot = event.indexOf('.');
-  if (dot === -1) return { base: event };
-  return { base: event.slice(0, dot), phase: event.slice(dot + 1) };
-}
+const CODEX_MARKETPLACE = 'baseline';
+const CODEX_PLUGIN = 'baseline';
+const CODEX_PLUGIN_VERSION = 'local';
+const CODEX_PLUGIN_KEY = CODEX_PLUGIN + '@' + CODEX_MARKETPLACE;
+const CODEX_PLUGIN_TABLE = '[plugins."' + CODEX_PLUGIN_KEY + '"]';
 
 // --- platform + path resolution -------------------------------------------
 
@@ -143,10 +146,22 @@ const homeDir = os.homedir();
 
 // Repo root resolved relative to this file (scripts/ sits directly under root).
 const repoRoot = path.resolve(__dirname, '..');
+function inferInstalledRootFromManagerLocation(): string | null {
+  const candidate = path.resolve(__dirname, '..');
+  const expectedManager = path.join(candidate, 'scripts', 'manage.js');
+  const sourceManager = path.join(candidate, 'src', 'manage.ts');
+
+  if (!samePath(__filename, expectedManager)) return null;
+  if (fs.existsSync(sourceManager)) return null;
+  return candidate;
+}
 
 // Install root: where baseline's REGENERABLE artifacts live (deployed dispatcher +
-// Claude skill payload). Per-skill and self-contained: BASELINE_HOME, else ~/.baseline.
-const installRoot = process.env.BASELINE_HOME || path.join(homeDir, '.baseline');
+// Claude skill payload). Per-skill and self-contained: BASELINE_HOME, else an
+// installed manager's own root, else ~/.baseline for source-repo development.
+const installRoot = process.env.BASELINE_HOME
+  ? path.resolve(process.env.BASELINE_HOME)
+  : (inferInstalledRootFromManagerLocation() || path.join(homeDir, '.baseline'));
 
 // `<installRoot>/cfg` is the canonical config path agents link to. When BASELINE_CFG is
 // set it is a symlink to that external folder; otherwise it is a real seeded folder. An
@@ -180,22 +195,40 @@ const central = {
   root:     installRoot,
   hooksDir: path.join(installRoot, 'hooks'),
   hookJs:   path.join(installRoot, 'hooks', 'baseline-recital.js'),
+  hookContractsJs: path.join(installRoot, 'hooks', 'contracts.js'),
   cfgLink:  cfgLink,   // <installRoot>/cfg — what agents link to (real dir, or symlink to cfgReal)
   cfgDir:   cfgReal,   // the real config folder (flat: config.json + docs/)
   config:   path.join(cfgReal, 'config.json'),
   docsDir:  path.join(cfgReal, 'docs'),
+  // Installed manager/source artifacts. A generated control surface points here
+  // for normal use so it survives a moved/deleted source checkout.
+  managerDir: path.join(installRoot, 'scripts'),
+  managerJs:  path.join(installRoot, 'scripts', 'manage.js'),
+  managerHookSourceJs: path.join(installRoot, 'scripts', 'baseline-recital.js'),
+  managerContractsJs: path.join(installRoot, 'scripts', 'contracts.js'),
+  installedClaudeManifest: path.join(installRoot, '.claude-plugin', 'plugin.json'),
+  installedCodexManifest:  path.join(installRoot, '.codex-plugin', 'plugin.json'),
+  installedPresetsDir:     path.join(installRoot, 'presets'),
   // Claude skills-dir plugin payload (skill-only; no hooks). Linked into each
   // skill-capable agent's skills dir so Claude recognizes baseline + loads its skill.
   skillDir:      path.join(installRoot, 'skills', 'baseline'),
   skillManifest: path.join(installRoot, 'skills', 'baseline', '.claude-plugin', 'plugin.json'),
   skillMd:       path.join(installRoot, 'skills', 'baseline', 'SKILL.md'),
+  // Codex plugin payload copied/linked into CODEX_HOME's plugin cache and
+  // activated through config.toml.
+  codexPluginDir:      path.join(installRoot, 'codex-plugin', 'baseline'),
+  codexPluginManifest: path.join(installRoot, 'codex-plugin', 'baseline', '.codex-plugin', 'plugin.json'),
+  codexPluginSkillMd:  path.join(installRoot, 'codex-plugin', 'baseline', 'skills', 'baseline', 'SKILL.md'),
 };
 
 const repo = {
-  hookSourceJs: path.join(repoRoot, 'scripts', 'baseline-recital.js'),
-  presetsDir:   path.join(repoRoot, 'presets'),
-  // Source of truth for the Claude plugin manifest, copied into the central skill payload.
+  managerSourceJs: path.join(repoRoot, 'scripts', 'manage.js'),
+  hookSourceJs:    path.join(repoRoot, 'scripts', 'baseline-recital.js'),
+  contractsSourceJs: path.join(repoRoot, 'scripts', 'contracts.js'),
+  presetsDir:      path.join(repoRoot, 'presets'),
+  // Source of truth for plugin manifests, copied into installed control-surface payloads.
   claudePluginManifest: path.join(repoRoot, '.claude-plugin', 'plugin.json'),
+  codexPluginManifest:  path.join(repoRoot, '.codex-plugin', 'plugin.json'),
 };
 
 // --- agent registry --------------------------------------------------------
@@ -205,8 +238,10 @@ interface Agent {
   configDir: string;
   settingsFile: string;
   // True when the agent discovers plugins via a Claude-style skills dir
-  // (<configDir>/skills/<name>/). Codex uses its own .codex-plugin manifest instead.
+  // (<configDir>/skills/<name>/). Codex uses its cache + config.toml model.
   skillPlugin: boolean;
+  // True when the agent should get Codex's marketplace/cache/config activation.
+  codexPlugin: boolean;
 }
 
 function agentRegistry(): Agent[] {
@@ -216,18 +251,21 @@ function agentRegistry(): Agent[] {
       configDir: process.env.CLAUDE_CONFIG_DIR || path.join(homeDir, '.claude'),
       settingsFile: 'settings.json',
       skillPlugin: true,
+      codexPlugin: false,
     },
     {
       name: 'codex',
       configDir: process.env.CODEX_HOME || path.join(homeDir, '.codex'),
       settingsFile: 'hooks.json',
       skillPlugin: false,
+      codexPlugin: true,
     },
   ];
 }
 
-// Derive every per-agent path. hookJs and cfgDir are LINKS to the center;
-// hook config and counters are real per-agent files.
+// Derive every per-agent path. hookJs/hookContractsJs and cfgDir are LINKS to
+// the center; hook config and counters are real per-agent files. Codex plugin
+// activation additionally needs a cache root and config.toml table.
 function agentPaths(agent: Agent): AgentPaths {
   const d = agent.configDir;
   return {
@@ -238,8 +276,11 @@ function agentPaths(agent: Agent): AgentPaths {
     counters:  path.join(d, '.baseline-counters.json'),
     hooksDir:  path.join(d, 'hooks'),
     hookJs:    path.join(d, 'hooks', 'baseline-recital.js'),
+    hookContractsJs: path.join(d, 'hooks', 'contracts.js'),
     cfgDir:    path.join(d, 'cfg', 'baseline'),
     skillDir:  agent.skillPlugin ? path.join(d, 'skills', 'baseline') : null,
+    codexPluginDir: agent.codexPlugin ? path.join(d, 'plugins', 'cache', CODEX_MARKETPLACE, CODEX_PLUGIN, CODEX_PLUGIN_VERSION) : null,
+    codexConfigToml: agent.codexPlugin ? path.join(d, 'config.toml') : null,
   };
 }
 
@@ -355,9 +396,10 @@ function copyFileAtomic(src: string, dest: string): void {
   fs.renameSync(tmp, dest);
 }
 
-// Recursively copy a directory tree (used to deploy a preset and as the config
-// link copy-fallback).
+// Recursively copy a directory tree (used to deploy a preset/artifact payload and
+// as the config/plugin link copy-fallback).
 function copyDir(src: string, dest: string): void {
+  if (samePath(src, dest)) return;
   fs.mkdirSync(dest, { recursive: true });
   for (const entry of fs.readdirSync(src, { withFileTypes: true })) {
     const s = path.join(src, entry.name);
@@ -505,10 +547,12 @@ function removeOurLink(linkPath: string, target: string): boolean {
 
 // --- directory link (a folder linked as a unit) ----------------------------
 
-// Marker file inside a config folder / skill plugin dir, used to (a) recognize a
-// baseline-managed directory as safe to replace and (b) byte-compare for copy detection.
+// Marker files inside managed config/control-surface folders, used to (a)
+// recognize a baseline-managed directory as safe to replace and (b) byte-compare
+// for copy detection.
 const CONFIG_MARKER = 'config.json';
 const SKILL_MARKER = path.join('.claude-plugin', 'plugin.json');
+const CODEX_PLUGIN_MARKER = path.join('.codex-plugin', 'plugin.json');
 
 // Link a central FOLDER into linkPath: directory symlink, else a recursive copy
 // (degraded — central edits won't propagate). A real directory at linkPath is
@@ -571,6 +615,182 @@ function removeOurDirLink(linkPath: string, target: string, marker: string): boo
     try { fs.rmSync(linkPath, { recursive: true, force: true }); return true; } catch (e) { return false; }
   }
   return false;
+}
+
+// --- Codex plugin activation (config.toml) ----------------------------------
+
+interface TomlSection {
+  start: number;
+  end: number;
+}
+
+interface TomlTableHeader {
+  name: string;
+  array: boolean;
+}
+
+function splitTomlLines(content: string): { lines: string[]; eol: string } {
+  const eol = content.indexOf('\r\n') !== -1 ? '\r\n' : '\n';
+  const normalized = content.replace(/\r\n/g, '\n');
+  if (normalized === '') return { lines: [], eol };
+  const body = normalized.endsWith('\n') ? normalized.slice(0, -1) : normalized;
+  return { lines: body === '' ? [] : body.split('\n'), eol };
+}
+
+function joinTomlLines(lines: string[], eol: string): string {
+  return lines.length ? lines.join(eol) + eol : '';
+}
+
+function tomlLineCommentStart(line: string): number {
+  let quote: '"' | "'" | null = null;
+  let escaped = false;
+
+  for (let i = 0; i < line.length; i++) {
+    const ch = line[i];
+    if (quote === '"') {
+      if (escaped) {
+        escaped = false;
+      } else if (ch === '\\') {
+        escaped = true;
+      } else if (ch === '"') {
+        quote = null;
+      }
+      continue;
+    }
+    if (quote === "'") {
+      if (ch === "'") quote = null;
+      continue;
+    }
+    if (ch === '"' || ch === "'") {
+      quote = ch;
+    } else if (ch === '#') {
+      return i;
+    }
+  }
+
+  return -1;
+}
+
+function tomlTableHeader(line: string): TomlTableHeader | null {
+  const trimmed = line.trim();
+  if (!trimmed.startsWith('[')) return null;
+  const comment = tomlLineCommentStart(trimmed);
+  const header = (comment === -1 ? trimmed : trimmed.slice(0, comment).trim());
+  const array = header.startsWith('[[');
+  const openLen = array ? 2 : 1;
+  let quote: '"' | "'" | null = null;
+  let escaped = false;
+
+  for (let i = openLen; i < header.length; i++) {
+    const ch = header[i];
+    if (quote === '"') {
+      if (escaped) {
+        escaped = false;
+      } else if (ch === '\\') {
+        escaped = true;
+      } else if (ch === '"') {
+        quote = null;
+      }
+      continue;
+    }
+    if (quote === "'") {
+      if (ch === "'") quote = null;
+      continue;
+    }
+    if (ch === '"' || ch === "'") {
+      quote = ch;
+      continue;
+    }
+
+    if (array) {
+      if (ch !== ']' || header[i + 1] !== ']') continue;
+      const closeEnd = i + 2;
+      return header.slice(closeEnd).trim() === ''
+        ? { name: header.slice(openLen, i).trim(), array }
+        : null;
+    }
+
+    if (ch === ']') {
+      const closeEnd = i + 1;
+      return header.slice(closeEnd).trim() === ''
+        ? { name: header.slice(openLen, i).trim(), array }
+        : null;
+    }
+  }
+
+  return null;
+}
+
+function tomlTableName(line: string): string | null {
+  const table = tomlTableHeader(line);
+  return table ? table.name : null;
+}
+
+function tomlOrdinaryTableName(line: string): string | null {
+  const table = tomlTableHeader(line);
+  return table && !table.array ? table.name : null;
+}
+
+function isCodexPluginActivationName(name: string): boolean {
+  return name === 'plugins."' + CODEX_PLUGIN_KEY + '"' || name === "plugins.'" + CODEX_PLUGIN_KEY + "'";
+}
+
+function findCodexPluginActivationSection(lines: string[]): TomlSection | null {
+  for (let i = 0; i < lines.length; i++) {
+    const name = tomlOrdinaryTableName(lines[i]);
+    if (!name || !isCodexPluginActivationName(name)) continue;
+    let end = i + 1;
+    while (end < lines.length && tomlTableName(lines[end]) === null) end++;
+    return { start: i, end };
+  }
+  return null;
+}
+
+function codexPluginActivationState(configToml: string): LinkState {
+  let content: string;
+  try { content = fs.readFileSync(configToml, 'utf8'); }
+  catch (e) {
+    if (e && e.code === 'ENOENT') return { ok: false, mechanism: 'missing' };
+    return { ok: false, mechanism: 'unreadable' };
+  }
+  return findCodexPluginActivationSection(splitTomlLines(content).lines)
+    ? { ok: true, mechanism: 'present' }
+    : { ok: false, mechanism: 'inactive' };
+}
+
+function ensureCodexPluginActivation(configToml: string): string {
+  let content = '';
+  let existed = true;
+  try { content = fs.readFileSync(configToml, 'utf8'); }
+  catch (e) {
+    if (e && e.code === 'ENOENT') existed = false;
+    else throw e;
+  }
+
+  const parsed = splitTomlLines(content);
+  if (findCodexPluginActivationSection(parsed.lines)) return 'present';
+
+  if (parsed.lines.length && parsed.lines[parsed.lines.length - 1].trim() !== '') {
+    parsed.lines.push('');
+  }
+  parsed.lines.push(CODEX_PLUGIN_TABLE);
+  atomicWrite(configToml, joinTomlLines(parsed.lines, parsed.eol));
+  return existed ? 'added' : 'created';
+}
+
+function removeCodexPluginActivation(configToml: string): string {
+  let content: string;
+  try { content = fs.readFileSync(configToml, 'utf8'); }
+  catch (e) {
+    if (e && e.code === 'ENOENT') return 'absent';
+    throw e;
+  }
+  const parsed = splitTomlLines(content);
+  const section = findCodexPluginActivationSection(parsed.lines);
+  if (!section) return 'absent';
+  const next = parsed.lines.slice(0, section.start).concat(parsed.lines.slice(section.end));
+  atomicWrite(configToml, joinTomlLines(next, parsed.eol));
+  return 'removed';
 }
 
 // --- command-string parsing ------------------------------------------------
@@ -687,33 +907,6 @@ function unwireAll(ap: AgentPaths): string[] {
 
 // --- config loading / validation -------------------------------------------
 
-// Resolve a route's `doc` against the central config dir; reject escapes.
-function safeDocPath(doc: string): string | null {
-  if (typeof doc !== 'string' || !doc) return null;
-  if (path.isAbsolute(doc)) return null;
-  const resolved = path.resolve(central.cfgDir, doc);
-  const rel = path.relative(central.cfgDir, resolved);
-  if (rel === '' || rel.startsWith('..') || path.isAbsolute(rel)) return null;
-  return resolved;
-}
-
-function pathInside(base: string, candidate: string): boolean {
-  const rel = path.relative(base, candidate);
-  return rel === '' || (!!rel && !rel.startsWith('..') && !path.isAbsolute(rel));
-}
-
-function safeRealDocPath(doc: string): string | null {
-  const p = safeDocPath(doc);
-  if (!p) return null;
-  try {
-    const realBase = fs.realpathSync(central.cfgDir);
-    const realDoc = fs.realpathSync(p);
-    return pathInside(realBase, realDoc) ? p : null;
-  } catch (e) {
-    return null;
-  }
-}
-
 // Load + validate the central config.json. Mirrors the dispatcher's fail-open
 // selection, but also collects per-route issues so doctor/status can report them.
 function loadCentralConfig(): ConfigReport {
@@ -753,7 +946,7 @@ function loadCentralConfig(): ConfigReport {
         (ev.phase !== undefined && (ev.base !== 'SessionStart' || SESSION_PHASES.indexOf(ev.phase) === -1))) {
       report.issues.push({ level: 'fail', msg: 'route ' + label + ' has unsupported event ' + JSON.stringify(r.event) }); continue;
     }
-    const docPath = safeDocPath(r.doc);
+    const docPath = safeDocPath(r.doc, central.cfgDir);
     if (!docPath) { report.issues.push({ level: 'fail', msg: 'route ' + label + ' has an invalid or out-of-range doc ' + JSON.stringify(r.doc) }); continue; }
     let freq = 1;
     if (r.freq !== undefined) {
@@ -764,7 +957,7 @@ function loadCentralConfig(): ConfigReport {
     // doc readability + size (a route past validation but whose doc is gone still fails doctor).
     try {
       const st = fs.statSync(docPath);
-      if (!safeRealDocPath(r.doc)) {
+      if (!safeRealDocPath(r.doc, central.cfgDir)) {
         report.issues.push({ level: 'fail', msg: 'route ' + label + ' doc resolves outside the config folder: ' + r.doc });
       }
       if (st.size > MAX_DOC_BYTES) report.issues.push({ level: 'fail', msg: 'route ' + label + ' doc exceeds 64 KiB cap' });
@@ -845,13 +1038,54 @@ function ensureCentralConfig(opts: InstallOpts): string {
   return exists ? 'replaced' : 'seeded';
 }
 
-// --- Claude skills-dir plugin payload --------------------------------------
+// --- installed control-surface payloads -------------------------------------
 
-// The deployed SKILL.md is a thin wrapper: the payload is detached from the repo,
-// so it records the repo root and points at the repo's canonical SKILL.md. Skill
-// triggering uses the frontmatter description, so keep it rich. The wrapper carries
-// no hooks — baseline's hook wiring lives in settings.json, managed by the installer.
-function skillWrapper(repoRootPath: string): string {
+function copyFileIfDifferent(src: string, dest: string): void {
+  if (samePath(src, dest)) return;
+  copyFileAtomic(src, dest);
+}
+
+function sameFileContents(left: string, right: string): boolean {
+  try { return fs.readFileSync(left).equals(fs.readFileSync(right)); }
+  catch (e) { return false; }
+}
+
+// Deploy the small set of source artifacts an installed control surface needs to
+// keep working even when the original checkout moves: the manager, dispatcher,
+// shared contracts, manifests, and presets. When the manager is run from the
+// install root these paths are already identical, so this is a no-op.
+function ensureInstalledManagerArtifacts(): void {
+  if (!fs.existsSync(repo.managerSourceJs)) {
+    throw new Error('manager artifact missing at ' + repo.managerSourceJs + ' — run `npm run build` first.');
+  }
+  if (!fs.existsSync(repo.hookSourceJs)) {
+    throw new Error('compiled dispatcher missing at ' + repo.hookSourceJs + ' — run `npm run build` first.');
+  }
+  if (!fs.existsSync(repo.contractsSourceJs)) {
+    throw new Error('compiled contracts missing at ' + repo.contractsSourceJs + ' — run `npm run build` first.');
+  }
+  if (!fs.existsSync(repo.claudePluginManifest)) {
+    throw new Error('Claude plugin manifest missing at ' + repo.claudePluginManifest + ' — cannot deploy the skill plugin.');
+  }
+  if (!fs.existsSync(repo.codexPluginManifest)) {
+    throw new Error('Codex plugin manifest missing at ' + repo.codexPluginManifest + ' — cannot deploy the Codex plugin.');
+  }
+  if (!fs.existsSync(repo.presetsDir)) {
+    throw new Error('preset directory missing at ' + repo.presetsDir + ' — cannot seed installs from this manager.');
+  }
+
+  copyFileIfDifferent(repo.managerSourceJs, central.managerJs);
+  copyFileIfDifferent(repo.hookSourceJs, central.managerHookSourceJs);
+  copyFileIfDifferent(repo.contractsSourceJs, central.managerContractsJs);
+  copyFileIfDifferent(repo.claudePluginManifest, central.installedClaudeManifest);
+  copyFileIfDifferent(repo.codexPluginManifest, central.installedCodexManifest);
+  copyDir(repo.presetsDir, central.installedPresetsDir);
+}
+
+// The deployed SKILL.md is self-contained enough for normal operation: it points
+// at installed disk artifacts under <installRoot>, not the source checkout's root
+// SKILL.md. The source path is recorded only as provenance for source development.
+function installedControlSurfaceSkill(host: 'Claude' | 'Codex', repoRootPath: string): string {
   return [
     '---',
     'name: baseline',
@@ -867,39 +1101,80 @@ function skillWrapper(repoRootPath: string): string {
     '  route", "change baseline frequency", or "make the agent recite X every N turns".',
     '---',
     '',
-    '# baseline (Claude skill)',
+    '# baseline (' + host + ' control surface)',
     '',
-    'Claude control surface for the **baseline** drift-correction system, installed as a',
-    'skills-directory plugin (`baseline@skills-dir`). This skill only makes baseline',
-    'discoverable; the hook wiring itself is managed by the baseline installer and is',
-    'unaffected by this skill.',
+    'Use the installed baseline manager and artifacts. Do not assume the original source',
+    'checkout still exists; it is only recorded below for source-development refreshes.',
     '',
-    'baseline was installed from this repo:',
+    'Install root:',
+    '',
+    '    ' + central.root,
+    '',
+    'Config folder (routes + injected docs):',
+    '',
+    '    ' + central.cfgDir,
+    '',
+    'Manager commands:',
+    '',
+    '    node "' + central.managerJs + '" status',
+    '    node "' + central.managerJs + '" install',
+    '    node "' + central.managerJs + '" update',
+    '    node "' + central.managerJs + '" verify',
+    '    node "' + central.managerJs + '" doctor',
+    '    node "' + central.managerJs + '" doctor --fix',
+    '    node "' + central.managerJs + '" uninstall',
+    '',
+    'Normal edits:',
+    '',
+    '- Change injected text in `' + central.docsDir + '`.',
+    '- Change routes in `' + central.config + '`; rerun `install`/`update` when the',
+    '  route event set changes so hook wiring stays exact.',
+    '- After hook-config changes, open `/hooks` once in each agent or restart it.',
+    '',
+    'Codex plugin activation managed by `install`/`update`:',
+    '',
+    '    cache: $CODEX_HOME/plugins/cache/' + CODEX_MARKETPLACE + '/' + CODEX_PLUGIN + '/' + CODEX_PLUGIN_VERSION,
+    '    config: ' + CODEX_PLUGIN_TABLE,
+    '',
+    'Source checkout recorded for provenance/source refresh only:',
     '',
     '    ' + repoRootPath,
     '',
-    'Before acting, read `' + path.join(repoRootPath, 'SKILL.md') + '` and follow it — it',
-    'is the single source of truth for baseline usage, workflow, vocabulary, and',
-    'verification. Run the manager from that repo root, e.g.:',
-    '',
-    '    node "' + path.join(repoRootPath, 'scripts', 'manage.js') + '" status',
-    '',
-    'Other commands: `install`, `update`, `verify`, `doctor` (add `--fix`), `uninstall`.',
-    'If that path no longer exists (repo moved or deleted), re-run the baseline installer',
-    'from the new location to refresh this skill.',
+    "If you need to refresh from a different checkout, run that checkout's",
+    '`node scripts/manage.js install` or `update`; otherwise use the installed manager',
+    'above.',
     '',
   ].join('\n');
 }
 
 // Deploy the Claude skills-dir plugin payload to the center: the manifest copied
-// verbatim from the repo (single source of truth), plus a generated SKILL.md wrapper
-// recording the current repo root. Always overwrites (repo wins), like the dispatcher.
+// verbatim from the repo (single source of truth), plus a generated SKILL.md that
+// uses installed artifacts for normal operation. Always overwrites (repo wins),
+// like the dispatcher.
 function ensureCentralSkill(): void {
   if (!fs.existsSync(repo.claudePluginManifest)) {
     throw new Error('Claude plugin manifest missing at ' + repo.claudePluginManifest + ' — cannot deploy the skill plugin.');
   }
   atomicWrite(central.skillManifest, fs.readFileSync(repo.claudePluginManifest, 'utf8'));
-  atomicWrite(central.skillMd, skillWrapper(repoRoot));
+  atomicWrite(central.skillMd, installedControlSurfaceSkill('Claude', repoRoot));
+}
+
+// Deploy the central Codex plugin payload. Codex itself loads from
+// CODEX_HOME/plugins/cache/<marketplace>/<plugin>/<version>, so selected agents
+// receive a managed link/copy from this root plus a config.toml activation table.
+function ensureCentralCodexPlugin(): void {
+  if (!fs.existsSync(repo.codexPluginManifest)) {
+    throw new Error('Codex plugin manifest missing at ' + repo.codexPluginManifest + ' — cannot deploy the Codex plugin.');
+  }
+  atomicWrite(central.codexPluginManifest, fs.readFileSync(repo.codexPluginManifest, 'utf8'));
+  atomicWrite(central.codexPluginSkillMd, installedControlSurfaceSkill('Codex', repoRoot));
+}
+
+function ensureCodexPluginForAgent(ap: AgentPaths): { cacheMech: string; activation: string } | null {
+  if (!ap.codexPluginDir || !ap.codexConfigToml) return null;
+  const cacheMech = linkDirInto(central.codexPluginDir, ap.codexPluginDir, CODEX_PLUGIN_MARKER);
+  const activation = ensureCodexPluginActivation(ap.codexConfigToml);
+  return { cacheMech, activation };
 }
 
 // --- commands --------------------------------------------------------------
@@ -962,47 +1237,61 @@ async function cmdInstall(opts: InstallOpts): Promise<void> {
   if (!fs.existsSync(repo.hookSourceJs)) {
     fail('install: compiled dispatcher missing at ' + repo.hookSourceJs + ' — run `npm run build` first.', 1);
   }
+  if (!fs.existsSync(repo.contractsSourceJs)) {
+    fail('install: compiled contracts missing at ' + repo.contractsSourceJs + ' — run `npm run build` first.', 1);
+  }
   fs.mkdirSync(central.hooksDir, { recursive: true });
   atomicWrite(central.hookJs, fs.readFileSync(repo.hookSourceJs, 'utf8'));
+  copyFileIfDifferent(repo.contractsSourceJs, central.hookContractsJs);
 
-  // 2b. Establish the config folder LOCATION (symlink to BASELINE_CFG, or a real dir).
+  // 2b. Deploy installed manager/source artifacts used by generated control surfaces.
+  try { ensureInstalledManagerArtifacts(); }
+  catch (e) { fail('install: ' + e.message, 1); }
+
+  // 3. Establish the config folder LOCATION (symlink to BASELINE_CFG, or a real dir).
   const cfgLocMech = ensureConfigLocation();
 
-  // 3. Establish the config folder CONTENTS (seed/keep/replace).
+  // 4. Establish the config folder CONTENTS (seed/keep/replace).
   const configState = ensureCentralConfig(opts);
 
-  // 3b. Deploy the Claude skills-dir plugin payload to the center (repo wins).
+  // 5. Deploy control-surface plugin payloads to the center (repo wins).
   ensureCentralSkill();
-
-  // 4. Read the config to learn which events to wire.
+  ensureCentralCodexPlugin();
+  // 6. Read the config to learn which events to wire.
   const cfg = loadCentralConfig();
 
-  // 4b. Persist the selected agent set so update/doctor/uninstall scope to it (D5).
+  // 7. Persist the selected agent set so update/doctor/uninstall scope to it (D5).
   if (selected.length) writeRecordedAgents(selected);
 
-  // 5. For each agent: link the center in, then wire hook config for the config's events.
+  // 8. For each agent: link the center in, then wire hook config for the config's
+  // events. Codex also gets its plugin cache materialized and config.toml activated.
   const perAgent = [];
   for (const ap of agentsP) {
     const jsMech = linkInto(central.hookJs, ap.hookJs);
+    const contractsMech = linkInto(central.hookContractsJs, ap.hookContractsJs);
     const cfgMech = linkDirInto(central.cfgLink, ap.cfgDir, CONFIG_MARKER);
     const skillMech = ap.skillDir ? linkDirInto(central.skillDir, ap.skillDir, SKILL_MARKER) : null;
+    const codexPlugin = ensureCodexPluginForAgent(ap);
     const command = jsCommand(ap);
     const sync = syncWiring(ap, command, cfg.desiredEvents);
-    perAgent.push({ name: ap.name, configDir: ap.configDir, jsMech, cfgMech, skillMech, sync });
+    perAgent.push({ name: ap.name, configDir: ap.configDir, jsMech, contractsMech, cfgMech, skillMech, codexPlugin, sync });
   }
 
   console.log('[baseline] install complete');
   console.log('  install root  : ' + central.root);
   console.log('  runtime       : node js');
+  console.log('  manager       : ' + central.managerJs);
   console.log('  dispatcher    : ' + central.hookJs);
   console.log('  config folder : ' + central.cfgDir + ' (' + configState + ', preset: ' + opts.preset + ')' +
     (configIsExternal ? ' [external; ' + central.cfgLink + ' (' + cfgLocMech + ') links to it]' : ''));
-  console.log('  skill plugin  : ' + central.skillDir + ' (baseline@skills-dir; no hooks)');
+  console.log('  claude skill  : ' + central.skillDir + ' (baseline@skills-dir; no hooks)');
+  console.log('  codex plugin  : ' + central.codexPluginDir + ' (' + CODEX_PLUGIN_KEY + ', version ' + CODEX_PLUGIN_VERSION + ')');
   console.log('  routes        : ' + cfg.routes.length + (cfg.desiredEvents.length ? ' over [' + cfg.desiredEvents.join(', ') + ']' : ' (no events wired)'));
   if (cfg.fatal) console.log('  config WARNING: ' + cfg.fatal + ' — run doctor');
   for (const a of perAgent) {
     console.log('  agent ' + a.name + ' @ ' + a.configDir);
-    console.log('    links       : dispatcher=' + a.jsMech + ', cfg=' + a.cfgMech + (a.skillMech ? ', skill=' + a.skillMech : ''));
+    console.log('    links       : dispatcher=' + a.jsMech + ', contracts=' + a.contractsMech + ', cfg=' + a.cfgMech + (a.skillMech ? ', skill=' + a.skillMech : '') +
+      (a.codexPlugin ? ', codex-cache=' + a.codexPlugin.cacheMech + ', codex-config=' + a.codexPlugin.activation : ''));
     console.log('    wired       : ' + (a.sync.wired.length ? a.sync.wired.join(', ') : '(none)') +
       (a.sync.unwired.length ? '; unwired ' + a.sync.unwired.join(', ') : ''));
   }
@@ -1019,37 +1308,46 @@ function cmdUninstall(): void {
     try { unwired = unwireAll(ap); }
     catch (e) { fail('uninstall: ' + e.message, 1); }
     const jsGone = removeOurLink(ap.hookJs, central.hookJs);
+    const contractsGone = removeOurLink(ap.hookContractsJs, central.hookContractsJs);
     const cfgGone = removeOurDirLink(ap.cfgDir, central.cfgLink, CONFIG_MARKER);
     const skillGone = ap.skillDir ? removeOurDirLink(ap.skillDir, central.skillDir, SKILL_MARKER) : false;
+    const codexCacheGone = ap.codexPluginDir ? removeOurDirLink(ap.codexPluginDir, central.codexPluginDir, CODEX_PLUGIN_MARKER) : false;
+    const codexActivation = ap.codexConfigToml ? removeCodexPluginActivation(ap.codexConfigToml) : 'absent';
     console.log('  agent ' + ap.name + ' @ ' + ap.configDir);
     console.log('    ' + ap.settingsLabel.padEnd(12) + ': ' + (unwired.length ? 'unwired ' + unwired.join(', ') : 'nothing wired'));
     console.log('    dispatcher  : ' + (jsGone ? 'unlinked' : 'absent'));
+    console.log('    contracts   : ' + (contractsGone ? 'unlinked' : 'absent'));
     console.log('    cfg folder  : ' + (cfgGone ? 'unlinked (central kept)' : 'left as-is'));
     if (ap.skillDir) console.log('    skill plugin: ' + (skillGone ? 'unlinked (central kept)' : 'left as-is'));
+    if (ap.codexPluginDir) console.log('    codex cache : ' + (codexCacheGone ? 'removed (central kept)' : 'left as-is'));
+    if (ap.codexConfigToml) console.log('    codex config: ' + (codexActivation === 'removed' ? 'removed ' + CODEX_PLUGIN_TABLE : 'no managed entry'));
   }
   console.log('  central config : KEPT at ' + central.cfgDir + ' (delete by hand if you want it gone)');
+  console.log('  central payloads: KEPT under ' + central.root + ' (delete by hand if you want them gone)');
 }
 
 function cmdStatus(): void {
   const agentsP = allAgentPaths();
 
-  const jsExists = fs.existsSync(central.hookJs);
-  let inSync = false;
-  if (jsExists) {
-    try { inSync = fs.readFileSync(central.hookJs, 'utf8') === fs.readFileSync(repo.hookSourceJs, 'utf8'); }
-    catch (e) {}
-  }
+  const dispatcherPresent = fs.existsSync(central.hookJs) && fs.existsSync(central.hookContractsJs);
+  const inSync = dispatcherPresent &&
+    sameFileContents(central.hookJs, repo.hookSourceJs) &&
+    sameFileContents(central.hookContractsJs, repo.contractsSourceJs);
   const cfg = loadCentralConfig();
 
   console.log('[baseline] status');
   console.log('  install root   : ' + central.root);
-  console.log('  dispatcher     : ' + (jsExists
+  console.log('  dispatcher     : ' + (dispatcherPresent
     ? 'present' + (inSync ? ' (byte-identical to repo source)' : ' (DIFFERS from repo source — run install to refresh)')
     : 'not present'));
   console.log('  config folder  : ' + (cfg.present ? 'present at ' + central.cfgDir : 'missing (install will seed it)') +
     (configIsExternal ? ' [external; ' + central.cfgLink + ' → it]' : ''));
+  const managerPresent = fs.existsSync(central.managerJs) && fs.existsSync(central.managerHookSourceJs) && fs.existsSync(central.managerContractsJs);
+  console.log('  manager        : ' + (managerPresent ? 'present at ' + central.managerJs : 'not deployed (install will deploy it)'));
   const skillPresent = fs.existsSync(central.skillManifest) && fs.existsSync(central.skillMd);
-  console.log('  skill plugin   : ' + (skillPresent ? 'present at ' + central.skillDir : 'not deployed (install will deploy it)'));
+  console.log('  claude skill   : ' + (skillPresent ? 'present at ' + central.skillDir : 'not deployed (install will deploy it)'));
+  const codexPluginPresent = fs.existsSync(central.codexPluginManifest) && fs.existsSync(central.codexPluginSkillMd);
+  console.log('  codex plugin   : ' + (codexPluginPresent ? 'present at ' + central.codexPluginDir : 'not deployed (install will deploy it)'));
   if (cfg.fatal) console.log('  config         : INVALID — ' + cfg.fatal);
   console.log('  routes         : ' + cfg.routes.length);
   for (const r of cfg.routes) {
@@ -1072,8 +1370,15 @@ function cmdStatus(): void {
       console.log('    ' + ap.settingsLabel.padEnd(13) + ': ' + (wired.length ? 'wired [' + wired.join(', ') + ']' : 'not wired'));
     }
     console.log('    dispatcher   : ' + describeLink(linkState(ap.hookJs, central.hookJs)));
+    console.log('    contracts    : ' + describeLink(linkState(ap.hookContractsJs, central.hookContractsJs)));
     console.log('    cfg folder   : ' + describeLink(dirLinkState(ap.cfgDir, central.cfgLink, CONFIG_MARKER)));
     if (ap.skillDir) console.log('    skill plugin : ' + describeLink(dirLinkState(ap.skillDir, central.skillDir, SKILL_MARKER)));
+    if (ap.codexPluginDir && ap.codexConfigToml) {
+      const cache = dirLinkState(ap.codexPluginDir, central.codexPluginDir, CODEX_PLUGIN_MARKER);
+      const activation = codexPluginActivationState(ap.codexConfigToml);
+      console.log('    codex cache  : ' + describeLink(cache));
+      console.log('    codex config : ' + (activation.ok ? 'OK (' + CODEX_PLUGIN_TABLE + ' in config.toml)' : activation.mechanism.toUpperCase() + ' (' + CODEX_PLUGIN_TABLE + ' absent)'));
+    }
   }
 }
 
@@ -1168,12 +1473,12 @@ async function cmdUpdate(): Promise<void> {
 function doctorChecks(): Check[] {
   const checks: Check[] = [];
 
-  const jsExists = fs.existsSync(central.hookJs);
-  if (!jsExists) {
-    checks.push({ name: 'central dispatcher', level: 'fail', detail: 'not deployed at ' + central.hookJs, fixable: true });
+  const dispatcherPresent = fs.existsSync(central.hookJs) && fs.existsSync(central.hookContractsJs);
+  if (!dispatcherPresent) {
+    checks.push({ name: 'central dispatcher', level: 'fail', detail: 'not fully deployed under ' + central.hooksDir, fixable: true });
   } else {
-    let inSync = false;
-    try { inSync = fs.readFileSync(central.hookJs, 'utf8') === fs.readFileSync(repo.hookSourceJs, 'utf8'); } catch (e) {}
+    const inSync = sameFileContents(central.hookJs, repo.hookSourceJs) &&
+      sameFileContents(central.hookContractsJs, repo.contractsSourceJs);
     checks.push(inSync
       ? { name: 'central dispatcher', level: 'ok', detail: 'byte-identical to repo source' }
       : { name: 'central dispatcher', level: 'warn', detail: 'DIFFERS from repo source (stale — update will refresh)', fixable: true });
@@ -1207,21 +1512,57 @@ function doctorChecks(): Check[] {
       : { name: 'config location', level: 'fail', detail: central.cfgLink + ' does not link to ' + central.cfgDir + ' (run install)', fixable: true });
   }
 
+  // Installed manager artifacts used by self-contained control surfaces.
+  const managerPresent = fs.existsSync(central.managerJs) && fs.existsSync(central.managerHookSourceJs) && fs.existsSync(central.managerContractsJs);
+  if (!managerPresent) {
+    checks.push({ name: 'installed manager', level: 'warn', detail: 'not fully deployed under ' + central.managerDir + ' (install will deploy it)', fixable: true });
+  } else {
+    let managerSync = false;
+    try {
+      managerSync = sameFileContents(central.managerJs, repo.managerSourceJs) &&
+        sameFileContents(central.managerHookSourceJs, repo.hookSourceJs) &&
+        sameFileContents(central.managerContractsJs, repo.contractsSourceJs);
+    } catch (e) {}
+    checks.push(managerSync
+      ? { name: 'installed manager', level: 'ok', detail: 'installed manager artifacts present' }
+      : { name: 'installed manager', level: 'warn', detail: 'installed manager artifacts differ from source (update will refresh)', fixable: true });
+  }
+
   // Central Claude skill plugin payload.
   if (!fs.existsSync(central.skillManifest) || !fs.existsSync(central.skillMd)) {
-    checks.push({ name: 'skill plugin', level: 'warn', detail: 'central payload not deployed at ' + central.skillDir + ' (install will deploy it)', fixable: true });
+    checks.push({ name: 'claude skill plugin', level: 'warn', detail: 'central payload not deployed at ' + central.skillDir + ' (install will deploy it)', fixable: true });
   } else if (fs.existsSync(repo.claudePluginManifest)) {
     let manifestSync = false;
     try { manifestSync = fs.readFileSync(central.skillManifest, 'utf8') === fs.readFileSync(repo.claudePluginManifest, 'utf8'); } catch (e) {}
     let pathFresh = false;
-    try { pathFresh = fs.readFileSync(central.skillMd, 'utf8').includes(repoRoot); } catch (e) {}
+    try { pathFresh = fs.readFileSync(central.skillMd, 'utf8').includes(central.managerJs); } catch (e) {}
     if (manifestSync && pathFresh) {
-      checks.push({ name: 'skill plugin', level: 'ok', detail: 'central payload deployed; recorded repo root current' });
+      checks.push({ name: 'claude skill plugin', level: 'ok', detail: 'central payload deployed; points at installed manager' });
     } else {
-      checks.push({ name: 'skill plugin', level: 'warn', detail: (!manifestSync ? 'manifest differs from repo source' : 'recorded repo root is stale') + ' (update will refresh)', fixable: true });
+      checks.push({ name: 'claude skill plugin', level: 'warn', detail: (!manifestSync ? 'manifest differs from source' : 'installed manager path missing/stale') + ' (update will refresh)', fixable: true });
     }
   } else {
-    checks.push({ name: 'skill plugin', level: 'ok', detail: 'central payload deployed' });
+    checks.push({ name: 'claude skill plugin', level: 'ok', detail: 'central payload deployed' });
+  }
+
+  // Central Codex plugin payload.
+  if (!fs.existsSync(central.codexPluginManifest) || !fs.existsSync(central.codexPluginSkillMd)) {
+    checks.push({ name: 'codex plugin payload', level: 'warn', detail: 'central payload not deployed at ' + central.codexPluginDir + ' (install will deploy it)', fixable: true });
+  } else if (fs.existsSync(repo.codexPluginManifest)) {
+    let manifestSync = false;
+    try { manifestSync = fs.readFileSync(central.codexPluginManifest, 'utf8') === fs.readFileSync(repo.codexPluginManifest, 'utf8'); } catch (e) {}
+    let pathFresh = false;
+    try {
+      const skill = fs.readFileSync(central.codexPluginSkillMd, 'utf8');
+      pathFresh = skill.includes(central.managerJs) && skill.includes(CODEX_PLUGIN_TABLE);
+    } catch (e) {}
+    if (manifestSync && pathFresh) {
+      checks.push({ name: 'codex plugin payload', level: 'ok', detail: 'central payload deployed; points at installed manager' });
+    } else {
+      checks.push({ name: 'codex plugin payload', level: 'warn', detail: (!manifestSync ? 'manifest differs from source' : 'installed manager/plugin activation path missing/stale') + ' (update will refresh)', fixable: true });
+    }
+  } else {
+    checks.push({ name: 'codex plugin payload', level: 'ok', detail: 'central payload deployed' });
   }
 
   // Scope the per-agent checks to the recorded set (D6); fall back to inferred, then all.
@@ -1252,6 +1593,11 @@ function doctorChecks(): Check[] {
     else if (js.ok) checks.push({ name: 'dispatcher link', level: 'warn', detail: 'degraded copy (edits will not propagate; install will relink)', fixable: true });
     else checks.push({ name: 'dispatcher link', level: 'fail', detail: js.mechanism + ' — not linked to ' + central.hookJs, fixable: true });
 
+    const contracts = linkState(ap.hookContractsJs, central.hookContractsJs);
+    if (contracts.ok && contracts.mechanism !== 'copy') checks.push({ name: 'contracts link', level: 'ok', detail: 'linked to center (' + contracts.mechanism + ')' });
+    else if (contracts.ok) checks.push({ name: 'contracts link', level: 'warn', detail: 'degraded copy (edits will not propagate; install will relink)', fixable: true });
+    else checks.push({ name: 'contracts link', level: 'fail', detail: contracts.mechanism + ' — not linked to ' + central.hookContractsJs, fixable: true });
+
     const cl = dirLinkState(ap.cfgDir, central.cfgLink, CONFIG_MARKER);
     if (cl.ok && cl.mechanism !== 'copy') checks.push({ name: 'config link', level: 'ok', detail: 'linked to center (' + cl.mechanism + ')' });
     else if (cl.ok) checks.push({ name: 'config link', level: 'warn', detail: 'degraded copy (edits will not propagate; install will relink)', fixable: true });
@@ -1264,6 +1610,18 @@ function doctorChecks(): Check[] {
       else if (sl.ok) checks.push({ name: 'skill link', level: 'warn', detail: ap.name + ' degraded copy (edits will not propagate; install will relink)', fixable: true });
       else if (!fs.existsSync(central.skillManifest)) checks.push({ name: 'skill link', level: 'warn', detail: ap.name + ' central skill missing — install will deploy + link', fixable: true });
       else checks.push({ name: 'skill link', level: 'fail', detail: ap.name + ' ' + sl.mechanism + ' — not linked to ' + central.skillDir, fixable: true });
+    }
+
+    if (ap.codexPluginDir && ap.codexConfigToml) {
+      const pl = dirLinkState(ap.codexPluginDir, central.codexPluginDir, CODEX_PLUGIN_MARKER);
+      if (pl.ok && pl.mechanism !== 'copy') checks.push({ name: 'codex plugin cache', level: 'ok', detail: ap.name + ' cache linked to center (' + pl.mechanism + ')' });
+      else if (pl.ok) checks.push({ name: 'codex plugin cache', level: 'warn', detail: ap.name + ' degraded cache copy (install will relink)', fixable: true });
+      else if (!fs.existsSync(central.codexPluginManifest)) checks.push({ name: 'codex plugin cache', level: 'warn', detail: ap.name + ' central Codex plugin missing — install will deploy + cache it', fixable: true });
+      else checks.push({ name: 'codex plugin cache', level: 'fail', detail: ap.name + ' ' + pl.mechanism + ' — not materialized at ' + ap.codexPluginDir, fixable: true });
+
+      const act = codexPluginActivationState(ap.codexConfigToml);
+      if (act.ok) checks.push({ name: 'codex plugin activation', level: 'ok', detail: ap.name + ' config.toml contains ' + CODEX_PLUGIN_TABLE });
+      else checks.push({ name: 'codex plugin activation', level: 'fail', detail: ap.name + ' ' + act.mechanism + ' — config.toml must contain ' + CODEX_PLUGIN_TABLE, fixable: act.mechanism !== 'unreadable' });
     }
   }
 
@@ -1348,14 +1706,15 @@ function printHelp(): void {
   console.log('  node scripts/manage.js help                    Show this help.');
   console.log('');
   console.log('install options:');
-  console.log('  --preset <minimal|default>   Which repo preset to seed when no config folder exists. Default: minimal.');
+  console.log('  --preset <minimal|default>   Which repo preset to seed when no config folder exists. Default: default.');
   console.log('  --force                      Replace an existing central config folder with the preset (DESTRUCTIVE — user edits lost).');
   console.log('  --agents <a,b>               Comma list of agents to wire (claude-code,codex). Each must be detected. Default: prompt on a TTY, else all detected.');
   console.log('');
   console.log('Agents are detected by config-dir existence; an install/update/uninstall scopes to the agents recorded in <install root>/state.json.');
   console.log('Native Zig runtime is paused for the routes feature; the dispatcher is Node-only in v1.');
+  console.log('Installed manager artifacts are deployed under <install root>/scripts so generated control surfaces do not depend on the source checkout.');
   console.log('A Claude skills-dir plugin (baseline@skills-dir) is deployed + linked so Claude recognizes baseline; it carries no hooks.');
-  console.log('Install root (artifacts): BASELINE_HOME if set, otherwise ~/.baseline.');
+  console.log('A Codex plugin (' + CODEX_PLUGIN_KEY + ') is deployed under <install root>/codex-plugin/baseline, materialized at $CODEX_HOME/plugins/cache/' + CODEX_MARKETPLACE + '/' + CODEX_PLUGIN + '/' + CODEX_PLUGIN_VERSION + ', and activated by ' + CODEX_PLUGIN_TABLE + ' in config.toml.');
   console.log('Config folder (routes + docs): BASELINE_CFG if set, otherwise <install root>/cfg.');
   console.log('Claude config dir: CLAUDE_CONFIG_DIR if set, otherwise ~/.claude.');
   console.log('Codex config dir: CODEX_HOME if set, otherwise ~/.codex.');

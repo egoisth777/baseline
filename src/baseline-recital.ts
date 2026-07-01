@@ -25,14 +25,19 @@
 import * as fs from 'fs';
 import * as path from 'path';
 import * as os from 'os';
-
-interface Route {
-  id: string;
-  event: string;
-  freq: number;
-  cwd?: string;
-  doc: string;
-}
+import {
+  MAX_CONFIG_BYTES,
+  MAX_DOC_BYTES,
+  MAX_DOC_CHARS,
+  MAX_ROUTES,
+  Route,
+  SESSION_PHASES,
+  SLUG,
+  SUPPORTED_EVENTS,
+  parseEvent,
+  safeDocPath,
+  safeRealDocPath,
+} from './contracts';
 
 interface CounterEntry {
   count: number;
@@ -49,31 +54,10 @@ interface HookInput {
   source?: string;
 }
 
-// Events this dispatcher can inject standing context into.
-const SUPPORTED_EVENTS = ['UserPromptSubmit', 'SessionStart', 'PreToolUse', 'PostToolUse'];
-// SessionStart lifecycle phases. An event may name one via a "SessionStart.<phase>"
-// suffix; the phase then resolves against the hook stdin `source`.
-const SESSION_PHASES = ['startup', 'resume', 'clear', 'compact'];
-// Route id shape — keys the counter and labels the route in status/doctor.
-const SLUG = /^[a-z0-9][a-z0-9-]*$/;
-
-// Split a route event into its base event and optional phase suffix, on the FIRST
-// '.'. "SessionStart.compact" -> { base:'SessionStart', phase:'compact' }; a bare
-// "UserPromptSubmit" -> { base:'UserPromptSubmit' }.
-function parseEvent(event: string): { base: string; phase?: string } {
-  const dot = event.indexOf('.');
-  if (dot === -1) return { base: event };
-  return { base: event.slice(0, dot), phase: event.slice(dot + 1) };
-}
-
 // Drop counter entries untouched for longer than this (stale sessions).
 const PRUNE_MS = 7 * 24 * 60 * 60 * 1000;
 const MAX_STDIN_BYTES = 1024 * 1024;
-const MAX_CONFIG_BYTES = 64 * 1024;
-const MAX_DOC_BYTES = 64 * 1024;
-const MAX_DOC_CHARS = 10_000;
 const MAX_COUNTER_BYTES = 1024 * 1024;
-const MAX_ROUTES = 64;
 const MAX_LOCK_WAIT_MS = 2000;
 const LOCK_RETRY_MS = 10;
 const STALE_LOCK_MS = 5000;
@@ -100,35 +84,6 @@ const cfgDir = path.join(agentDir, 'cfg', 'baseline');
 const configPath = path.join(cfgDir, 'config.json');
 const counterPath = path.join(agentDir, '.baseline-counters.json');
 const counterLockPath = counterPath + '.lock';
-
-// Resolve a route's `doc` against the config dir and require it to stay inside
-// cfg/baseline. Doc bytes are trusted context, so this is a trust boundary:
-// reject absolute paths and `..` escapes. Returns the absolute path or null.
-function safeDocPath(doc: string): string | null {
-  if (typeof doc !== 'string' || !doc) return null;
-  if (path.isAbsolute(doc)) return null;
-  const resolved = path.resolve(cfgDir, doc);
-  const rel = path.relative(cfgDir, resolved);
-  if (rel === '' || rel.startsWith('..') || path.isAbsolute(rel)) return null;
-  return resolved;
-}
-
-function pathInside(base: string, candidate: string): boolean {
-  const rel = path.relative(base, candidate);
-  return rel === '' || (!!rel && !rel.startsWith('..') && !path.isAbsolute(rel));
-}
-
-function safeRealDocPath(doc: string): string | null {
-  const p = safeDocPath(doc);
-  if (!p) return null;
-  try {
-    const realBase = fs.realpathSync(cfgDir);
-    const realDoc = fs.realpathSync(p);
-    return pathInside(realBase, realDoc) ? p : null;
-  } catch (e) {
-    return null;
-  }
-}
 
 // Load and validate config.json into the routes the dispatcher will act on.
 // Fail-open: any fatal problem (missing/oversize/malformed config, bad version,
@@ -164,7 +119,7 @@ function loadValidRoutes(): Route[] {
     const ev = parseEvent(r.event);
     if (SUPPORTED_EVENTS.indexOf(ev.base) === -1) continue;
     if (ev.phase !== undefined && (ev.base !== 'SessionStart' || SESSION_PHASES.indexOf(ev.phase) === -1)) continue;
-    if (!safeDocPath(r.doc)) continue;
+    if (!safeDocPath(r.doc, cfgDir)) continue;
     let freq = 1;
     if (r.freq !== undefined) {
       if (typeof r.freq !== 'number' || !Number.isInteger(r.freq) || r.freq < 1) continue;
@@ -205,7 +160,7 @@ function cwdMatches(route: Route, data: HookInput): boolean {
 // Read a route's doc, bounded. Returns the verbatim body, or null to skip (missing,
 // unreadable, over-cap, or — defensively — out of range).
 function readDoc(doc: string): string | null {
-  const p = safeRealDocPath(doc);
+  const p = safeRealDocPath(doc, cfgDir);
   if (!p) return null;
   try {
     const st = fs.statSync(p);

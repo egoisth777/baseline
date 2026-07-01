@@ -26,30 +26,11 @@ Object.defineProperty(exports, "__esModule", { value: true });
 const fs = require("fs");
 const path = require("path");
 const os = require("os");
-// Events this dispatcher can inject standing context into.
-const SUPPORTED_EVENTS = ['UserPromptSubmit', 'SessionStart', 'PreToolUse', 'PostToolUse'];
-// SessionStart lifecycle phases. An event may name one via a "SessionStart.<phase>"
-// suffix; the phase then resolves against the hook stdin `source`.
-const SESSION_PHASES = ['startup', 'resume', 'clear', 'compact'];
-// Route id shape — keys the counter and labels the route in status/doctor.
-const SLUG = /^[a-z0-9][a-z0-9-]*$/;
-// Split a route event into its base event and optional phase suffix, on the FIRST
-// '.'. "SessionStart.compact" -> { base:'SessionStart', phase:'compact' }; a bare
-// "UserPromptSubmit" -> { base:'UserPromptSubmit' }.
-function parseEvent(event) {
-    const dot = event.indexOf('.');
-    if (dot === -1)
-        return { base: event };
-    return { base: event.slice(0, dot), phase: event.slice(dot + 1) };
-}
+const contracts_1 = require("./contracts");
 // Drop counter entries untouched for longer than this (stale sessions).
 const PRUNE_MS = 7 * 24 * 60 * 60 * 1000;
 const MAX_STDIN_BYTES = 1024 * 1024;
-const MAX_CONFIG_BYTES = 64 * 1024;
-const MAX_DOC_BYTES = 64 * 1024;
-const MAX_DOC_CHARS = 10_000;
 const MAX_COUNTER_BYTES = 1024 * 1024;
-const MAX_ROUTES = 64;
 const MAX_LOCK_WAIT_MS = 2000;
 const LOCK_RETRY_MS = 10;
 const STALE_LOCK_MS = 5000;
@@ -75,37 +56,6 @@ const cfgDir = path.join(agentDir, 'cfg', 'baseline');
 const configPath = path.join(cfgDir, 'config.json');
 const counterPath = path.join(agentDir, '.baseline-counters.json');
 const counterLockPath = counterPath + '.lock';
-// Resolve a route's `doc` against the config dir and require it to stay inside
-// cfg/baseline. Doc bytes are trusted context, so this is a trust boundary:
-// reject absolute paths and `..` escapes. Returns the absolute path or null.
-function safeDocPath(doc) {
-    if (typeof doc !== 'string' || !doc)
-        return null;
-    if (path.isAbsolute(doc))
-        return null;
-    const resolved = path.resolve(cfgDir, doc);
-    const rel = path.relative(cfgDir, resolved);
-    if (rel === '' || rel.startsWith('..') || path.isAbsolute(rel))
-        return null;
-    return resolved;
-}
-function pathInside(base, candidate) {
-    const rel = path.relative(base, candidate);
-    return rel === '' || (!!rel && !rel.startsWith('..') && !path.isAbsolute(rel));
-}
-function safeRealDocPath(doc) {
-    const p = safeDocPath(doc);
-    if (!p)
-        return null;
-    try {
-        const realBase = fs.realpathSync(cfgDir);
-        const realDoc = fs.realpathSync(p);
-        return pathInside(realBase, realDoc) ? p : null;
-    }
-    catch (e) {
-        return null;
-    }
-}
 // Load and validate config.json into the routes the dispatcher will act on.
 // Fail-open: any fatal problem (missing/oversize/malformed config, bad version,
 // over-cap route count) returns [] so the hook injects nothing. Individual bad
@@ -114,10 +64,10 @@ function loadValidRoutes() {
     let raw;
     try {
         const st = fs.statSync(configPath);
-        if (st.size > MAX_CONFIG_BYTES)
+        if (st.size > contracts_1.MAX_CONFIG_BYTES)
             return [];
         raw = fs.readFileSync(configPath, 'utf8');
-        if (Buffer.byteLength(raw, 'utf8') > MAX_CONFIG_BYTES)
+        if (Buffer.byteLength(raw, 'utf8') > contracts_1.MAX_CONFIG_BYTES)
             return [];
     }
     catch (e) {
@@ -136,25 +86,25 @@ function loadValidRoutes() {
     if (cfg.version !== undefined && cfg.version !== 1)
         return [];
     const routes = Array.isArray(cfg.routes) ? cfg.routes : [];
-    if (routes.length > MAX_ROUTES)
+    if (routes.length > contracts_1.MAX_ROUTES)
         return [];
     const seen = {};
     const out = [];
     for (const r of routes) {
         if (!r || typeof r !== 'object')
             continue;
-        if (typeof r.id !== 'string' || !SLUG.test(r.id))
+        if (typeof r.id !== 'string' || !contracts_1.SLUG.test(r.id))
             continue;
         if (seen[r.id])
             continue; // duplicate id — first wins, never double-count
         if (typeof r.event !== 'string')
             continue;
-        const ev = parseEvent(r.event);
-        if (SUPPORTED_EVENTS.indexOf(ev.base) === -1)
+        const ev = (0, contracts_1.parseEvent)(r.event);
+        if (contracts_1.SUPPORTED_EVENTS.indexOf(ev.base) === -1)
             continue;
-        if (ev.phase !== undefined && (ev.base !== 'SessionStart' || SESSION_PHASES.indexOf(ev.phase) === -1))
+        if (ev.phase !== undefined && (ev.base !== 'SessionStart' || contracts_1.SESSION_PHASES.indexOf(ev.phase) === -1))
             continue;
-        if (!safeDocPath(r.doc))
+        if (!(0, contracts_1.safeDocPath)(r.doc, cfgDir))
             continue;
         let freq = 1;
         if (r.freq !== undefined) {
@@ -174,7 +124,7 @@ function loadValidRoutes() {
 // phase suffix (when present) must equal the stdin `source` lifecycle phase. A bare
 // event (no phase) matches every phase of its base event.
 function eventMatches(route, data) {
-    const { base, phase } = parseEvent(route.event);
+    const { base, phase } = (0, contracts_1.parseEvent)(route.event);
     if (base !== data.hook_event_name)
         return false;
     return phase === undefined || data.source === phase;
@@ -202,17 +152,17 @@ function cwdMatches(route, data) {
 // Read a route's doc, bounded. Returns the verbatim body, or null to skip (missing,
 // unreadable, over-cap, or — defensively — out of range).
 function readDoc(doc) {
-    const p = safeRealDocPath(doc);
+    const p = (0, contracts_1.safeRealDocPath)(doc, cfgDir);
     if (!p)
         return null;
     try {
         const st = fs.statSync(p);
-        if (st.size > MAX_DOC_BYTES)
+        if (st.size > contracts_1.MAX_DOC_BYTES)
             return null;
         const body = fs.readFileSync(p, 'utf8');
-        if (Buffer.byteLength(body, 'utf8') > MAX_DOC_BYTES)
+        if (Buffer.byteLength(body, 'utf8') > contracts_1.MAX_DOC_BYTES)
             return null;
-        if (body.length > MAX_DOC_CHARS)
+        if (body.length > contracts_1.MAX_DOC_CHARS)
             return null;
         return body;
     }
@@ -307,7 +257,7 @@ process.stdin.on('end', () => {
         if (!sessionId)
             return; // No stable key → nothing to count.
         const event = data.hook_event_name;
-        if (typeof event !== 'string' || SUPPORTED_EVENTS.indexOf(event) === -1)
+        if (typeof event !== 'string' || contracts_1.SUPPORTED_EVENTS.indexOf(event) === -1)
             return;
         // Select the routes this invocation activates (event name + cwd).
         const selected = loadValidRoutes().filter(r => eventMatches(r, data) && cwdMatches(r, data));
@@ -352,7 +302,7 @@ process.stdin.on('end', () => {
             if (body === null)
                 continue;
             const joined = bodies.length ? bodies.join('\n\n') + '\n\n' + body : body;
-            if (joined.length <= MAX_DOC_CHARS)
+            if (joined.length <= contracts_1.MAX_DOC_CHARS)
                 bodies.push(body);
         }
         if (!bodies.length)

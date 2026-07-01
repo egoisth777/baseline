@@ -10,6 +10,7 @@ const child_process_1 = require("child_process");
 const root = path.resolve(__dirname, '..');
 const manage = path.join(root, 'scripts', 'manage.js');
 const dispatcher = path.join(root, 'scripts', 'baseline-recital.js');
+const contracts = path.join(root, 'scripts', 'contracts.js');
 function tempConfig() {
     const cfg = fs.mkdtempSync(path.join(os.tmpdir(), 'baseline-test-'));
     // Detection is by config-dir existence (CLAUDE_CONFIG_DIR / CODEX_HOME). mkdtemp
@@ -47,6 +48,32 @@ function run(args, cfg, home, extraEnv) {
         encoding: 'utf8'
     });
 }
+function runInstalled(args, cfg, home, extraEnv) {
+    const baseHome = home || homeFor(cfg);
+    return (0, child_process_1.spawnSync)(process.execPath, [installedManager(baseHome)].concat(args), {
+        cwd: root,
+        env: Object.assign({}, process.env, {
+            CLAUDE_CONFIG_DIR: cfg,
+            CODEX_HOME: codexFor(cfg),
+            BASELINE_HOME: baseHome,
+            BASELINE_CFG: path.join(baseHome, 'cfg')
+        }, extraEnv || {}),
+        encoding: 'utf8'
+    });
+}
+function runInstalledWithoutBaselineEnv(args, cfg, home, extraEnv) {
+    const env = Object.assign({}, process.env, {
+        CLAUDE_CONFIG_DIR: cfg,
+        CODEX_HOME: codexFor(cfg)
+    }, extraEnv || {});
+    delete env.BASELINE_HOME;
+    delete env.BASELINE_CFG;
+    return (0, child_process_1.spawnSync)(process.execPath, [installedManager(home)].concat(args), {
+        cwd: root,
+        env,
+        encoding: 'utf8'
+    });
+}
 // Drive the deployed dispatcher directly with one synthetic hook payload. It reads
 // CLAUDE_CONFIG_DIR for the linked cfg/baseline and the counter file.
 function hook(input, cfg) {
@@ -71,14 +98,93 @@ function setCentralConfig(home, routes, docs) {
 function readThrough(p) {
     return fs.readFileSync(p, 'utf8');
 }
+const CODEX_ACTIVATION_TABLE = '[plugins."baseline@baseline"]';
+const CODEX_QUOTED_PROJECT_TABLE = '[projects."C:/work#prod"] # trusted project';
+const CODEX_QUOTED_PROJECT_TRUST = CODEX_QUOTED_PROJECT_TABLE + '\ntrust_level = "trusted"';
+function installedManager(home) {
+    return path.join(home, 'scripts', 'manage.js');
+}
+function installedDispatcherSource(home) {
+    return path.join(home, 'scripts', 'baseline-recital.js');
+}
+function installedContractsSource(home) {
+    return path.join(home, 'scripts', 'contracts.js');
+}
+function centralHookContracts(home) {
+    return path.join(home, 'hooks', 'contracts.js');
+}
+function agentHookDispatcher(agentConfig) {
+    return path.join(agentConfig, 'hooks', 'baseline-recital.js');
+}
+function agentHookContracts(agentConfig) {
+    return path.join(agentConfig, 'hooks', 'contracts.js');
+}
+function runAgentHook(agentConfig, home, input) {
+    return (0, child_process_1.spawnSync)(process.execPath, [agentHookDispatcher(agentConfig), '--agent-config', agentConfig], {
+        input: JSON.stringify(input),
+        env: Object.assign({}, process.env, { BASELINE_HOME: home }),
+        encoding: 'utf8'
+    });
+}
+function statusAgentSection(output, agentName) {
+    const text = output.replace(/\r\n/g, '\n');
+    const marker = '  agent ' + agentName + ' @ ';
+    const start = text.indexOf(marker);
+    assert.notStrictEqual(start, -1, 'status missing ' + agentName + ' section');
+    const next = text.indexOf('\n  agent ', start + marker.length);
+    return text.slice(start, next === -1 ? undefined : next);
+}
+function centralCodexPlugin(home) {
+    return path.join(home, 'codex-plugin', 'baseline');
+}
+function codexPluginCache(codex) {
+    return path.join(codex, 'plugins', 'cache', 'baseline', 'baseline', 'local');
+}
+function assertCodexPayload(pluginDir, label) {
+    const manifest = path.join(pluginDir, '.codex-plugin', 'plugin.json');
+    const skill = path.join(pluginDir, 'skills', 'baseline', 'SKILL.md');
+    assert.strictEqual(JSON.parse(readThrough(manifest)).name, 'baseline', label + ' manifest should name baseline');
+    assert.ok(fs.existsSync(skill), label + ' skill wrapper missing');
+}
+function assertControlSurfaceCommandsUseInstalledManager(skillBody, home, label) {
+    const manager = installedManager(home);
+    for (const cmd of ['status', 'install', 'update', 'verify', 'doctor', 'doctor --fix', 'uninstall']) {
+        assert.ok(skillBody.includes('node "' + manager + '" ' + cmd), label + ' should invoke installed manager for `' + cmd + '`');
+    }
+    assert.ok(!skillBody.includes('node "' + path.join(root, 'scripts', 'manage.js') + '" status'), label + ' must not use source-checkout manager commands for normal status');
+}
+function assertEmptyCodexActivationTable(tomlPath) {
+    const lines = readThrough(tomlPath).replace(/\r\n/g, '\n').split('\n');
+    const start = lines.findIndex(line => line.trim() === CODEX_ACTIVATION_TABLE);
+    assert.notStrictEqual(start, -1, 'Codex activation table missing from config.toml');
+    for (let i = start + 1; i < lines.length; i++) {
+        const trimmed = lines[i].trim();
+        if (!trimmed)
+            continue;
+        assert.ok(trimmed.startsWith('['), 'Codex activation table should be empty, found: ' + lines[i]);
+        return;
+    }
+}
+function assertNoClaudePayloadInCodex(codex) {
+    assert.ok(!fs.existsSync(path.join(codexPluginCache(codex), '.claude-plugin', 'plugin.json')), 'Codex cache must not contain a Claude .claude-plugin manifest');
+    assert.ok(!fs.existsSync(path.join(codex, 'skills', 'baseline', '.claude-plugin', 'plugin.json')), 'Codex must not receive the Claude skills-dir payload');
+}
 // --- install / link / settings ---------------------------------------------
 function testDefaultInstallAndVerify() {
     const cfg = tempConfig();
+    const home = homeFor(cfg);
     const install = run(['install'], cfg);
     assert.strictEqual(install.status, 0, install.stderr || install.stdout);
     assert.match(install.stdout, /runtime\s+: node js/);
     // No --preset → DEFAULT_PRESET is now 'default'.
     assert.match(install.stdout, /config folder : .*\(seeded, preset: default\)/);
+    assert.ok(install.stdout.includes('manager       : ' + installedManager(home)), 'plain install should report the self-contained installed manager path');
+    assert.strictEqual(readThrough(installedManager(home)), readThrough(manage), 'plain install did not deploy the manager artifact under the install root');
+    assert.strictEqual(readThrough(installedDispatcherSource(home)), readThrough(dispatcher), 'plain install did not deploy the dispatcher source artifact under install-root scripts');
+    assert.strictEqual(readThrough(installedContractsSource(home)), readThrough(contracts), 'plain install did not deploy the contracts artifact under install-root scripts');
+    const installedStatus = runInstalled(['status'], cfg, home);
+    assert.strictEqual(installedStatus.status, 0, installedStatus.stderr || installedStatus.stdout);
+    assert.match(installedStatus.stdout, /manager\s+: present at /, 'installed manager should run independently from the install root');
     const settings = JSON.parse(fs.readFileSync(path.join(cfg, 'settings.json'), 'utf8'));
     const command = settings.hooks.UserPromptSubmit[0].hooks[0].command;
     assert.ok(command.includes('baseline-recital.js'), command);
@@ -89,6 +195,58 @@ function testDefaultInstallAndVerify() {
     const verify = run(['verify'], cfg);
     assert.strictEqual(verify.status, 0, verify.stderr || verify.stdout);
     assert.match(verify.stdout, /verify: PASS/);
+}
+function testInstalledManagerInfersInstallRootWithoutBaselineHome() {
+    const cfg = tempConfig();
+    const home = homeFor(cfg);
+    const install = run(['install'], cfg);
+    assert.strictEqual(install.status, 0, install.stderr || install.stdout);
+    const fallbackHome = cfg + '-fallback-home';
+    fs.mkdirSync(fallbackHome, { recursive: true });
+    const noBaselineEnv = { HOME: fallbackHome, USERPROFILE: fallbackHome };
+    fs.rmSync(path.join(home, 'hooks'), { recursive: true, force: true });
+    const status = runInstalledWithoutBaselineEnv(['status'], cfg, home, noBaselineEnv);
+    assert.strictEqual(status.status, 0, status.stderr || status.stdout);
+    assert.ok(status.stdout.includes('install root   : ' + home), 'installed manager should infer its own non-default install root when BASELINE_HOME is absent, even when the central hook is missing:\n' + status.stdout);
+    assert.ok(status.stdout.includes('manager        : present at ' + installedManager(home)), 'installed manager status should look under the inferred install root:\n' + status.stdout);
+    const update = runInstalledWithoutBaselineEnv(['update'], cfg, home, noBaselineEnv);
+    assert.strictEqual(update.status, 0, update.stderr || update.stdout);
+    assert.ok(fs.existsSync(path.join(home, 'hooks', 'baseline-recital.js')), 'installed manager update should repair the missing central hook under the inferred install root');
+    fs.rmSync(path.join(home, 'hooks'), { recursive: true, force: true });
+    const fixed = runInstalledWithoutBaselineEnv(['doctor', '--fix'], cfg, home, noBaselineEnv);
+    assert.strictEqual(fixed.status, 0, fixed.stderr || fixed.stdout);
+    assert.match(fixed.stdout, /doctor: installation repaired/);
+    assert.ok(fs.existsSync(path.join(home, 'hooks', 'baseline-recital.js')), 'installed manager doctor --fix should repair the missing central hook under the inferred install root');
+}
+function testBaselineHomeOverridesInstalledManagerLocation() {
+    const cfg = tempConfig();
+    const home = homeFor(cfg);
+    const overrideHome = cfg + '-override-home';
+    const install = run(['install'], cfg);
+    assert.strictEqual(install.status, 0, install.stderr || install.stdout);
+    const status = runInstalled(['status'], cfg, home, {
+        BASELINE_HOME: overrideHome,
+        BASELINE_CFG: path.join(overrideHome, 'cfg')
+    });
+    assert.strictEqual(status.status, 0, status.stderr || status.stdout);
+    assert.ok(status.stdout.includes('install root   : ' + overrideHome), 'BASELINE_HOME should override the installed manager location:\n' + status.stdout);
+}
+function testSourceLikeInstalledManagerDoesNotInferInstallRoot() {
+    const cfg = tempConfig();
+    const home = homeFor(cfg);
+    const install = run(['install'], cfg);
+    assert.strictEqual(install.status, 0, install.stderr || install.stdout);
+    write(path.join(home, 'src', 'manage.ts'), '// source checkout marker\n');
+    const fakeUserHome = cfg + '-user-home';
+    fs.mkdirSync(fakeUserHome, { recursive: true });
+    const status = runInstalledWithoutBaselineEnv(['status'], cfg, home, {
+        HOME: fakeUserHome,
+        USERPROFILE: fakeUserHome
+    });
+    assert.strictEqual(status.status, 0, status.stderr || status.stdout);
+    const fallbackRoot = path.join(fakeUserHome, '.baseline');
+    assert.ok(status.stdout.includes('install root   : ' + fallbackRoot), 'source-like manager should fall back to the user install root when src/manage.ts is present:\n' + status.stdout);
+    assert.ok(!status.stdout.includes('install root   : ' + home), 'source-like manager must not infer the source-like root as installed:\n' + status.stdout);
 }
 // The minimal preset is bare baseline only: one UserPromptSubmit route, nothing else.
 function testMinimalPresetWiresOnlyUserPromptSubmit() {
@@ -146,12 +304,16 @@ function testCentralInstallAndAgentLinks() {
     const install = run(['install'], cfg);
     assert.strictEqual(install.status, 0, install.stderr || install.stdout);
     assert.ok(fs.existsSync(path.join(home, 'hooks', 'baseline-recital.js')), 'central dispatcher missing');
+    assert.ok(fs.existsSync(centralHookContracts(home)), 'central contracts missing');
     assert.ok(fs.existsSync(path.join(home, 'cfg', 'config.json')), 'central config.json missing');
     assert.ok(fs.existsSync(path.join(home, 'cfg', 'docs', 'baseline.md')), 'central doc missing');
-    const agentJs = path.join(cfg, 'hooks', 'baseline-recital.js');
+    const agentJs = agentHookDispatcher(cfg);
+    const agentContracts = agentHookContracts(cfg);
     const agentConfig = path.join(cfg, 'cfg', 'baseline', 'config.json');
     assert.ok(fs.existsSync(agentJs), 'agent dispatcher not linked');
+    assert.ok(fs.existsSync(agentContracts), 'agent contracts not linked');
     assert.strictEqual(readThrough(agentJs), readThrough(path.join(home, 'hooks', 'baseline-recital.js')), 'agent dispatcher does not resolve to central content');
+    assert.strictEqual(readThrough(agentContracts), readThrough(centralHookContracts(home)), 'agent contracts do not resolve to central content');
     assert.strictEqual(readThrough(agentConfig), readThrough(path.join(home, 'cfg', 'config.json')), 'agent config.json does not resolve to central content');
     const status = run(['status'], cfg);
     assert.strictEqual(status.status, 0, status.stderr || status.stdout);
@@ -160,6 +322,7 @@ function testCentralInstallAndAgentLinks() {
 }
 function testCodexInstallAndAgentLinks() {
     const cfg = tempConfig();
+    const home = homeFor(cfg);
     const codex = codexFor(cfg);
     const install = run(['install'], cfg);
     assert.strictEqual(install.status, 0, install.stderr || install.stdout);
@@ -168,8 +331,38 @@ function testCodexInstallAndAgentLinks() {
     assert.ok(command.includes('baseline-recital.js'), command);
     assert.ok(command.includes('--agent-config'), command);
     assert.ok(command.includes(codex), command);
+    const agentContracts = agentHookContracts(codex);
+    assert.ok(fs.existsSync(agentContracts), 'codex contracts not linked');
+    assert.strictEqual(readThrough(agentContracts), readThrough(centralHookContracts(home)), 'codex contracts do not resolve to central content');
     const agentConfig = path.join(codex, 'cfg', 'baseline', 'config.json');
     assert.strictEqual(readThrough(agentConfig), readThrough(path.join(homeFor(cfg), 'cfg', 'config.json')), 'codex config.json does not resolve to central content');
+}
+function testInstalledHooksResolveBundledContracts() {
+    const cfg = tempConfig();
+    const home = homeFor(cfg);
+    const codex = codexFor(cfg);
+    setCentralConfig(home, [
+        { id: 'hook-contracts', event: 'UserPromptSubmit', freq: 1, doc: 'docs/hook-contracts.md' }
+    ], { 'docs/hook-contracts.md': 'CONTRACT HOOK OK\n' });
+    const install = run(['install'], cfg);
+    assert.strictEqual(install.status, 0, install.stderr || install.stdout);
+    for (const [label, agentConfig] of [['claude-code', cfg], ['codex', codex]]) {
+        assert.ok(fs.existsSync(agentHookDispatcher(agentConfig)), label + ' dispatcher missing');
+        assert.ok(fs.existsSync(agentHookContracts(agentConfig)), label + ' contracts missing');
+        assert.strictEqual(readThrough(agentHookContracts(agentConfig)), readThrough(centralHookContracts(home)), label + ' contracts should resolve to central content');
+    }
+    const claude = runAgentHook(cfg, home, { session_id: 'contracts-claude', hook_event_name: 'UserPromptSubmit', cwd: cfg });
+    assert.strictEqual(claude.status, 0, claude.stderr || claude.stdout);
+    assert.ok((fireBodies(claude) || '').includes('CONTRACT HOOK OK'), 'Claude installed hook should resolve ./contracts and fire');
+    // Simulate the cross-device/perms fallback path: both hook files are regular copies
+    // in the Codex hooks dir, so require("./contracts") must resolve beside that copy.
+    fs.rmSync(agentHookDispatcher(codex), { force: true });
+    fs.rmSync(agentHookContracts(codex), { force: true });
+    fs.copyFileSync(path.join(home, 'hooks', 'baseline-recital.js'), agentHookDispatcher(codex));
+    fs.copyFileSync(centralHookContracts(home), agentHookContracts(codex));
+    const codexRun = runAgentHook(codex, home, { session_id: 'contracts-codex', hook_event_name: 'UserPromptSubmit', cwd: cfg });
+    assert.strictEqual(codexRun.status, 0, codexRun.stderr || codexRun.stdout);
+    assert.ok((fireBodies(codexRun) || '').includes('CONTRACT HOOK OK'), 'Codex copied hook should resolve ./contracts from the copy target and fire');
 }
 function testCentralEditPropagatesToAgent() {
     const cfg = tempConfig();
@@ -472,6 +665,30 @@ function testDoctorReportsAndFixes() {
     assert.strictEqual(fixed.status, 0, fixed.stderr || fixed.stdout);
     assert.match(fixed.stdout, /doctor: installation repaired/);
 }
+function testStatusAndDoctorRepairPerAgentContracts() {
+    const cfg = tempConfig();
+    const home = homeFor(cfg);
+    const codex = codexFor(cfg);
+    assert.strictEqual(run(['install'], cfg).status, 0);
+    const healthy = run(['status'], cfg);
+    assert.strictEqual(healthy.status, 0, healthy.stderr || healthy.stdout);
+    assert.match(statusAgentSection(healthy.stdout, 'claude-code'), /contracts\s+: OK/, 'status should report healthy Claude contracts');
+    assert.match(statusAgentSection(healthy.stdout, 'codex'), /contracts\s+: OK/, 'status should report healthy Codex contracts');
+    fs.unlinkSync(agentHookContracts(cfg));
+    fs.unlinkSync(agentHookContracts(codex));
+    const degraded = run(['status'], cfg);
+    assert.strictEqual(degraded.status, 0, degraded.stderr || degraded.stdout);
+    assert.match(statusAgentSection(degraded.stdout, 'claude-code'), /contracts\s+: MISSING/, 'status should report missing Claude contracts');
+    assert.match(statusAgentSection(degraded.stdout, 'codex'), /contracts\s+: MISSING/, 'status should report missing Codex contracts');
+    const broken = run(['doctor'], cfg);
+    assert.strictEqual(broken.status, 1, broken.stdout);
+    assert.match(broken.stdout, /\[FAIL\] contracts link: missing/, 'doctor should check per-agent contracts links');
+    const fixed = run(['doctor', '--fix'], cfg);
+    assert.strictEqual(fixed.status, 0, fixed.stderr || fixed.stdout);
+    assert.match(fixed.stdout, /doctor: installation repaired/);
+    assert.strictEqual(readThrough(agentHookContracts(cfg)), readThrough(centralHookContracts(home)), 'doctor --fix did not repair Claude contracts');
+    assert.strictEqual(readThrough(agentHookContracts(codex)), readThrough(centralHookContracts(home)), 'doctor --fix did not repair Codex contracts');
+}
 function testDoctorDetectsMissingDoc() {
     const cfg = tempConfig();
     const home = homeFor(cfg);
@@ -530,13 +747,169 @@ function testUpdateRedeploysDispatcher() {
 function testUninstallKeepsCentralConfig() {
     const cfg = tempConfig();
     const home = homeFor(cfg);
+    const codex = codexFor(cfg);
     assert.strictEqual(run(['install'], cfg).status, 0);
     const uninstall = run(['uninstall'], cfg);
     assert.strictEqual(uninstall.status, 0, uninstall.stderr || uninstall.stdout);
     const settings = JSON.parse(fs.readFileSync(path.join(cfg, 'settings.json'), 'utf8'));
     assert.ok(!settings.hooks || !settings.hooks.UserPromptSubmit || settings.hooks.UserPromptSubmit.length === 0, 'uninstall left a wired hook');
     assert.ok(!fs.existsSync(path.join(cfg, 'hooks', 'baseline-recital.js')), 'agent dispatcher link not removed');
+    assert.ok(!fs.existsSync(agentHookContracts(cfg)), 'agent contracts link not removed');
+    assert.ok(!fs.existsSync(agentHookContracts(codex)), 'codex contracts link not removed');
     assert.ok(fs.existsSync(path.join(home, 'cfg', 'config.json')), 'central config was wrongly removed');
+}
+function testUninstallPreservesDivergentPerAgentContracts() {
+    const cfg = tempConfig();
+    const home = homeFor(cfg);
+    const codex = codexFor(cfg);
+    assert.strictEqual(run(['install'], cfg).status, 0);
+    const unmanaged = 'OPERATOR-MANAGED CONTRACTS\n';
+    fs.rmSync(agentHookContracts(codex), { force: true });
+    write(agentHookContracts(codex), unmanaged);
+    const uninstall = run(['uninstall'], cfg);
+    assert.strictEqual(uninstall.status, 0, uninstall.stderr || uninstall.stdout);
+    assert.ok(!fs.existsSync(agentHookContracts(cfg)), 'uninstall should remove managed Claude contracts');
+    assert.strictEqual(readThrough(agentHookContracts(codex)), unmanaged, 'uninstall should preserve divergent/unmanaged Codex contracts');
+    assert.ok(fs.existsSync(centralHookContracts(home)), 'uninstall should keep central contracts');
+}
+function testUninstallRemovesOnlyManagedCodexPluginActivation() {
+    const cfg = tempConfig();
+    const home = homeFor(cfg);
+    const codex = codexFor(cfg);
+    const toml = path.join(codex, 'config.toml');
+    const otherCache = path.join(codex, 'plugins', 'cache', 'other-market', 'other-plugin', 'local', 'keep.txt');
+    const unrelatedToml = '[profiles.default]\n' +
+        'model = "gpt-5.1"\n' +
+        '\n' +
+        '[plugins."other@market"]\n' +
+        'enabled = true\n';
+    write(toml, unrelatedToml);
+    write(otherCache, 'KEEP\n');
+    assert.strictEqual(run(['install'], cfg).status, 0);
+    assertCodexPayload(codexPluginCache(codex), 'installed Codex cache plugin');
+    assertEmptyCodexActivationTable(toml);
+    const uninstall = run(['uninstall'], cfg);
+    assert.strictEqual(uninstall.status, 0, uninstall.stderr || uninstall.stdout);
+    assert.ok(!fs.existsSync(codexPluginCache(codex)), 'uninstall should remove only the managed Codex cache/local activation');
+    assert.strictEqual(readThrough(otherCache), 'KEEP\n', 'uninstall should preserve unrelated Codex plugin caches');
+    const after = readThrough(toml);
+    assert.ok(!after.includes(CODEX_ACTIVATION_TABLE), 'uninstall should remove only the managed Codex activation table');
+    assert.ok(after.includes('[profiles.default]\nmodel = "gpt-5.1"'), 'uninstall should preserve unrelated profile TOML');
+    assert.ok(after.includes('[plugins."other@market"]\nenabled = true'), 'uninstall should preserve unrelated plugin TOML');
+    assert.ok(fs.existsSync(path.join(home, 'cfg', 'config.json')), 'uninstall should keep central config');
+    assert.ok(fs.existsSync(path.join(home, 'skills', 'baseline')), 'uninstall should keep the central Claude skill payload');
+    assert.ok(fs.existsSync(centralCodexPlugin(home)), 'uninstall should keep the central Codex plugin payload');
+}
+function testUninstallPreservesCodexArrayTablesAfterManagedActivation() {
+    const cfg = tempConfig();
+    const codex = codexFor(cfg);
+    const toml = path.join(codex, 'config.toml');
+    assert.strictEqual(run(['install'], cfg).status, 0);
+    const beforeUninstall = '[profiles.default]\n' +
+        'model = "gpt-5.1"\n' +
+        '\n' +
+        CODEX_ACTIVATION_TABLE + '\n' +
+        '[[plugins.something]]\n' +
+        'name = "keep-plugin"\n' +
+        'enabled = true\n' +
+        '\n' +
+        '[[tool.foo]]\n' +
+        'name = "keep-tool"\n' +
+        'path = "survives"\n';
+    write(toml, beforeUninstall);
+    const uninstall = run(['uninstall'], cfg);
+    assert.strictEqual(uninstall.status, 0, uninstall.stderr || uninstall.stdout);
+    const after = readThrough(toml);
+    assert.ok(!after.includes(CODEX_ACTIVATION_TABLE), 'uninstall should remove the managed Codex activation table');
+    assert.ok(after.includes('[[plugins.something]]\nname = "keep-plugin"\nenabled = true'), 'uninstall should preserve unrelated plugin array-table entries after the managed activation table');
+    assert.ok(after.includes('[[tool.foo]]\nname = "keep-tool"\npath = "survives"'), 'uninstall should preserve unrelated tool array-table entries after the managed activation table');
+}
+function testUninstallPreservesCodexQuotedProjectTableAfterManagedActivation() {
+    const cases = [
+        {
+            name: 'ordinary double-quoted table key containing #',
+            section: CODEX_QUOTED_PROJECT_TRUST + '\n'
+        },
+        {
+            name: 'ordinary single-quoted table key containing #',
+            section: "[projects.'C:/work#prod']\ntrust_level = \"trusted\"\n"
+        },
+        {
+            name: 'array-table key containing #',
+            section: '[[projects."C:/work#prod"]]\ntrust_level = "trusted"\n'
+        }
+    ];
+    for (const c of cases) {
+        const cfg = tempConfig();
+        const codex = codexFor(cfg);
+        const toml = path.join(codex, 'config.toml');
+        assert.strictEqual(run(['install'], cfg).status, 0);
+        const beforeUninstall = CODEX_ACTIVATION_TABLE + '\n' +
+            c.section;
+        write(toml, beforeUninstall);
+        const uninstall = run(['uninstall'], cfg);
+        assert.strictEqual(uninstall.status, 0, uninstall.stderr || uninstall.stdout);
+        const after = readThrough(toml);
+        assert.ok(!after.includes(CODEX_ACTIVATION_TABLE), c.name + ': uninstall should remove the managed Codex activation table');
+        assert.ok(after.includes(c.section.trim()), c.name + ': uninstall should preserve the quoted # table immediately after the managed activation table');
+    }
+}
+function testUninstallPreservesCodexQuotedBracketTomlSectionsAfterManagedActivation() {
+    const cases = [
+        {
+            name: 'ordinary double-quoted table key containing ]',
+            section: '[projects."team]prod"]\ntrust_level = "trusted"\n'
+        },
+        {
+            name: 'ordinary single-quoted table key containing ]',
+            section: "[projects.'team]prod']\ntrust_level = \"trusted\"\n"
+        },
+        {
+            name: 'array-table key containing ]',
+            section: '[[projects."team]prod"]]\ntrust_level = "trusted"\n'
+        }
+    ];
+    for (const c of cases) {
+        const cfg = tempConfig();
+        const codex = codexFor(cfg);
+        const toml = path.join(codex, 'config.toml');
+        assert.strictEqual(run(['install'], cfg).status, 0);
+        const beforeUninstall = CODEX_ACTIVATION_TABLE + '\n' +
+            c.section;
+        write(toml, beforeUninstall);
+        const uninstall = run(['uninstall'], cfg);
+        assert.strictEqual(uninstall.status, 0, uninstall.stderr || uninstall.stdout);
+        const after = readThrough(toml);
+        assert.ok(!after.includes(CODEX_ACTIVATION_TABLE), c.name + ': uninstall should remove the managed Codex activation table');
+        assert.ok(after.includes(c.section.trim()), c.name + ': uninstall should preserve the quoted ] table immediately after the managed activation table');
+    }
+}
+function testUninstallRemovesSingleQuotedManagedCodexPluginActivation() {
+    const cfg = tempConfig();
+    const codex = codexFor(cfg);
+    const toml = path.join(codex, 'config.toml');
+    assert.strictEqual(run(['install'], cfg).status, 0);
+    const beforeUninstall = "[plugins.'baseline@baseline']\n" +
+        'enabled = true\n' +
+        '[profiles.default]\n' +
+        'model = "gpt-5.1"\n';
+    write(toml, beforeUninstall);
+    const uninstall = run(['uninstall'], cfg);
+    assert.strictEqual(uninstall.status, 0, uninstall.stderr || uninstall.stdout);
+    const after = readThrough(toml);
+    assert.strictEqual(after, '[profiles.default]\nmodel = "gpt-5.1"\n', 'uninstall should remove single-quoted managed activation and preserve the following ordinary table');
+}
+function testUninstallPreservesBaselineCodexPluginArrayTable() {
+    const cfg = tempConfig();
+    const codex = codexFor(cfg);
+    const toml = path.join(codex, 'config.toml');
+    assert.strictEqual(run(['install'], cfg).status, 0);
+    const arrayActivation = '[[plugins."baseline@baseline"]]\n' +
+        'enabled = true\n';
+    write(toml, arrayActivation);
+    const uninstall = run(['uninstall'], cfg);
+    assert.strictEqual(uninstall.status, 0, uninstall.stderr || uninstall.stdout);
+    assert.strictEqual(readThrough(toml), arrayActivation, 'uninstall should not treat a Codex plugin array-table as the managed ordinary activation table');
 }
 // --- repo invariants --------------------------------------------------------
 function assertGitVisible(file) {
@@ -608,12 +981,12 @@ function testBrandAssetsAndReadme() {
 function testDocsDescribeRoutesModel() {
     const readme = fs.readFileSync(path.join(root, 'README.md'), 'utf8');
     const skill = fs.readFileSync(path.join(root, 'SKILL.md'), 'utf8');
-    // Knowledge/reference docs (architecture.md, ubi_lang.md) live in the persistent
-    // knowledge database under .arca/<proj>-sp/, which is intentionally gitignored —
-    // git must never see the knowledge files. Assert that invariant instead of the old
-    // tracked references/ location.
-    assertGitIgnored(path.join('.arca', 'baseline-sp', 'architecture.md'));
-    assertGitIgnored(path.join('.arca', 'baseline-sp', 'ubi_lang.md'));
+    // Canonical goal docs live in the persistent knowledge database under
+    // .arca/<proj>-sp/goal/, which is intentionally gitignored — git must never
+    // see those knowledge files.
+    for (const doc of ['vision.md', 'architecture.md', 'vocabulary.md', 'plain.md']) {
+        assertGitIgnored(path.join('.arca', 'baseline-sp', 'goal', doc));
+    }
     for (const [name, text] of [['README', readme], ['SKILL', skill]]) {
         assert.match(text, /cfg\/baseline/, name + ' should describe the cfg/baseline config folder');
         assert.match(text, /config\.json/, name + ' should mention config.json');
@@ -639,38 +1012,113 @@ function testClaudePluginManifest() {
     // Top-level SKILL.md is exposed via "skills": ["./"].
     assert.ok(Array.isArray(manifest.skills) && manifest.skills.indexOf('./') !== -1, 'Claude plugin manifest should expose the top-level skill via "skills": ["./"]');
 }
-// install deploys a Claude skills-dir plugin (baseline@skills-dir): a central payload
-// linked into the Claude agent's skills dir, skill-only, Claude-only, and removed on
-// uninstall while the central payload is kept.
-function testClaudeSkillPluginDeployed() {
+// install deploys self-contained control surfaces: Claude gets the skills-dir
+// .claude-plugin payload, Codex gets a .codex-plugin cache/activation, and both
+// generated skill payloads point normal commands at the installed manager.
+function testControlSurfacePluginsDeployed() {
     const cfg = tempConfig();
     const home = homeFor(cfg);
     const codex = codexFor(cfg);
     assert.strictEqual(run(['install'], cfg).status, 0);
-    // Central payload (manifest + generated SKILL.md wrapper) exists.
-    assert.ok(fs.existsSync(path.join(home, 'skills', 'baseline', '.claude-plugin', 'plugin.json')), 'central skill manifest missing');
-    assert.ok(fs.existsSync(path.join(home, 'skills', 'baseline', 'SKILL.md')), 'central skill SKILL.md missing');
+    // Central Claude payload (manifest + generated SKILL.md wrapper) exists.
+    assert.ok(fs.existsSync(path.join(home, 'skills', 'baseline', '.claude-plugin', 'plugin.json')), 'central Claude skill manifest missing');
+    assert.ok(fs.existsSync(path.join(home, 'skills', 'baseline', 'SKILL.md')), 'central Claude skill SKILL.md missing');
     // Linked into the Claude agent skills dir so Claude loads it as baseline@skills-dir.
     const agentManifest = path.join(cfg, 'skills', 'baseline', '.claude-plugin', 'plugin.json');
     const agentSkill = path.join(cfg, 'skills', 'baseline', 'SKILL.md');
     assert.ok(fs.existsSync(agentManifest), 'Claude skill plugin not linked into the agent skills dir');
     assert.strictEqual(JSON.parse(readThrough(agentManifest)).name, 'baseline');
     const skillBody = readThrough(agentSkill);
-    assert.match(skillBody, /name:\s*baseline/, 'deployed skill missing name frontmatter');
-    assert.ok(skillBody.includes(root), 'deployed skill should record the repo root so the manager can be found');
-    // Codex uses .codex-plugin, not a skills dir — it must NOT get one.
-    assert.ok(!fs.existsSync(path.join(codex, 'skills', 'baseline')), 'Codex should not get a skills-dir plugin');
-    // status + doctor report the skill link healthy.
+    assert.match(skillBody, /name:\s*baseline/, 'deployed Claude skill missing name frontmatter');
+    assertControlSurfaceCommandsUseInstalledManager(skillBody, home, 'deployed Claude skill');
+    // Codex parity is a marketplace/cache payload, not the Claude skills-dir payload.
+    assertCodexPayload(centralCodexPlugin(home), 'central Codex plugin');
+    assertCodexPayload(codexPluginCache(codex), 'Codex cache plugin');
+    assertControlSurfaceCommandsUseInstalledManager(readThrough(path.join(codexPluginCache(codex), 'skills', 'baseline', 'SKILL.md')), home, 'deployed Codex skill');
+    assertNoClaudePayloadInCodex(codex);
+    // status + doctor report both central payloads and the per-agent links healthy.
     const status = run(['status'], cfg);
-    assert.match(status.stdout, /skill plugin : OK/, 'status should report the agent skill link');
+    assert.match(status.stdout, /skill plugin : OK/, 'status should report the Claude agent skill link');
+    assert.match(status.stdout, /codex plugin\s+: present at /, 'status should report the central Codex plugin payload');
+    assert.match(status.stdout, /codex cache\s+: OK/, 'status should report the Codex cache materialized');
+    assert.match(status.stdout, /codex config\s+: OK/, 'status should report the Codex plugin activation table');
     const doctor = run(['doctor'], cfg);
     assert.strictEqual(doctor.status, 0, doctor.stdout);
-    assert.match(doctor.stdout, /skill plugin: central payload deployed/);
+    assert.match(doctor.stdout, /claude skill plugin: central payload deployed; points at installed manager/);
     assert.match(doctor.stdout, /skill link: claude-code linked to center/);
-    // uninstall removes the per-agent link but keeps the central payload.
+    assert.match(doctor.stdout, /codex plugin payload: central payload deployed; points at installed manager/);
+    assert.match(doctor.stdout, /codex plugin cache: codex cache linked to center/);
+    assert.match(doctor.stdout, /codex plugin activation: codex config\.toml contains \[plugins\."baseline@baseline"\]/);
+    // uninstall removes per-agent links/cache but keeps central payloads.
     assert.strictEqual(run(['uninstall'], cfg).status, 0);
-    assert.ok(!fs.existsSync(path.join(cfg, 'skills', 'baseline')), 'uninstall should remove the agent skill link');
-    assert.ok(fs.existsSync(path.join(home, 'skills', 'baseline')), 'uninstall should keep the central skill payload');
+    assert.ok(!fs.existsSync(path.join(cfg, 'skills', 'baseline')), 'uninstall should remove the Claude agent skill link');
+    assert.ok(!fs.existsSync(codexPluginCache(codex)), 'uninstall should remove the Codex agent cache');
+    assert.ok(fs.existsSync(path.join(home, 'skills', 'baseline')), 'uninstall should keep the central Claude skill payload');
+    assert.ok(fs.existsSync(centralCodexPlugin(home)), 'uninstall should keep the central Codex plugin payload');
+}
+function testCodexPluginPayloadDeployedAndActivated() {
+    const cfg = tempConfig();
+    const home = homeFor(cfg);
+    const codex = codexFor(cfg);
+    const toml = path.join(codex, 'config.toml');
+    const unrelatedToml = '# operator config stays\n' +
+        '[profiles.default]\n' +
+        'model = "gpt-5.1"\n' +
+        '\n' +
+        CODEX_QUOTED_PROJECT_TRUST + '\n';
+    write(toml, unrelatedToml);
+    const install = run(['install'], cfg);
+    assert.strictEqual(install.status, 0, install.stderr || install.stdout);
+    assertCodexPayload(centralCodexPlugin(home), 'central Codex plugin');
+    assertCodexPayload(codexPluginCache(codex), 'Codex cache plugin');
+    assert.strictEqual(readThrough(path.join(codexPluginCache(codex), '.codex-plugin', 'plugin.json')), readThrough(path.join(centralCodexPlugin(home), '.codex-plugin', 'plugin.json')), 'Codex cache plugin manifest should resolve to the central payload');
+    assertControlSurfaceCommandsUseInstalledManager(readThrough(path.join(codexPluginCache(codex), 'skills', 'baseline', 'SKILL.md')), home, 'Codex cache skill');
+    assertNoClaudePayloadInCodex(codex);
+    const after = readThrough(toml);
+    assert.ok(after.includes('# operator config stays'), 'install should preserve unrelated TOML comments');
+    assert.ok(after.includes('[profiles.default]\nmodel = "gpt-5.1"'), 'install should preserve unrelated TOML tables');
+    assert.ok(after.includes(CODEX_QUOTED_PROJECT_TRUST), 'install should preserve quoted project trust TOML with # in table key');
+    assertEmptyCodexActivationTable(toml);
+}
+function testUpdateRepairsCodexPluginCacheAndActivation() {
+    const cfg = tempConfig();
+    const codex = codexFor(cfg);
+    const toml = path.join(codex, 'config.toml');
+    const unrelatedToml = '[profiles.default]\n' +
+        'model = "gpt-5.1"\n' +
+        '\n' +
+        CODEX_QUOTED_PROJECT_TRUST + '\n';
+    write(toml, unrelatedToml);
+    assert.strictEqual(run(['install'], cfg).status, 0);
+    fs.rmSync(codexPluginCache(codex), { recursive: true, force: true });
+    write(toml, unrelatedToml);
+    const update = run(['update'], cfg);
+    assert.strictEqual(update.status, 0, update.stderr || update.stdout);
+    assertCodexPayload(codexPluginCache(codex), 'repaired Codex cache plugin');
+    const after = readThrough(toml);
+    assert.ok(after.includes('[profiles.default]\nmodel = "gpt-5.1"'), 'update should preserve unrelated profile TOML while repairing activation');
+    assert.ok(after.includes(CODEX_QUOTED_PROJECT_TRUST), 'update should preserve quoted project trust TOML while repairing activation');
+    assertEmptyCodexActivationTable(toml);
+}
+function testDoctorFixRepairsCodexPluginCacheAndActivation() {
+    const cfg = tempConfig();
+    const codex = codexFor(cfg);
+    const toml = path.join(codex, 'config.toml');
+    const unrelatedToml = '[profiles.default]\nmodel = "gpt-5.1"\n';
+    write(toml, unrelatedToml);
+    assert.strictEqual(run(['install'], cfg).status, 0);
+    fs.rmSync(codexPluginCache(codex), { recursive: true, force: true });
+    write(toml, unrelatedToml);
+    const broken = run(['doctor'], cfg);
+    assert.strictEqual(broken.status, 1, broken.stdout);
+    assert.match(broken.stdout, /\[FAIL\] codex plugin cache/);
+    assert.match(broken.stdout, /\[FAIL\] codex plugin activation/);
+    const fixed = run(['doctor', '--fix'], cfg);
+    assert.strictEqual(fixed.status, 0, fixed.stderr || fixed.stdout);
+    assert.match(fixed.stdout, /doctor: installation repaired/);
+    assertCodexPayload(codexPluginCache(codex), 'doctor-repaired Codex cache plugin');
+    assert.ok(readThrough(toml).includes(unrelatedToml.trim()), 'doctor --fix should preserve unrelated TOML while repairing activation');
+    assertEmptyCodexActivationTable(toml);
 }
 // install with BASELINE_CFG set: config lives FLAT in the external folder, the install
 // root holds only artifacts, <installRoot>/cfg symlinks to the external folder, agents
@@ -860,12 +1308,16 @@ function testUpdateDropsVanishedRecordedAgent() {
 const TESTS = [
     ['testCentralInstallAndAgentLinks', testCentralInstallAndAgentLinks],
     ['testCodexInstallAndAgentLinks', testCodexInstallAndAgentLinks],
+    ['testInstalledHooksResolveBundledContracts', testInstalledHooksResolveBundledContracts],
     ['testCentralEditPropagatesToAgent', testCentralEditPropagatesToAgent],
     ['testIdempotentReinstall', testIdempotentReinstall],
     ['testForceReplacesConfigKeepWithout', testForceReplacesConfigKeepWithout],
     ['testUnknownPresetFails', testUnknownPresetFails],
     ['testNativeRuntimePaused', testNativeRuntimePaused],
     ['testDefaultInstallAndVerify', testDefaultInstallAndVerify],
+    ['testInstalledManagerInfersInstallRootWithoutBaselineHome', testInstalledManagerInfersInstallRootWithoutBaselineHome],
+    ['testBaselineHomeOverridesInstalledManagerLocation', testBaselineHomeOverridesInstalledManagerLocation],
+    ['testSourceLikeInstalledManagerDoesNotInferInstallRoot', testSourceLikeInstalledManagerDoesNotInferInstallRoot],
     ['testMinimalPresetWiresOnlyUserPromptSubmit', testMinimalPresetWiresOnlyUserPromptSubmit],
     ['testDefaultPresetWiresBaseEventsBothAgents', testDefaultPresetWiresBaseEventsBothAgents],
     ['testInvalidSettingsFailsClosed', testInvalidSettingsFailsClosed],
@@ -885,12 +1337,23 @@ const TESTS = [
     ['testOversizeDocSkipped', testOversizeDocSkipped],
     ['testDoctorReportsAndFixes', testDoctorReportsAndFixes],
     ['testDoctorDetectsMissingDoc', testDoctorDetectsMissingDoc],
+    ['testStatusAndDoctorRepairPerAgentContracts', testStatusAndDoctorRepairPerAgentContracts],
     ['testDoctorFixRefusesInvalidSettings', testDoctorFixRefusesInvalidSettings],
     ['testVerifyRequiresSelectedRouteEvent', testVerifyRequiresSelectedRouteEvent],
     ['testVerifyToolEventFires', testVerifyToolEventFires],
     ['testUpdateRedeploysDispatcher', testUpdateRedeploysDispatcher],
     ['testUninstallKeepsCentralConfig', testUninstallKeepsCentralConfig],
-    ['testClaudeSkillPluginDeployed', testClaudeSkillPluginDeployed],
+    ['testUninstallPreservesDivergentPerAgentContracts', testUninstallPreservesDivergentPerAgentContracts],
+    ['testControlSurfacePluginsDeployed', testControlSurfacePluginsDeployed],
+    ['testCodexPluginPayloadDeployedAndActivated', testCodexPluginPayloadDeployedAndActivated],
+    ['testUpdateRepairsCodexPluginCacheAndActivation', testUpdateRepairsCodexPluginCacheAndActivation],
+    ['testDoctorFixRepairsCodexPluginCacheAndActivation', testDoctorFixRepairsCodexPluginCacheAndActivation],
+    ['testUninstallRemovesOnlyManagedCodexPluginActivation', testUninstallRemovesOnlyManagedCodexPluginActivation],
+    ['testUninstallPreservesCodexArrayTablesAfterManagedActivation', testUninstallPreservesCodexArrayTablesAfterManagedActivation],
+    ['testUninstallPreservesCodexQuotedProjectTableAfterManagedActivation', testUninstallPreservesCodexQuotedProjectTableAfterManagedActivation],
+    ['testUninstallPreservesCodexQuotedBracketTomlSectionsAfterManagedActivation', testUninstallPreservesCodexQuotedBracketTomlSectionsAfterManagedActivation],
+    ['testUninstallRemovesSingleQuotedManagedCodexPluginActivation', testUninstallRemovesSingleQuotedManagedCodexPluginActivation],
+    ['testUninstallPreservesBaselineCodexPluginArrayTable', testUninstallPreservesBaselineCodexPluginArrayTable],
     ['testClaudePluginManifest', testClaudePluginManifest],
     ['testExternalConfigLocation', testExternalConfigLocation],
     ['testChecksumsMatchBinaries', testChecksumsMatchBinaries],
@@ -912,9 +1375,18 @@ const TESTS = [
     ['testUninstallScopesToRecordedSet', testUninstallScopesToRecordedSet],
     ['testUpdateDropsVanishedRecordedAgent', testUpdateDropsVanishedRecordedAgent],
 ];
+const filterRaw = process.env.BASELINE_TEST_FILTER;
+const testFilters = filterRaw ? filterRaw.split(',').map(s => s.trim()).filter(Boolean) : [];
+const selectedTests = testFilters.length
+    ? TESTS.filter(([name]) => testFilters.some(filter => name.indexOf(filter) !== -1))
+    : TESTS;
+if (testFilters.length && selectedTests.length === 0) {
+    console.error('No tests matched BASELINE_TEST_FILTER=' + filterRaw);
+    process.exit(1);
+}
 let passed = 0;
 let failed = 0;
-for (const [name, fn] of TESTS) {
+for (const [name, fn] of selectedTests) {
     try {
         fn();
         passed++;
