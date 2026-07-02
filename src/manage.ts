@@ -54,6 +54,10 @@ import {
   SLUG,
   SUPPORTED_EVENTS,
   VarMap,
+  applyTemplate,
+  cwdMatches,
+  eventMatches,
+  mergeVars,
   parseEvent,
   safeDocPath,
   safeRealDocPath,
@@ -141,6 +145,27 @@ const CODEX_PLUGIN = 'baseline';
 const CODEX_PLUGIN_VERSION = 'local';
 const CODEX_PLUGIN_KEY = CODEX_PLUGIN + '@' + CODEX_MARKETPLACE;
 const CODEX_PLUGIN_TABLE = '[plugins."' + CODEX_PLUGIN_KEY + '"]';
+
+// --- JSON machine surface (R-012) ------------------------------------------
+// Global --json: every covered command (status, route list/add/remove, dispatch
+// simulate) emits exactly ONE versioned JSON object on stdout and suppresses human
+// console.log; errors become { apiVersion, error } on stdout with a nonzero exit. This
+// is the whole programmatic surface — no Node library export, no daemon (decision #6).
+const JSON_API_VERSION = 1;
+const jsonMode = process.argv.slice(2).indexOf('--json') !== -1;
+
+function emitJson(command: string, data: any): void {
+  process.stdout.write(JSON.stringify({ apiVersion: JSON_API_VERSION, command, data }) + '\n');
+}
+
+// Read a single --flag value from an arg list (supports "--flag value" and "--flag=value").
+function flagValue(argv: string[], name: string): string | undefined {
+  for (let i = 0; i < argv.length; i++) {
+    if (argv[i] === name) return argv[i + 1];
+    if (argv[i].indexOf(name + '=') === 0) return argv[i].slice(name.length + 1);
+  }
+  return undefined;
+}
 
 // --- platform + path resolution -------------------------------------------
 
@@ -375,8 +400,12 @@ function promptAgentSelection(detected: AgentPaths[]): Promise<string[]> {
   });
 }
 
-function fail(message: string, code?: number): never {
-  console.error('[baseline] ' + message);
+function fail(message: string, code?: number, jsonCode?: string): never {
+  if (jsonMode) {
+    process.stdout.write(JSON.stringify({ apiVersion: JSON_API_VERSION, error: { code: jsonCode || 'error', message } }) + '\n');
+  } else {
+    console.error('[baseline] ' + message);
+  }
   process.exit(code || 1);
 }
 
@@ -1334,7 +1363,54 @@ function cmdUninstall(): void {
   console.log('  central payloads: KEPT under ' + central.root + ' (delete by hand if you want them gone)');
 }
 
+// Structured mirror of `status` for the --json surface: the same facts the human view
+// prints, shaped for machines. Link fields carry the { ok, mechanism } LinkState.
+function collectStatusData(): any {
+  const dispatcherPresent = fs.existsSync(central.hookJs) && fs.existsSync(central.hookContractsJs);
+  const inSync = dispatcherPresent &&
+    sameFileContents(central.hookJs, repo.hookSourceJs) &&
+    sameFileContents(central.hookContractsJs, repo.contractsSourceJs);
+  const cfg = loadCentralConfig();
+  const managerPresent = fs.existsSync(central.managerJs) && fs.existsSync(central.managerHookSourceJs) && fs.existsSync(central.managerContractsJs);
+  const skillPresent = fs.existsSync(central.skillManifest) && fs.existsSync(central.skillMd);
+  const codexPluginPresent = fs.existsSync(central.codexPluginManifest) && fs.existsSync(central.codexPluginSkillMd);
+
+  const agents = allAgentPaths().map(ap => {
+    const { settings, error } = settingsForRead(ap);
+    const links: any = {
+      dispatcher: linkState(ap.hookJs, central.hookJs),
+      contracts: linkState(ap.hookContractsJs, central.hookContractsJs),
+      cfg: dirLinkState(ap.cfgDir, central.cfgLink, CONFIG_MARKER),
+    };
+    if (ap.skillDir) links.skill = dirLinkState(ap.skillDir, central.skillDir, SKILL_MARKER);
+    if (ap.codexPluginDir && ap.codexConfigToml) {
+      links.codexCache = dirLinkState(ap.codexPluginDir, central.codexPluginDir, CODEX_PLUGIN_MARKER);
+      links.codexActivation = codexPluginActivationState(ap.codexConfigToml);
+    }
+    return {
+      name: ap.name,
+      configDir: ap.configDir,
+      settingsValid: !error,
+      settingsError: error ? error.message : null,
+      wiredEvents: error ? [] : wiredEvents(settings, ap),
+      links
+    };
+  });
+
+  return {
+    installRoot: central.root,
+    dispatcher: { present: dispatcherPresent, inSync },
+    configFolder: { present: cfg.present, path: central.cfgDir, external: configIsExternal },
+    manager: { present: managerPresent },
+    claudeSkill: { present: skillPresent },
+    codexPlugin: { present: codexPluginPresent },
+    config: { fatal: cfg.fatal, vars: cfg.vars, routes: cfg.routes, issues: cfg.issues, desiredEvents: cfg.desiredEvents },
+    agents
+  };
+}
+
 function cmdStatus(): void {
+  if (jsonMode) { emitJson('status', collectStatusData()); return; }
   const agentsP = allAgentPaths();
 
   const dispatcherPresent = fs.existsSync(central.hookJs) && fs.existsSync(central.hookContractsJs);
@@ -1699,6 +1775,143 @@ async function cmdDoctor(fix: boolean): Promise<void> {
   console.log('[baseline] doctor: installation repaired.');
 }
 
+// --- route + dispatch-simulate commands (R-012) -----------------------------
+
+// Read config.json as a plain object for mutation, preserving unknown keys (version,
+// vars, ...). A missing file yields a fresh { version: 1, routes: [] }. A fatal shape
+// error fails (json-aware).
+function readConfigObject(): any {
+  const r = readJson(central.config);
+  if (!r.ok) fail('config.json is not valid JSON: ' + (r.error ? r.error.message : 'parse error'), 1, 'invalid_config');
+  if (r.missing || r.value === null || r.value === undefined) return { version: 1, routes: [] };
+  const v = r.value;
+  if (typeof v !== 'object' || Array.isArray(v)) fail('config.json root must be an object', 1, 'invalid_config');
+  if (!Array.isArray(v.routes)) v.routes = [];
+  return v;
+}
+
+function writeConfigObject(obj: any): void {
+  atomicWrite(central.config, JSON.stringify(obj, null, 2) + '\n');
+}
+
+// Bounded doc read for `dispatch simulate` (mirrors the dispatcher's caps). Synchronous
+// — the CLI has no concurrency need.
+function readDocBodyForSimulate(doc: string): string | null {
+  const p = safeRealDocPath(doc, central.cfgDir);
+  if (!p) return null;
+  try {
+    const st = fs.statSync(p);
+    if (st.size > MAX_DOC_BYTES) return null;
+    const body = fs.readFileSync(p, 'utf8');
+    if (Buffer.byteLength(body, 'utf8') > MAX_DOC_BYTES) return null;
+    if (body.length > MAX_DOC_CHARS) return null;
+    return body;
+  } catch (e) {
+    return null;
+  }
+}
+
+function cmdRouteList(): void {
+  const cfg = loadCentralConfig();
+  if (jsonMode) { emitJson('route.list', { routes: cfg.routes, configVars: cfg.vars, fatal: cfg.fatal, issues: cfg.issues }); return; }
+  console.log('[baseline] routes (' + cfg.routes.length + ')');
+  for (const r of cfg.routes) {
+    const bits = ['event=' + r.event, 'freq=' + r.freq];
+    if (r.cwd !== undefined) bits.push('cwd=' + r.cwd);
+    bits.push('doc=' + r.doc);
+    console.log('  ' + r.id + ': ' + bits.join(', '));
+  }
+  if (cfg.fatal) console.log('  config INVALID: ' + cfg.fatal);
+}
+
+function cmdRouteAdd(argv: string[]): void {
+  const id = flagValue(argv, '--id');
+  const event = flagValue(argv, '--event');
+  const doc = flagValue(argv, '--doc');
+  const freqRaw = flagValue(argv, '--freq');
+  const cwd = flagValue(argv, '--cwd');
+
+  if (!id || !SLUG.test(id)) fail('route add: --id must be a slug matching ' + SLUG.source, 2, 'invalid_args');
+  if (!event) fail('route add: --event is required', 2, 'invalid_args');
+  const ev = parseEvent(event);
+  if (SUPPORTED_EVENTS.indexOf(ev.base) === -1 ||
+      (ev.phase !== undefined && (ev.base !== 'SessionStart' || SESSION_PHASES.indexOf(ev.phase) === -1))) {
+    fail('route add: unsupported event "' + event + '"', 2, 'invalid_args');
+  }
+  if (!doc || !safeDocPath(doc, central.cfgDir)) fail('route add: --doc must be a config-relative path inside the config folder', 2, 'invalid_args');
+  let freq = 1;
+  if (freqRaw !== undefined) {
+    const n = Number(freqRaw);
+    if (!Number.isInteger(n) || n < 1) fail('route add: --freq must be a positive integer', 2, 'invalid_args');
+    freq = n;
+  }
+
+  const cfg = readConfigObject();
+  if (cfg.routes.some((r: any) => r && r.id === id)) fail('route add: a route with id "' + id + '" already exists', 2, 'duplicate');
+  const route: Route = { id, event, freq, doc };
+  if (cwd) route.cwd = cwd;
+  cfg.routes.push(route);
+  writeConfigObject(cfg);
+
+  if (jsonMode) { emitJson('route.add', { added: route, routes: cfg.routes }); return; }
+  console.log('[baseline] route added: ' + id + ' (' + event + ', freq ' + freq + ', doc ' + doc + ')');
+  console.log('  rerun install/update if this introduces a new event so hook wiring re-syncs.');
+}
+
+function cmdRouteRemove(argv: string[]): void {
+  const id = flagValue(argv, '--id');
+  if (!id) fail('route remove: --id is required', 2, 'invalid_args');
+  const cfg = readConfigObject();
+  const before = cfg.routes.length;
+  cfg.routes = cfg.routes.filter((r: any) => !(r && r.id === id));
+  if (cfg.routes.length === before) fail('route remove: no route with id "' + id + '"', 2, 'not_found');
+  writeConfigObject(cfg);
+  if (jsonMode) { emitJson('route.remove', { removed: id, routes: cfg.routes }); return; }
+  console.log('[baseline] route removed: ' + id);
+  console.log('  rerun install/update if this drops an event so hook wiring re-syncs.');
+}
+
+// Dry-run: which routes a (event, cwd, source) invocation SELECTS, and the templated
+// additionalContext that WOULD be injected if they were due. Side-effect-free — it never
+// touches counters (freq gating is stateful, so simulate reports selection assuming due).
+function cmdDispatchSimulate(argv: string[]): void {
+  const event = flagValue(argv, '--event');
+  const cwd = flagValue(argv, '--cwd') || process.cwd();
+  const source = flagValue(argv, '--source');
+  if (!event) fail('dispatch simulate: --event is required', 2, 'invalid_args');
+  const ev = parseEvent(event);
+  if (SUPPORTED_EVENTS.indexOf(ev.base) === -1) fail('dispatch simulate: unsupported event "' + event + '"', 2, 'invalid_args');
+
+  const cfg = loadCentralConfig();
+  const selected = cfg.routes.filter(r => eventMatches(r.event, ev.base, source) && cwdMatches(r.cwd, cwd, isWin));
+
+  const now = new Date();
+  const bodies: string[] = [];
+  for (const r of selected) {
+    const raw = readDocBodyForSimulate(r.doc);
+    if (raw === null) continue;
+    const body = applyTemplate(raw, { event: ev.base, cwd, home: homeDir, now, env: process.env, vars: mergeVars(cfg.vars, r.vars) });
+    const joined = bodies.length ? bodies.join('\n\n') + '\n\n' + body : body;
+    if (joined.length <= MAX_DOC_CHARS) bodies.push(body);
+  }
+  const additionalContext = bodies.length ? bodies.join('\n\n') : null;
+
+  if (jsonMode) {
+    emitJson('dispatch.simulate', {
+      event: ev.base,
+      phase: ev.phase !== undefined ? ev.phase : null,
+      cwd,
+      source: source !== undefined ? source : null,
+      selected: selected.map(r => ({ id: r.id, event: r.event, freq: r.freq, cwd: r.cwd !== undefined ? r.cwd : null, doc: r.doc })),
+      additionalContext
+    });
+    return;
+  }
+  console.log('[baseline] dispatch simulate: event=' + event + (source ? ', source=' + source : '') + ', cwd=' + cwd);
+  console.log('  selected routes : ' + (selected.length ? selected.map(r => r.id).join(', ') : '(none)'));
+  console.log('  would inject     : ' + (additionalContext ? additionalContext.length + ' chars' : '(nothing)'));
+}
+
 // --- help / arg parsing -----------------------------------------------------
 
 function printHelp(): void {
@@ -1706,6 +1919,8 @@ function printHelp(): void {
   console.log('');
   console.log('Usage:');
   console.log('  node scripts/manage.js status                  Report what is installed vs the repo source + config.');
+  console.log('  node scripts/manage.js route list|add|remove   Inspect or edit routes in config.json (see route options).');
+  console.log('  node scripts/manage.js dispatch simulate --event <e> [--cwd <d>] [--source <phase>]  Dry-run: show what would be injected.');
   console.log('  node scripts/manage.js install [--preset <n>] [--agents <a,b>]  Deploy the dispatcher, seed the config preset, link agents, wire hook config.');
   console.log('  node scripts/manage.js verify                  Functionally test a wired route (does it fire?).');
   console.log('  node scripts/manage.js update                  Redeploy dispatcher + re-sync hook wiring from current config.');
@@ -1717,6 +1932,14 @@ function printHelp(): void {
   console.log('  --preset <minimal|default>   Which repo preset to seed when no config folder exists. Default: default.');
   console.log('  --force                      Replace an existing central config folder with the preset (DESTRUCTIVE — user edits lost).');
   console.log('  --agents <a,b>               Comma list of agents to wire (claude-code,codex). Each must be detected. Default: prompt on a TTY, else all detected.');
+  console.log('');
+  console.log('route options:');
+  console.log('  add    --id <slug> --event <e> --doc <config-relative path> [--freq <n>] [--cwd <dir>]');
+  console.log('  remove --id <slug>');
+  console.log('');
+  console.log('Machine output: add --json to status, route list/add/remove, and dispatch simulate to get one');
+  console.log('versioned JSON object (apiVersion 1) on stdout; on error it prints {"apiVersion":1,"error":{...}} and');
+  console.log('exits nonzero. This CLI plus --json is the whole programmatic surface — no Node library, no daemon.');
   console.log('');
   console.log('Agents are detected by config-dir existence; an install/update/uninstall scopes to the agents recorded in <install root>/state.json.');
   console.log('Native Zig runtime is paused for the routes feature; the dispatcher is Node-only in v1.');
@@ -1776,6 +1999,26 @@ switch (cmd) {
   case 'status':
     cmdStatus();
     break;
+  case 'route': {
+    const sub = (process.argv[3] || '').toLowerCase();
+    const rest = process.argv.slice(4);
+    try {
+      if (sub === 'list' || sub === 'ls') cmdRouteList();
+      else if (sub === 'add') cmdRouteAdd(rest);
+      else if (sub === 'remove' || sub === 'rm') cmdRouteRemove(rest);
+      else fail('route: unknown subcommand "' + sub + '" (use list|add|remove)', 2, 'invalid_args');
+    } catch (e) { fail('route ' + sub + ': ' + (e && e.message ? e.message : e), 1); }
+    break;
+  }
+  case 'dispatch': {
+    const sub = (process.argv[3] || '').toLowerCase();
+    const rest = process.argv.slice(4);
+    try {
+      if (sub === 'simulate' || sub === 'sim') cmdDispatchSimulate(rest);
+      else fail('dispatch: unknown subcommand "' + sub + '" (use simulate)', 2, 'invalid_args');
+    } catch (e) { fail('dispatch ' + sub + ': ' + (e && e.message ? e.message : e), 1); }
+    break;
+  }
   case 'verify':
     cmdVerify();
     break;

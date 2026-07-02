@@ -86,6 +86,8 @@ node scripts/manage.js uninstall   # unwire all events + remove agent links (kee
 
 Plain `install` seeds the curated `default` preset; `--preset minimal` selects the neutral floor; `--force` replaces an existing config folder (destructive). Or use the platform installers (`./install.sh`, `.\install.ps1`) from the same baseline root. Commands are idempotent and preserve co-resident hooks — hook-config edits are surgical.
 
+For scripting, add `--json` to `status`, `route list`/`add`/`remove`, and `dispatch simulate` for versioned machine output (`{ "apiVersion": 1, "command", "data" }`; errors as `{ "apiVersion": 1, "error": { "code", "message" } }` with a nonzero exit). `dispatch simulate` is a side-effect-free dry run of what a `(event, cwd, source)` would inject. The CLI plus `--json` is the whole programmatic surface — no Node library export, no daemon.
+
 ## Workflow guidance for the agent using this skill
 
 1. **Identify the intent.** Editing docs/routes → it's a `cfg/baseline/` edit. Installing/repairing/removing → it's a `manage.js` run. Adding or removing an *event* always needs install/update afterward (wiring re-sync).

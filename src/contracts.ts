@@ -37,6 +37,30 @@ export function parseEvent(event: string): ParsedEvent {
   return { base: event.slice(0, dot), phase: event.slice(dot + 1) };
 }
 
+// Event-name match: the route's base event equals the native hook event, and any
+// SessionStart phase suffix equals the stdin `source` (a bare event matches every
+// phase). Shared by the dispatcher and `dispatch simulate` so a simulation selects
+// exactly what a real invocation would.
+export function eventMatches(routeEvent: string, hookEventName: string | undefined, source: string | undefined): boolean {
+  const { base, phase } = parseEvent(routeEvent);
+  if (base !== hookEventName) return false;
+  return phase === undefined || source === phase;
+}
+
+// cwd scope match: normalized path-boundary prefix (/foo must not match /foobar),
+// case-insensitive on Windows. An omitted route cwd matches any directory.
+export function cwdMatches(routeCwd: string | undefined, sessionCwd: string | undefined, isWin: boolean): boolean {
+  if (routeCwd === undefined) return true;
+  const sessionRaw = typeof sessionCwd === 'string' ? sessionCwd : '';
+  if (!sessionRaw) return false;
+  let base = path.resolve(routeCwd);
+  let here = path.resolve(sessionRaw);
+  if (isWin) { base = base.toLowerCase(); here = here.toLowerCase(); }
+  if (base === here) return true;
+  const prefix = base.endsWith(path.sep) ? base : base + path.sep;
+  return here.startsWith(prefix);
+}
+
 // Resolve a route's `doc` against a config dir; reject escapes.
 export function safeDocPath(doc: string, cfgDir: string): string | null {
   if (typeof doc !== 'string' || !doc) return null;

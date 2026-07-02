@@ -124,35 +124,15 @@ function loadValidConfig() {
     }
     return { routes: out, vars: configVars };
 }
-// Does this route's event name accept the invocation? The event is the sole
-// moment-resolver: its base must equal the native hook event, and a SessionStart
-// phase suffix (when present) must equal the stdin `source` lifecycle phase. A bare
-// event (no phase) matches every phase of its base event.
+// Selection predicates delegate to the shared contract matchers so the dispatcher and
+// `dispatch simulate` agree exactly. The event name is the sole moment-resolver (base
+// event + optional SessionStart phase vs stdin `source`); cwd is a normalized
+// path-boundary prefix, case-insensitive on Windows; an omitted cwd matches any dir.
 function eventMatches(route, data) {
-    const { base, phase } = (0, contracts_1.parseEvent)(route.event);
-    if (base !== data.hook_event_name)
-        return false;
-    return phase === undefined || data.source === phase;
+    return (0, contracts_1.eventMatches)(route.event, data.hook_event_name, data.source);
 }
-// Is the session working directory at or under the route's cwd scope? Normalized
-// prefix match on path boundaries (/foo must not match /foobar), case-insensitive
-// on Windows. Omitted cwd means "any directory".
 function cwdMatches(route, data) {
-    if (route.cwd === undefined)
-        return true;
-    const sessionCwd = typeof data.cwd === 'string' ? data.cwd : '';
-    if (!sessionCwd)
-        return false;
-    let base = path.resolve(route.cwd);
-    let here = path.resolve(sessionCwd);
-    if (process.platform === 'win32') {
-        base = base.toLowerCase();
-        here = here.toLowerCase();
-    }
-    if (base === here)
-        return true;
-    const prefix = base.endsWith(path.sep) ? base : base + path.sep;
-    return here.startsWith(prefix);
+    return (0, contracts_1.cwdMatches)(route.cwd, data.cwd, process.platform === 'win32');
 }
 // Read a route's doc, bounded. Returns the verbatim body, or null to skip (missing,
 // unreadable, over-cap, or — defensively — out of range). The content read is async so

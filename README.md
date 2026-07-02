@@ -164,6 +164,25 @@ bash uninstall.sh
 
 All commands are idempotent and preserve any co-resident hooks (e.g. other skills). Hook-config edits are surgical. `install`/`uninstall` refuse to rewrite malformed `settings.json`/`hooks.json`; fix the JSON first so existing hooks are not lost.
 
+## Machine output (`--json`)
+
+For scripting, plugins, or MCP servers, add `--json` to `status`, `route list`, `route add`, `route remove`, and `dispatch simulate`. Each prints exactly one JSON object on stdout:
+
+- Success: `{ "apiVersion": 1, "command": "<name>", "data": { ... } }`, exit `0`.
+- Error: `{ "apiVersion": 1, "error": { "code": "...", "message": "..." } }`, nonzero exit.
+
+Human output is unchanged when `--json` is absent; `apiVersion` bumps only on a breaking shape change. This CLI plus `--json` is the entire programmatic surface this cycle — there is **no Node library export and no daemon**.
+
+```bash
+node scripts/manage.js status --json
+node scripts/manage.js route list --json
+node scripts/manage.js route add --id notes --event UserPromptSubmit --doc docs/notes.md --freq 3 --json
+node scripts/manage.js route remove --id notes --json
+node scripts/manage.js dispatch simulate --event UserPromptSubmit --cwd . --json
+```
+
+`dispatch simulate` is a **dry run**: it reports which routes a given `(event, cwd, source)` would select and the templated text that would be injected, without touching counters or any other state.
+
 ## Repository layout
 
 ```

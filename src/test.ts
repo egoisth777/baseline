@@ -1838,6 +1838,107 @@ function testUpdateDropsVanishedRecordedAgent(): void {
   assert.ok(!fs.existsSync(path.join(codex, 'hooks.json')), 'dropped codex must not be wired');
 }
 
+// --- CLI --json machine surface (R-012) ------------------------------------
+
+function testJsonStatusShape(): void {
+  const cfg = tempConfig();
+  assert.strictEqual(run(['install'], cfg).status, 0);
+  const res = run(['status', '--json'], cfg);
+  assert.strictEqual(res.status, 0, res.stderr || res.stdout);
+  const out = res.stdout.trim();
+  const obj = JSON.parse(out); // must parse cleanly → nothing but JSON on stdout
+  assert.strictEqual(obj.apiVersion, 1, 'status --json apiVersion');
+  assert.strictEqual(obj.command, 'status');
+  assert.ok(obj.data && typeof obj.data === 'object', 'status data object');
+  assert.strictEqual(obj.data.installRoot, homeFor(cfg), 'installRoot reflects BASELINE_HOME');
+  assert.ok(Array.isArray(obj.data.config.routes), 'config.routes is an array');
+  assert.ok(Array.isArray(obj.data.agents) && obj.data.agents.length >= 1, 'agents array present');
+  assert.ok(obj.data.agents[0].links && obj.data.agents[0].links.dispatcher, 'agent link states present');
+  assert.ok(!out.includes('[baseline] status'), 'json stdout must not carry human output');
+}
+
+function testJsonRouteListShape(): void {
+  const cfg = tempConfig();
+  assert.strictEqual(run(['install'], cfg).status, 0);
+  const res = run(['route', 'list', '--json'], cfg);
+  assert.strictEqual(res.status, 0, res.stderr || res.stdout);
+  const obj = JSON.parse(res.stdout.trim());
+  assert.strictEqual(obj.apiVersion, 1);
+  assert.strictEqual(obj.command, 'route.list');
+  assert.ok(Array.isArray(obj.data.routes), 'routes array');
+  const baseline = obj.data.routes.find((r: any) => r.id === 'baseline');
+  assert.ok(baseline, 'default preset baseline route present in JSON');
+  for (const k of ['id', 'event', 'freq', 'doc']) assert.ok(k in baseline, 'route entry has ' + k);
+}
+
+function testJsonRouteAddRemove(): void {
+  const cfg = tempConfig();
+  const home = homeFor(cfg);
+  assert.strictEqual(run(['install'], cfg).status, 0);
+
+  const add = run(['route', 'add', '--id', 'extra', '--event', 'UserPromptSubmit', '--doc', 'docs/extra.md', '--freq', '3', '--json'], cfg);
+  assert.strictEqual(add.status, 0, add.stderr || add.stdout);
+  const addObj = JSON.parse(add.stdout.trim());
+  assert.strictEqual(addObj.apiVersion, 1);
+  assert.strictEqual(addObj.command, 'route.add');
+  assert.strictEqual(addObj.data.added.id, 'extra');
+  assert.strictEqual(addObj.data.added.freq, 3);
+  assert.ok(addObj.data.routes.some((r: any) => r.id === 'extra'), 'returned routes include the added one');
+  // config.json actually mutated on disk, preserving the preset routes.
+  let cfgJson = JSON.parse(readThrough(path.join(home, 'cfg', 'config.json')));
+  assert.ok(cfgJson.routes.some((r: any) => r.id === 'extra' && r.freq === 3), 'config.json gained the route');
+  assert.ok(cfgJson.routes.some((r: any) => r.id === 'baseline'), 'existing routes preserved');
+
+  // Duplicate add → structured error, nonzero exit.
+  const dup = run(['route', 'add', '--id', 'extra', '--event', 'UserPromptSubmit', '--doc', 'docs/extra.md', '--json'], cfg);
+  assert.notStrictEqual(dup.status, 0, 'duplicate add should fail');
+  const dupObj = JSON.parse(dup.stdout.trim());
+  assert.ok(dupObj.error && dupObj.error.code, 'duplicate add returns a structured error');
+
+  const rm = run(['route', 'remove', '--id', 'extra', '--json'], cfg);
+  assert.strictEqual(rm.status, 0, rm.stderr || rm.stdout);
+  const rmObj = JSON.parse(rm.stdout.trim());
+  assert.strictEqual(rmObj.command, 'route.remove');
+  assert.strictEqual(rmObj.data.removed, 'extra');
+  assert.ok(!rmObj.data.routes.some((r: any) => r.id === 'extra'), 'removed route gone from returned list');
+  cfgJson = JSON.parse(readThrough(path.join(home, 'cfg', 'config.json')));
+  assert.ok(!cfgJson.routes.some((r: any) => r.id === 'extra'), 'config.json no longer has the route');
+}
+
+function testJsonDispatchSimulate(): void {
+  const cfg = tempConfig();
+  const home = homeFor(cfg);
+  assert.strictEqual(run(['install'], cfg).status, 0);
+  setCentralConfig(home, [
+    { id: 'sim', event: 'UserPromptSubmit', freq: 1, doc: 'docs/sim.md' }
+  ], { 'docs/sim.md': 'SIM {{event}}\n' });
+
+  const res = run(['dispatch', 'simulate', '--event', 'UserPromptSubmit', '--cwd', cfg, '--json'], cfg);
+  assert.strictEqual(res.status, 0, res.stderr || res.stdout);
+  const obj = JSON.parse(res.stdout.trim());
+  assert.strictEqual(obj.apiVersion, 1);
+  assert.strictEqual(obj.command, 'dispatch.simulate');
+  assert.strictEqual(obj.data.event, 'UserPromptSubmit');
+  assert.ok(obj.data.selected.some((r: any) => r.id === 'sim'), 'sim route selected');
+  assert.ok(obj.data.additionalContext && obj.data.additionalContext.includes('SIM UserPromptSubmit'),
+    'templated body previewed: ' + obj.data.additionalContext);
+  // Side-effect-free: simulate must never write the counter file.
+  assert.ok(!fs.existsSync(path.join(cfg, '.baseline-counters.json')), 'simulate must not write counters');
+}
+
+function testJsonErrorPathExitCode(): void {
+  const cfg = tempConfig();
+  assert.strictEqual(run(['install'], cfg).status, 0);
+  const res = run(['route', 'remove', '--id', 'ghost', '--json'], cfg);
+  assert.notStrictEqual(res.status, 0, 'error path must exit nonzero');
+  const obj = JSON.parse(res.stdout.trim());
+  assert.strictEqual(obj.apiVersion, 1);
+  assert.ok(obj.error && typeof obj.error.code === 'string' && typeof obj.error.message === 'string',
+    'structured { code, message } error');
+  assert.ok(!('data' in obj), 'error payload carries no data');
+  assert.strictEqual((res.stderr || '').trim(), '', 'json error must not also write stderr');
+}
+
 // --- runner -----------------------------------------------------------------
 
 const TESTS: Array<[string, () => void]> = [
@@ -1899,6 +2000,11 @@ const TESTS: Array<[string, () => void]> = [
   ['testExternalConfigLocation', testExternalConfigLocation],
   ['testChecksumsMatchBinaries', testChecksumsMatchBinaries],
   ['testNoRuntimeDependencies', testNoRuntimeDependencies],
+  ['testJsonStatusShape', testJsonStatusShape],
+  ['testJsonRouteListShape', testJsonRouteListShape],
+  ['testJsonRouteAddRemove', testJsonRouteAddRemove],
+  ['testJsonDispatchSimulate', testJsonDispatchSimulate],
+  ['testJsonErrorPathExitCode', testJsonErrorPathExitCode],
   ['testPresetsAreValid', testPresetsAreValid],
   ['testMinimalPresetIsNeutral', testMinimalPresetIsNeutral],
   ['testBrandAssetsAndReadme', testBrandAssetsAndReadme],

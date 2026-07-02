@@ -2,6 +2,8 @@
 Object.defineProperty(exports, "__esModule", { value: true });
 exports.DEFAULT_PROVIDERS = exports.deterministicProvider = exports.MAX_ROUTES = exports.MAX_DOC_CHARS = exports.MAX_DOC_BYTES = exports.MAX_CONFIG_BYTES = exports.SLUG = exports.SESSION_PHASES = exports.SUPPORTED_EVENTS = void 0;
 exports.parseEvent = parseEvent;
+exports.eventMatches = eventMatches;
+exports.cwdMatches = cwdMatches;
 exports.safeDocPath = safeDocPath;
 exports.pathInside = pathInside;
 exports.safeRealDocPath = safeRealDocPath;
@@ -29,6 +31,35 @@ function parseEvent(event) {
     if (dot === -1)
         return { base: event };
     return { base: event.slice(0, dot), phase: event.slice(dot + 1) };
+}
+// Event-name match: the route's base event equals the native hook event, and any
+// SessionStart phase suffix equals the stdin `source` (a bare event matches every
+// phase). Shared by the dispatcher and `dispatch simulate` so a simulation selects
+// exactly what a real invocation would.
+function eventMatches(routeEvent, hookEventName, source) {
+    const { base, phase } = parseEvent(routeEvent);
+    if (base !== hookEventName)
+        return false;
+    return phase === undefined || source === phase;
+}
+// cwd scope match: normalized path-boundary prefix (/foo must not match /foobar),
+// case-insensitive on Windows. An omitted route cwd matches any directory.
+function cwdMatches(routeCwd, sessionCwd, isWin) {
+    if (routeCwd === undefined)
+        return true;
+    const sessionRaw = typeof sessionCwd === 'string' ? sessionCwd : '';
+    if (!sessionRaw)
+        return false;
+    let base = path.resolve(routeCwd);
+    let here = path.resolve(sessionRaw);
+    if (isWin) {
+        base = base.toLowerCase();
+        here = here.toLowerCase();
+    }
+    if (base === here)
+        return true;
+    const prefix = base.endsWith(path.sep) ? base : base + path.sep;
+    return here.startsWith(prefix);
 }
 // Resolve a route's `doc` against a config dir; reject escapes.
 function safeDocPath(doc, cfgDir) {
