@@ -435,11 +435,127 @@ function testUnknownPresetFails() {
     assert.notStrictEqual(install.status, 0, 'install with unknown preset unexpectedly succeeded');
     assert.match(install.stderr, /preset "nope" not found/);
 }
-function testNativeRuntimePaused() {
+// --- native Zig runtime (R-009, goal decision #18) --------------------------
+// The prebuilt shipped for this platform, or null where none exists (mirrors
+// manage.ts nativePrebuiltName). Native tests skip cleanly on such platforms.
+function nativePrebuiltForPlatform() {
+    if (process.platform === 'win32' && process.arch === 'x64')
+        return 'baseline-recital-windows-x64.exe';
+    if (process.platform === 'linux' && process.arch === 'x64')
+        return 'baseline-recital-linux-x64';
+    return null;
+}
+const nativeBinName = process.platform === 'win32' ? 'baseline-recital.exe' : 'baseline-recital';
+function agentHookBin(agentConfig) {
+    return path.join(agentConfig, 'hooks', nativeBinName);
+}
+function wiredCommandFor(cfg, event) {
+    const settings = JSON.parse(fs.readFileSync(path.join(cfg, 'settings.json'), 'utf8'));
+    return settings.hooks[event][0].hooks[0].command;
+}
+// install --runtime prebuilt lifts the former pause: it deploys the native binary to the
+// center, links it into the agent, and wires the binary DIRECTLY (no node) as the hot path.
+// verify drives the actually-wired command end-to-end. Skips where no prebuilt is shipped.
+function testNativeRuntimeInstallsAndWires() {
+    const target = nativePrebuiltForPlatform();
+    if (!target || !fs.existsSync(path.join(root, 'bin', target))) {
+        console.log('  (skip) testNativeRuntimeInstallsAndWires: no native prebuilt for ' + process.platform + '-' + process.arch + '.');
+        return;
+    }
     const cfg = tempConfig();
+    const home = homeFor(cfg);
     const install = run(['install', '--runtime', 'prebuilt'], cfg);
-    assert.strictEqual(install.status, 2, install.stderr || install.stdout);
-    assert.match(install.stderr, /native runtime is paused/);
+    assert.strictEqual(install.status, 0, install.stderr || install.stdout);
+    assert.match(install.stdout, /runtime\s+: native \(prebuilt /);
+    assert.ok(fs.existsSync(path.join(home, 'hooks', nativeBinName)), 'native binary not deployed to the center');
+    assert.ok(fs.existsSync(agentHookBin(cfg)), 'native binary not linked into the agent hooks dir');
+    const cmd = wiredCommandFor(cfg, 'UserPromptSubmit');
+    assert.ok(cmd.includes(nativeBinName), 'wired command should run the native binary: ' + cmd);
+    assert.ok(!/baseline-recital\.js/.test(cmd), 'wired command must not run the Node .js when native: ' + cmd);
+    // verify parses the wired command and spawns it (the native binary) for real.
+    const verify = run(['verify'], cfg);
+    assert.strictEqual(verify.status, 0, 'verify should pass against the wired native binary: ' + (verify.stderr || verify.stdout));
+}
+// With no native runtime requested the platform binary is absent, and the Node dispatcher
+// is wired + dispatches. Deterministic on every platform (no prebuilt is deployed).
+function testNativeFallbackToNodeWhenBinaryAbsent() {
+    const cfg = tempConfig();
+    const home = homeFor(cfg);
+    const install = run(['install'], cfg);
+    assert.strictEqual(install.status, 0, install.stderr || install.stdout);
+    assert.match(install.stdout, /runtime\s+: node js/);
+    assert.ok(!fs.existsSync(path.join(home, 'hooks', nativeBinName)), 'no native binary should deploy without --runtime');
+    assert.ok(!fs.existsSync(agentHookBin(cfg)), 'no native binary should link into the agent without --runtime');
+    const cmd = wiredCommandFor(cfg, 'UserPromptSubmit');
+    assert.ok(/baseline-recital\.js/.test(cmd), 'binary absent -> the Node .js must be wired: ' + cmd);
+    setCentralConfig(home, [
+        { id: 'fb', event: 'UserPromptSubmit', freq: 1, doc: 'docs/fb.md' }
+    ], { 'docs/fb.md': 'FALLBACK OK\n' });
+    const body = fireBodies(hook({ session_id: 'fallback', hook_event_name: 'UserPromptSubmit', cwd: cfg }, cfg));
+    assert.ok(body && body.includes('FALLBACK OK'), 'the Node dispatcher should fire when the native binary is absent');
+}
+// End-to-end byte-parity: identical stdin fixtures to the native binary and the Node
+// dispatcher must produce byte-identical stdout across multi-route templating, freq
+// rollover, and a no-match event. Skips cleanly where no prebuilt exists for the platform.
+function testNativeDispatchParity() {
+    const target = nativePrebuiltForPlatform();
+    if (!target || !fs.existsSync(path.join(root, 'bin', target))) {
+        console.log('  (skip) testNativeDispatchParity: no native prebuilt for ' + process.platform + '-' + process.arch + '.');
+        return;
+    }
+    const nativeBin = path.join(root, 'bin', target);
+    function fixture() {
+        const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'baseline-parity-'));
+        const cb = path.join(dir, 'cfg', 'baseline');
+        fs.mkdirSync(path.join(cb, 'docs'), { recursive: true });
+        fs.writeFileSync(path.join(cb, 'config.json'), JSON.stringify({
+            version: 1,
+            vars: { greeting: 'hello', who: 'config' },
+            routes: [
+                { id: 'first', event: 'UserPromptSubmit', freq: 1, doc: 'docs/first.md', vars: { who: 'route' } },
+                { id: 'second', event: 'UserPromptSubmit', freq: 1, doc: 'docs/second.md' },
+                { id: 'every2', event: 'UserPromptSubmit', freq: 2, doc: 'docs/every2.md' }
+            ]
+        }, null, 2));
+        fs.writeFileSync(path.join(cb, 'docs', 'first.md'), 'FIRST e={{event}} g={{greeting}} w={{who}} u={{unknown}}\n');
+        fs.writeFileSync(path.join(cb, 'docs', 'second.md'), 'SECOND\n');
+        fs.writeFileSync(path.join(cb, 'docs', 'every2.md'), 'EVERY-TWO\n');
+        return dir;
+    }
+    // TZ=UTC aligns the Node {{date}}/{{time}} built-ins with the native UTC clock (the docs
+    // here use neither, but this keeps the harness honest for future date/time cases).
+    const env = Object.assign({}, process.env, { TZ: 'UTC' });
+    const nDir = fixture();
+    const jDir = fixture();
+    const native = (dir, input) => (0, child_process_1.spawnSync)(nativeBin, ['--agent-config', dir], { input: JSON.stringify(input), encoding: 'utf8', env });
+    const node = (dir, input) => (0, child_process_1.spawnSync)(process.execPath, [dispatcher, '--agent-config', dir], { input: JSON.stringify(input), encoding: 'utf8', env });
+    try {
+        const turns = [
+            { hook_event_name: 'UserPromptSubmit' }, // t1: first + second (every2 not yet due)
+            { hook_event_name: 'UserPromptSubmit' }, // t2: first + second + every2 (config order)
+            { hook_event_name: 'PostToolUse', tool_name: 'Bash' } // no matching route -> empty
+        ];
+        const nativeOut = [];
+        for (let i = 0; i < turns.length; i++) {
+            const rn = native(nDir, Object.assign({ session_id: 'p', cwd: nDir }, turns[i]));
+            const rj = node(jDir, Object.assign({ session_id: 'p', cwd: jDir }, turns[i]));
+            assert.strictEqual(rn.status, 0, 'native exit 0 at turn ' + (i + 1) + ': ' + (rn.stderr || ''));
+            assert.strictEqual(rj.status, 0, 'node exit 0 at turn ' + (i + 1) + ': ' + (rj.stderr || ''));
+            assert.strictEqual(rn.stdout, rj.stdout, 'native vs node stdout must be byte-identical at turn ' + (i + 1) +
+                '\n  native: ' + JSON.stringify(rn.stdout) + '\n  node:   ' + JSON.stringify(rj.stdout));
+            nativeOut.push(rn.stdout || '');
+        }
+        // Guard against a vacuous pass (two empties): assert the expected non-empty semantics.
+        assert.ok(nativeOut[0].includes('FIRST e=UserPromptSubmit g=hello w=route u={{unknown}}'), 't1 must template built-ins/vars and leave unknown verbatim: ' + nativeOut[0]);
+        assert.ok(nativeOut[0].includes('SECOND') && !nativeOut[0].includes('EVERY-TWO'), 't1: freq-2 route not yet due');
+        const iF = nativeOut[1].indexOf('FIRST'), iS = nativeOut[1].indexOf('SECOND'), iE = nativeOut[1].indexOf('EVERY-TWO');
+        assert.ok(iF !== -1 && iS !== -1 && iE !== -1 && iF < iS && iS < iE, 't2: all three due, emitted in config order: ' + nativeOut[1]);
+        assert.strictEqual(nativeOut[2].trim(), '', 't3: no-match event injects nothing');
+    }
+    finally {
+        fs.rmSync(nDir, { recursive: true, force: true });
+        fs.rmSync(jDir, { recursive: true, force: true });
+    }
 }
 function testInvalidSettingsFailsClosed() {
     const cfg = tempConfig();
@@ -1155,9 +1271,10 @@ function testDocsDescribeRoutesModel() {
         assert.match(text, /route/i, name + ' should describe routes');
     }
 }
-// R-005 (goal decision #12): install wrappers expose only flags the manager accepts.
-// The paused native runtime (--build/--runtime) must not surface in the install path;
-// parseInstallOpts in src/manage.ts still rejects it as the backstop.
+// R-005 (goal decision #12): install wrappers expose only a curated flag set. The native
+// runtime is now available via `manage.js install --runtime prebuilt|build` (R-009), but the
+// install WRAPPERS deliberately do NOT advertise --build/--runtime — that surface stays with
+// the manager. This guards the wrappers against re-growing those flags.
 function testInstallWrappersHaveNoBuildFlag() {
     const sh = fs.readFileSync(path.join(root, 'install.sh'), 'utf8');
     const ps1 = fs.readFileSync(path.join(root, 'install.ps1'), 'utf8');
@@ -1669,7 +1786,9 @@ const TESTS = [
     ['testIdempotentReinstall', testIdempotentReinstall],
     ['testForceReplacesConfigKeepWithout', testForceReplacesConfigKeepWithout],
     ['testUnknownPresetFails', testUnknownPresetFails],
-    ['testNativeRuntimePaused', testNativeRuntimePaused],
+    ['testNativeRuntimeInstallsAndWires', testNativeRuntimeInstallsAndWires],
+    ['testNativeFallbackToNodeWhenBinaryAbsent', testNativeFallbackToNodeWhenBinaryAbsent],
+    ['testNativeDispatchParity', testNativeDispatchParity],
     ['testDefaultInstallAndVerify', testDefaultInstallAndVerify],
     ['testInstalledManagerInfersInstallRootWithoutBaselineHome', testInstalledManagerInfersInstallRootWithoutBaselineHome],
     ['testBaselineHomeOverridesInstalledManagerLocation', testBaselineHomeOverridesInstalledManagerLocation],
