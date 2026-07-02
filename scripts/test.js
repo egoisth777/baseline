@@ -517,14 +517,15 @@ function testNativeDispatchParity() {
                 { id: 'every2', event: 'UserPromptSubmit', freq: 2, doc: 'docs/every2.md' }
             ]
         }, null, 2));
-        fs.writeFileSync(path.join(cb, 'docs', 'first.md'), 'FIRST e={{event}} g={{greeting}} w={{who}} u={{unknown}}\n');
+        fs.writeFileSync(path.join(cb, 'docs', 'first.md'), 'FIRST e={{event}} g={{greeting}} w={{who}} u={{unknown}} d={{date}}\n');
         fs.writeFileSync(path.join(cb, 'docs', 'second.md'), 'SECOND\n');
         fs.writeFileSync(path.join(cb, 'docs', 'every2.md'), 'EVERY-TWO\n');
         return dir;
     }
-    // TZ=UTC aligns the Node {{date}}/{{time}} built-ins with the native UTC clock (the docs
-    // here use neither, but this keeps the harness honest for future date/time cases).
-    const env = Object.assign({}, process.env, { TZ: 'UTC' });
+    // No TZ crutch: {{date}} resolves in UTC on BOTH runtimes, so parity must hold at this
+    // machine's real local offset. first.md carries {{date}} to exercise that (a Node resolver
+    // that reverted to local time would diverge from the native UTC date for much of the day).
+    const env = process.env;
     const nDir = fixture();
     const jDir = fixture();
     const native = (dir, input) => (0, child_process_1.spawnSync)(nativeBin, ['--agent-config', dir], { input: JSON.stringify(input), encoding: 'utf8', env });
@@ -546,7 +547,7 @@ function testNativeDispatchParity() {
             nativeOut.push(rn.stdout || '');
         }
         // Guard against a vacuous pass (two empties): assert the expected non-empty semantics.
-        assert.ok(nativeOut[0].includes('FIRST e=UserPromptSubmit g=hello w=route u={{unknown}}'), 't1 must template built-ins/vars and leave unknown verbatim: ' + nativeOut[0]);
+        assert.ok(/FIRST e=UserPromptSubmit g=hello w=route u=\{\{unknown\}\} d=\d{4}-\d{2}-\d{2}/.test(nativeOut[0]), 't1 must template built-ins/vars (incl. a UTC {{date}}) and leave unknown verbatim: ' + nativeOut[0]);
         assert.ok(nativeOut[0].includes('SECOND') && !nativeOut[0].includes('EVERY-TWO'), 't1: freq-2 route not yet due');
         const iF = nativeOut[1].indexOf('FIRST'), iS = nativeOut[1].indexOf('SECOND'), iE = nativeOut[1].indexOf('EVERY-TWO');
         assert.ok(iF !== -1 && iS !== -1 && iE !== -1 && iF < iS && iS < iE, 't2: all three due, emitted in config order: ' + nativeOut[1]);
@@ -720,9 +721,11 @@ function testEventNameSemantics() {
     assert.ok(!fireBodies(hook({ session_id: 's5', hook_event_name: 'UserPromptSubmit', cwd: path.join(cfg, 'elsewhere') }, cfg))?.includes('SCOPED'), 'scoped route should not fire outside its cwd');
 }
 // --- {{name}} templating (R-010) -------------------------------------------
-// Fixed-clock context helper so date/time assertions are deterministic.
+// Fixed-clock context helper so date/time assertions are deterministic. Built from a UTC
+// timestamp because {{date}}/{{time}} resolve in UTC — the assertions below are then
+// independent of the machine's local timezone.
 function tmplCtx(over) {
-    return Object.assign({ event: 'UserPromptSubmit', cwd: '/work/proj', home: '/home/dev', now: new Date(2026, 0, 9, 4, 7), env: {}, vars: {} }, over);
+    return Object.assign({ event: 'UserPromptSubmit', cwd: '/work/proj', home: '/home/dev', now: new Date(Date.UTC(2026, 0, 9, 4, 7)), env: {}, vars: {} }, over);
 }
 function testTemplateResolvesBuiltinsAndVars() {
     const ctx = tmplCtx({ env: { FOO: 'bar' }, vars: { greeting: 'hello', name: 'Ada' } });

@@ -103,7 +103,7 @@ A route is one entry in `config.json` `routes[]`:
 
 A doc may contain `{{name}}` placeholders resolved **deterministically at injection time** (in-process — no shell, no model calls, no dynamic file selection):
 
-- **Built-ins:** `{{event}}` (the hook event), `{{cwd}}`, `{{date}}` (`YYYY-MM-DD`), `{{time}}` (`HH:MM`), `{{home}}`, and `{{env.NAME}}` (an environment variable; empty string if unset).
+- **Built-ins:** `{{event}}` (the hook event), `{{cwd}}`, `{{date}}` (`YYYY-MM-DD`, UTC), `{{time}}` (`HH:MM`, UTC), `{{home}}`, and `{{env.NAME}}` (an environment variable; empty string if unset). `{{date}}`/`{{time}}` are UTC on both the Node and native runtimes.
 - **User variables:** an optional config-level `"vars": { "name": "value" }` map, overridable by a per-route `"vars"` map. Precedence is **route vars > config vars > built-ins**.
 - An **unknown** placeholder is left verbatim (no error, no strip). There is no escaping syntax.
 

@@ -101,7 +101,7 @@ export interface TemplateContext {
   event: string;   // native hook event name → {{event}}
   cwd: string;     // session working directory → {{cwd}}
   home: string;    // user home → {{home}}
-  now: Date;       // one clock snapshot per dispatch → {{date}} / {{time}}
+  now: Date;       // one clock snapshot per dispatch → {{date}} / {{time}} (resolved in UTC)
   env: { [k: string]: string | undefined }; // environment for {{env.NAME}}
   vars: VarMap;    // merged user vars (route over config); these override built-ins
 }
@@ -125,8 +125,10 @@ export const deterministicProvider: TemplateProvider = {
       case 'event': return ctx.event;
       case 'cwd':   return ctx.cwd;
       case 'home':  return ctx.home;
-      case 'date':  return ctx.now.getFullYear() + '-' + pad2(ctx.now.getMonth() + 1) + '-' + pad2(ctx.now.getDate());
-      case 'time':  return pad2(ctx.now.getHours()) + ':' + pad2(ctx.now.getMinutes());
+      // {{date}}/{{time}} resolve in UTC (contract: identical on the Node and native Zig
+      // runtimes, independent of the machine's local timezone).
+      case 'date':  return ctx.now.getUTCFullYear() + '-' + pad2(ctx.now.getUTCMonth() + 1) + '-' + pad2(ctx.now.getUTCDate());
+      case 'time':  return pad2(ctx.now.getUTCHours()) + ':' + pad2(ctx.now.getUTCMinutes());
     }
     if (token.indexOf('env.') === 0) {
       const v = ctx.env[token.slice(4)];
