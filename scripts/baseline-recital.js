@@ -155,16 +155,18 @@ function cwdMatches(route, data) {
     return here.startsWith(prefix);
 }
 // Read a route's doc, bounded. Returns the verbatim body, or null to skip (missing,
-// unreadable, over-cap, or — defensively — out of range).
-function readDoc(doc) {
+// unreadable, over-cap, or — defensively — out of range). The content read is async so
+// several due docs can be read concurrently (R-011); the path-safety realpath check
+// stays synchronous, and the byte/char caps are unchanged.
+async function readDocAsync(doc) {
     const p = (0, contracts_1.safeRealDocPath)(doc, cfgDir);
     if (!p)
         return null;
     try {
-        const st = fs.statSync(p);
+        const st = await fs.promises.stat(p);
         if (st.size > contracts_1.MAX_DOC_BYTES)
             return null;
-        const body = fs.readFileSync(p, 'utf8');
+        const body = await fs.promises.readFile(p, 'utf8');
         if (Buffer.byteLength(body, 'utf8') > contracts_1.MAX_DOC_BYTES)
             return null;
         if (body.length > contracts_1.MAX_DOC_CHARS)
@@ -253,7 +255,7 @@ process.stdin.on('data', chunk => {
     }
     input += chunk;
 });
-process.stdin.on('end', () => {
+process.stdin.on('end', async () => {
     try {
         if (inputTooLarge)
             return;
@@ -299,20 +301,22 @@ process.stdin.on('end', () => {
         }
         if (!due.length)
             return;
-        // Concatenate the due doc bodies in config routes[] order (selected/due both
-        // preserve it), joined by a blank line, with no headers or route-id labels —
-        // labels would break verbatim injection. Each body is templated at injection time
-        // ({{name}} resolved deterministically) before the combined-context cap, so the cap
-        // bounds the text actually injected.
+        // Read the due docs CONCURRENTLY (R-011), then assemble strictly in config routes[]
+        // order — Promise.all preserves input order, so output is deterministic regardless of
+        // which read finishes first. No headers or route-id labels (they would break verbatim
+        // injection). Each body is templated at injection time ({{name}} resolved
+        // deterministically) before the combined-context cap, so the cap bounds the text
+        // actually injected.
         const now = new Date();
         const cwd = typeof data.cwd === 'string' ? data.cwd : '';
+        const rawBodies = await Promise.all(due.map(r => readDocAsync(r.doc)));
         const bodies = [];
-        for (const r of due) {
-            const raw = readDoc(r.doc);
+        for (let i = 0; i < due.length; i++) {
+            const raw = rawBodies[i];
             if (raw === null)
                 continue;
             const body = (0, contracts_1.applyTemplate)(raw, {
-                event, cwd, home: os.homedir(), now, env: process.env, vars: (0, contracts_1.mergeVars)(config.vars, r.vars)
+                event, cwd, home: os.homedir(), now, env: process.env, vars: (0, contracts_1.mergeVars)(config.vars, due[i].vars)
             });
             const joined = bodies.length ? bodies.join('\n\n') + '\n\n' + body : body;
             if (joined.length <= contracts_1.MAX_DOC_CHARS)

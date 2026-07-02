@@ -172,14 +172,16 @@ function cwdMatches(route: Route, data: HookInput): boolean {
 }
 
 // Read a route's doc, bounded. Returns the verbatim body, or null to skip (missing,
-// unreadable, over-cap, or — defensively — out of range).
-function readDoc(doc: string): string | null {
+// unreadable, over-cap, or — defensively — out of range). The content read is async so
+// several due docs can be read concurrently (R-011); the path-safety realpath check
+// stays synchronous, and the byte/char caps are unchanged.
+async function readDocAsync(doc: string): Promise<string | null> {
   const p = safeRealDocPath(doc, cfgDir);
   if (!p) return null;
   try {
-    const st = fs.statSync(p);
+    const st = await fs.promises.stat(p);
     if (st.size > MAX_DOC_BYTES) return null;
-    const body = fs.readFileSync(p, 'utf8');
+    const body = await fs.promises.readFile(p, 'utf8');
     if (Buffer.byteLength(body, 'utf8') > MAX_DOC_BYTES) return null;
     if (body.length > MAX_DOC_CHARS) return null;
     return body;
@@ -258,7 +260,7 @@ process.stdin.on('data', chunk => {
   }
   input += chunk;
 });
-process.stdin.on('end', () => {
+process.stdin.on('end', async () => {
   try {
     if (inputTooLarge) return;
     const data: HookInput = JSON.parse(input);
@@ -304,19 +306,21 @@ process.stdin.on('end', () => {
 
     if (!due.length) return;
 
-    // Concatenate the due doc bodies in config routes[] order (selected/due both
-    // preserve it), joined by a blank line, with no headers or route-id labels —
-    // labels would break verbatim injection. Each body is templated at injection time
-    // ({{name}} resolved deterministically) before the combined-context cap, so the cap
-    // bounds the text actually injected.
+    // Read the due docs CONCURRENTLY (R-011), then assemble strictly in config routes[]
+    // order — Promise.all preserves input order, so output is deterministic regardless of
+    // which read finishes first. No headers or route-id labels (they would break verbatim
+    // injection). Each body is templated at injection time ({{name}} resolved
+    // deterministically) before the combined-context cap, so the cap bounds the text
+    // actually injected.
     const now = new Date();
     const cwd = typeof data.cwd === 'string' ? data.cwd : '';
+    const rawBodies = await Promise.all(due.map(r => readDocAsync(r.doc)));
     const bodies: string[] = [];
-    for (const r of due) {
-      const raw = readDoc(r.doc);
+    for (let i = 0; i < due.length; i++) {
+      const raw = rawBodies[i];
       if (raw === null) continue;
       const body = applyTemplate(raw, {
-        event, cwd, home: os.homedir(), now, env: process.env, vars: mergeVars(config.vars, r.vars)
+        event, cwd, home: os.homedir(), now, env: process.env, vars: mergeVars(config.vars, due[i].vars)
       });
       const joined = bodies.length ? bodies.join('\n\n') + '\n\n' + body : body;
       if (joined.length <= MAX_DOC_CHARS) bodies.push(body);

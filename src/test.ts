@@ -810,6 +810,35 @@ function testTemplateDispatchEndToEnd(): void {
   assert.ok(body!.includes('U={{unknown}}'), 'unknown placeholder must stay verbatim: ' + body);
 }
 
+// R-011 (goal decision #19): due docs are read concurrently but assembled strictly in
+// config routes[] order. Four routes with very different doc sizes (so read-completion
+// order differs from config order) must still emit in declared order.
+function testConcurrentDispatchDeterministicOrder(): void {
+  const cfg = tempConfig();
+  const home = homeFor(cfg);
+  assert.strictEqual(run(['install'], cfg).status, 0);
+  const big = 'B'.repeat(5000);
+  const mid = 'M'.repeat(2000);
+  setCentralConfig(home, [
+    { id: 'first',  event: 'UserPromptSubmit', freq: 1, doc: 'docs/first.md' },
+    { id: 'second', event: 'UserPromptSubmit', freq: 1, doc: 'docs/second.md' },
+    { id: 'third',  event: 'UserPromptSubmit', freq: 1, doc: 'docs/third.md' },
+    { id: 'fourth', event: 'UserPromptSubmit', freq: 1, doc: 'docs/fourth.md' }
+  ], {
+    'docs/first.md': 'FIRST-' + big + '\n',   // largest: typically reads slowest
+    'docs/second.md': 'SECOND\n',             // tiny
+    'docs/third.md': 'THIRD-' + mid + '\n',
+    'docs/fourth.md': 'FOURTH\n'
+  });
+
+  const body = fireBodies(hook({ session_id: 'order', hook_event_name: 'UserPromptSubmit', cwd: cfg }, cfg));
+  assert.ok(body, 'multi-route dispatch should fire');
+  const iF = body!.indexOf('FIRST-'), iS = body!.indexOf('SECOND'), iT = body!.indexOf('THIRD-'), i4 = body!.indexOf('FOURTH');
+  assert.ok(iF !== -1 && iS !== -1 && iT !== -1 && i4 !== -1, 'all four bodies must be present: ' + body);
+  assert.ok(iF < iS && iS < iT && iT < i4,
+    'bodies must appear in config routes[] order regardless of read timing (got offsets ' + [iF, iS, iT, i4].join(',') + ')');
+}
+
 function testFailOpenMissingConfig(): void {
   // Point the dispatcher at a config dir with no cfg/baseline at all.
   const empty = tempConfig();
@@ -1840,6 +1869,7 @@ const TESTS: Array<[string, () => void]> = [
   ['testTemplatePerRouteOverrideOrder', testTemplatePerRouteOverrideOrder],
   ['testTemplateUnknownPlaceholderVerbatim', testTemplateUnknownPlaceholderVerbatim],
   ['testTemplateDispatchEndToEnd', testTemplateDispatchEndToEnd],
+  ['testConcurrentDispatchDeterministicOrder', testConcurrentDispatchDeterministicOrder],
   ['testFailOpenMissingConfig', testFailOpenMissingConfig],
   ['testMalformedConfigInjectsNothing', testMalformedConfigInjectsNothing],
   ['testBadRouteSkippedOthersFire', testBadRouteSkippedOthersFire],
