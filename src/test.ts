@@ -676,6 +676,71 @@ function testNativeDispatchParity(): void {
   }
 }
 
+// The native counter update runs under the SAME mkdir-lock as the Node oracle. Verify freq
+// integrity under CONCURRENT dispatch (no lost increments), that the lock dir is cleaned up,
+// and that a stale lock is broken. Skips cleanly where no prebuilt exists for the platform.
+function testNativeCounterLock(): void {
+  const target = nativePrebuiltForPlatform();
+  if (!target || !fs.existsSync(path.join(root, 'bin', target))) {
+    console.log('  (skip) testNativeCounterLock: no native prebuilt for ' + process.platform + '-' + process.arch + '.');
+    return;
+  }
+  const nativeBin = path.join(root, 'bin', target);
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'baseline-lock-'));
+  try {
+    const cb = path.join(dir, 'cfg', 'baseline');
+    fs.mkdirSync(path.join(cb, 'docs'), { recursive: true });
+    fs.writeFileSync(path.join(cb, 'config.json'), JSON.stringify({
+      version: 1, routes: [{ id: 'r', event: 'UserPromptSubmit', freq: 3, doc: 'docs/r.md' }]
+    }));
+    fs.writeFileSync(path.join(cb, 'docs', 'r.md'), 'LOCK DOC\n');
+    const lockPath = path.join(dir, '.baseline-counters.json.lock');
+
+    // Concurrency: K same-session invocations race the shared counter (spawned concurrently by
+    // a child so the synchronous test runner still blocks on the result). With the lock the
+    // counts form a clean 1..K, so the final count is K and exactly floor(K/3) fire; a lockless
+    // read-modify-write would lose increments (final count < K).
+    const K = 12;
+    const helper =
+      'const {spawn}=require("child_process");' +
+      'const bin=process.env.NB,dir=process.env.ND,K=+process.env.NK;' +
+      'const e=Object.assign({},process.env);delete e.BASELINE_AGENT_CONFIG_DIR;delete e.CLAUDE_CONFIG_DIR;delete e.CODEX_HOME;' +
+      'const input=JSON.stringify({session_id:"lock",hook_event_name:"UserPromptSubmit",cwd:dir});' +
+      'Promise.all(Array.from({length:K},()=>new Promise(res=>{' +
+      'const p=spawn(bin,["--agent-config",dir],{stdio:["pipe","pipe","ignore"],env:e});' +
+      'let o="";p.stdout.on("data",d=>o+=d);p.on("close",()=>res(o.trim()));p.stdin.end(input);' +
+      '}))).then(outs=>process.stdout.write(JSON.stringify({fired:outs.filter(Boolean).length})));';
+    const r = spawnSync(process.execPath, ['-e', helper], {
+      encoding: 'utf8', env: Object.assign({}, process.env, { NB: nativeBin, ND: dir, NK: String(K) })
+    });
+    assert.strictEqual(r.status, 0, 'concurrency helper failed: ' + (r.stderr || r.stdout));
+    const fired = JSON.parse((r.stdout || '').trim()).fired;
+
+    const counters = JSON.parse(fs.readFileSync(path.join(dir, '.baseline-counters.json'), 'utf8'));
+    assert.strictEqual(counters['lock:r'] && counters['lock:r'].count, K,
+      'lock must serialize concurrent bumps to a clean 1..' + K + ' (no lost increments); got ' + JSON.stringify(counters['lock:r']));
+    assert.strictEqual(fired, Math.floor(K / 3), 'exactly floor(K/3) invocations should fire under the freq-3 route (got ' + fired + ')');
+    assert.ok(!fs.existsSync(lockPath), 'lock dir must be cleaned up after a normal dispatch');
+
+    // Stale lock: one older than the 5s window must be broken so a crashed holder never wedges
+    // the counter. Plant a 30s-old lock, run one freq-1 dispatch, assert it fired and cleaned up.
+    fs.writeFileSync(path.join(cb, 'config.json'), JSON.stringify({
+      version: 1, routes: [{ id: 'r1', event: 'UserPromptSubmit', freq: 1, doc: 'docs/r.md' }]
+    }));
+    fs.mkdirSync(lockPath);
+    const old = Date.now() / 1000 - 30;
+    fs.utimesSync(lockPath, old, old);
+    const r2 = spawnSync(nativeBin, ['--agent-config', dir], {
+      input: JSON.stringify({ session_id: 'stale', hook_event_name: 'UserPromptSubmit', cwd: dir }),
+      encoding: 'utf8', env: Object.assign({}, process.env)
+    });
+    assert.ok((r2.stdout || '').includes('LOCK DOC'), 'a stale lock must be broken so the dispatch fires: ' + JSON.stringify(r2.stdout));
+    assert.ok(!fs.existsSync(lockPath), 'the broken stale lock dir must be cleaned up after dispatch');
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+}
+
 function testInvalidSettingsFailsClosed(): void {
   const cfg = tempConfig();
   const home = homeFor(cfg);
@@ -2140,6 +2205,7 @@ const TESTS: Array<[string, () => void]> = [
   ['testNativeRuntimeInstallsAndWires', testNativeRuntimeInstallsAndWires],
   ['testNativeFallbackToNodeWhenBinaryAbsent', testNativeFallbackToNodeWhenBinaryAbsent],
   ['testNativeDispatchParity', testNativeDispatchParity],
+  ['testNativeCounterLock', testNativeCounterLock],
   ['testDefaultInstallAndVerify', testDefaultInstallAndVerify],
   ['testInstalledManagerInfersInstallRootWithoutBaselineHome', testInstalledManagerInfersInstallRootWithoutBaselineHome],
   ['testBaselineHomeOverridesInstalledManagerLocation', testBaselineHomeOverridesInstalledManagerLocation],

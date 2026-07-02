@@ -22,9 +22,8 @@
 //    built-ins {{event}}/{{cwd}}/{{home}}/{{date}}/{{time}}/{{env.NAME}}; unknown tokens are
 //    left byte-for-byte verbatim; the env.* family blanks (empty string) on a miss.
 //  - JSON output escaping matches JSON.stringify for the additionalContext value.
-//  - {{date}}/{{time}} resolve against a UTC clock here; the Node built-ins use the process
-//    LOCAL timezone. Set TZ=UTC to align the two exactly. This is the one intentional
-//    date/time corner (see the residual RETURN); all other tokens are byte-identical.
+//  - {{date}}/{{time}} resolve in UTC on BOTH runtimes (contract — the Node resolver was
+//    switched to UTC to match this), so output is byte-identical regardless of local timezone.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -40,6 +39,13 @@ const MAX_ROUTES: usize = 64;
 const MAX_STDIN_BYTES: usize = 1024 * 1024;
 const MAX_COUNTER_BYTES: usize = 1024 * 1024;
 const PRUNE_MS: i64 = 7 * 24 * 60 * 60 * 1000; // 604800000
+
+// Counter mkdir-lock (mirrors the Node oracle): makeDir is atomic, so a mkdir race has
+// exactly one winner; hold it across the read/prune/bump/write, then remove it. A lock
+// older than STALE_LOCK_MS is broken (a crashed holder never wedges the counter forever).
+const MAX_LOCK_WAIT_MS: i64 = 2000;
+const LOCK_RETRY_MS: i64 = 10;
+const STALE_LOCK_MS: i64 = 5000;
 
 const SUPPORTED_EVENTS = [_][]const u8{ "UserPromptSubmit", "SessionStart", "PreToolUse", "PostToolUse" };
 const SESSION_PHASES = [_][]const u8{ "startup", "resume", "clear", "compact" };
@@ -93,30 +99,38 @@ fn run(io: Io, env: *std.process.Environ.Map) !void {
     }
     if (selected.items.len == 0) return;
 
-    // ---- bump each selected route's per-route counter; collect the ones now due ----
-    const now = Io.Clock.real.now(io).toMilliseconds();
-    var counters = readCounters(io, counter_path);
-    pruneCounters(&counters, now);
-
+    // ---- bump each selected route's per-route counter under the mkdir lock; collect the
+    // ones now due. The lock guards ONLY the read/prune/bump/write (as in the oracle) and is
+    // released before the doc reads. Fail-open: if the lock can't be acquired, inject nothing.
+    const counter_lock_path = try std.fmt.allocPrint(A, "{s}.lock", .{counter_path});
+    if (!acquireCounterLock(io, counter_lock_path)) return;
     var due: std.ArrayList(*const Route) = .empty;
-    for (selected.items) |r| {
-        const key = try std.fmt.allocPrint(A, "{s}:{s}", .{ sid, r.id });
-        const prev: i64 = blk: {
-            if (counters.getPtr(key)) |e| {
-                if (e.has_count) break :blk e.count;
-            }
-            break :blk 0;
-        };
-        const count = prev + 1;
-        try counters.put(key, .{ .count = count, .ts = now, .has_count = true, .ts_is_num = true });
-        if (r.freq != 0 and @mod(count, r.freq) == 0) try due.append(A, r);
+    {
+        const now = Io.Clock.real.now(io).toMilliseconds();
+        var counters = readCounters(io, counter_path);
+        pruneCounters(&counters, now);
+        for (selected.items) |r| {
+            const key = std.fmt.allocPrint(A, "{s}:{s}", .{ sid, r.id }) catch continue;
+            const prev: i64 = blk: {
+                if (counters.getPtr(key)) |e| {
+                    if (e.has_count) break :blk e.count;
+                }
+                break :blk 0;
+            };
+            const count = prev + 1;
+            counters.put(key, .{ .count = count, .ts = now, .has_count = true, .ts_is_num = true }) catch {};
+            if (r.freq != 0 and @mod(count, r.freq) == 0) due.append(A, r) catch {};
+        }
+        writeCounters(io, counter_path, &counters) catch {};
     }
-    writeCounters(io, counter_path, &counters) catch {};
+    releaseCounterLock(io, counter_lock_path);
 
     if (due.items.len == 0) return;
 
     // ---- read due docs, template, apply the combined-context cap, emit in config order ----
-    const dt = utcDateTime(now);
+    // Fresh clock snapshot for templating (the oracle also reads the clock again here, after
+    // the counter section, for {{date}}/{{time}}).
+    const dt = utcDateTime(Io.Clock.real.now(io).toMilliseconds());
     var bodies: std.ArrayList([]const u8) = .empty;
     var sum_units: usize = 0; // running sum of UTF-16 lengths of pushed bodies
     for (due.items) |r| {
@@ -490,6 +504,31 @@ fn isSymlink(io: Io, path: []const u8) bool {
     return st.kind == .sym_link;
 }
 
+// Acquire the counter mkdir-lock, mirroring the oracle: spin (bounded by MAX_LOCK_WAIT_MS,
+// LOCK_RETRY_MS between tries) on createDir; makeDir is atomic so exactly one racer wins.
+// A PathAlreadyExists whose dir is older than STALE_LOCK_MS is broken and retried; any other
+// createDir error gives up. Returns false when the lock can't be taken (caller injects nothing).
+fn acquireCounterLock(io: Io, lock_path: []const u8) bool {
+    const start = Io.Clock.real.now(io).toMilliseconds();
+    while ((Io.Clock.real.now(io).toMilliseconds() - start) <= MAX_LOCK_WAIT_MS) {
+        if (std.Io.Dir.cwd().createDir(io, lock_path, .default_dir)) |_| {
+            return true;
+        } else |err| {
+            if (err != error.PathAlreadyExists) return false;
+            if (std.Io.Dir.cwd().statFile(io, lock_path, .{ .follow_symlinks = false })) |st| {
+                const age = Io.Clock.real.now(io).toMilliseconds() - st.mtime.toMilliseconds();
+                if (age > STALE_LOCK_MS) std.Io.Dir.cwd().deleteDir(io, lock_path) catch {};
+            } else |_| {}
+            io.sleep(Io.Duration.fromMilliseconds(LOCK_RETRY_MS), .real) catch {};
+        }
+    }
+    return false;
+}
+
+fn releaseCounterLock(io: Io, lock_path: []const u8) void {
+    std.Io.Dir.cwd().deleteDir(io, lock_path) catch {};
+}
+
 fn readCounters(io: Io, path: []const u8) Counters {
     var c = Counters.init();
     if (isSymlink(io, path)) return c; // refuse to read through a planted symlink
@@ -682,8 +721,8 @@ fn utf16Len(s: []const u8) usize {
     return n;
 }
 
-// UTC calendar date/time from Unix ms. Node's built-ins use LOCAL time; set TZ=UTC to
-// align. (See the file header — the one intentional date/time parity corner.)
+// UTC calendar date/time from Unix ms — the {{date}}/{{time}} contract is UTC on both
+// runtimes (the Node resolver matches this).
 fn utcDateTime(now_ms: i64) DateTime {
     const secs = @divFloor(now_ms, 1000);
     const days = @divFloor(secs, 86400);
