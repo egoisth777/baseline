@@ -1,5 +1,9 @@
 {
-  "$comment": "PROVISIONAL Node-path budgets seeded from the first bench runs (win32, 2026-07-02). latencyP95Ms: baseline-node p95 ~38-42 ms, pinned generously at 150 ms so it never flakes across machines (cold-start timing is noisy; bench:check is not part of `npm test`). peakRssBytes: a Node-path near-peak RSS ceiling — measured ref-node self-report ~47 MiB, pinned generously at 256 MiB so it never flakes across machines/Node versions. Both are NODE-PATH numbers. TODO: pin the FINAL latency + RSS budgets after the native engine (R-009) lands (that final-budget task is a separate unchecked box in R-014). Where peak RSS is not obtainable (e.g. baseline-node on Windows via /usr/bin/time), that gate skips-with-notice — never a false green.",
+  "$comment": "Two-tier budgets (win32 baseline, 2026-07-02). Top-level = the DEFAULT (Node) runtime floor, which is what v1 installs by default and what testDispatchRssWithinCeiling enforces: latencyP95Ms 150 (baseline-node p95 ~37-40 ms, pinned generously so cold-start noise never flakes); peakRssBytes 256 MiB (ref-node ##RSS self-report ~47 MiB, generous). `native` = the R-009 hot-path target (decision #18), pinned from measurement and enforced by `npm run bench:check`: latencyP95Ms 60 (baseline-native p95 ~5-10 ms, ~8x headroom — catches a regression toward Node speed without flaking); peakRssBytes 32 MiB (a small static Zig binary's peak RSS is a few MiB, far below the Node path). Native RSS is measured via the impl's /usr/bin/time peak on POSIX/CI and is n/a on Windows (no portable child-peak-RSS probe) — the native RSS gate skips-with-notice there, never a false green. This EXTENDS the provisional Node-path pin rather than replacing it (the Node floor still guards the default runtime).",
   "latencyP95Ms": 150,
-  "peakRssBytes": 268435456
+  "peakRssBytes": 268435456,
+  "native": {
+    "latencyP95Ms": 60,
+    "peakRssBytes": 33554432
+  }
 }

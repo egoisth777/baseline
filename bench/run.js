@@ -240,6 +240,30 @@ function enforceBudgets(results) {
   } else {
     process.stdout.write('bench:check RSS budget not pinned yet (TODO after native engine); skipping RSS gate.\n');
   }
+
+  // Native hot-path budgets (R-009, decision #18). Enforced where the native lane ran and
+  // its numbers are obtainable; skip-with-notice when the lane skipped (no prebuilt for this
+  // platform) or its peak RSS is n/a (e.g. Windows) — never a false green.
+  const native = results.find((r) => r.name === 'baseline-native');
+  const nb = budgets.native;
+  if (nb && native && !native.skipped && !native.error) {
+    if (nb.latencyP95Ms != null && native.p95 != null) {
+      const ok = native.p95 <= nb.latencyP95Ms;
+      process.stdout.write('bench:check native latency p95 ' + native.p95.toFixed(1) + ' ms vs budget ' + nb.latencyP95Ms + ' ms — ' + (ok ? 'OK' : 'BREACH') + '\n');
+      if (!ok) bad = true;
+    }
+    if (nb.peakRssBytes != null) {
+      if (native.rssBytes == null) {
+        process.stdout.write('bench:check native peak RSS not measurable on this platform; skipping native RSS gate (never a false green).\n');
+      } else {
+        const ok = native.rssBytes <= nb.peakRssBytes;
+        process.stdout.write('bench:check native peak RSS ' + (native.rssBytes / 1048576).toFixed(1) + ' MiB vs budget ' + (nb.peakRssBytes / 1048576).toFixed(1) + ' MiB — ' + (ok ? 'OK' : 'BREACH') + '\n');
+        if (!ok) bad = true;
+      }
+    }
+  } else if (nb) {
+    process.stdout.write('bench:check native lane not measured here (no prebuilt for this platform); skipping native gates.\n');
+  }
   return bad ? 1 : 0;
 }
 
