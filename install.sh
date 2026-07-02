@@ -17,14 +17,6 @@ if ! command -v node >/dev/null 2>&1; then
 	exit 1
 fi
 
-# Zig is only needed when building from source. Warn early, but keep going.
-if [[ " $* " == *" --build "* ]]; then
-	if ! command -v zig >/dev/null 2>&1; then
-		echo "Error: Zig was not found, so --build cannot compile from source." >&2
-		exit 1
-	fi
-fi
-
 node "$SCRIPT_DIR/scripts/manage.js" install "$@"
 
 echo

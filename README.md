@@ -55,21 +55,21 @@ bash install.sh
 
 Both delegate to `node scripts/manage.js install`, which:
 1. Deploys the canonical dispatcher and shared runtime contracts to the **install root** (`BASELINE_HOME`, else `~/.baseline`), at `~/.baseline/hooks/baseline-recital.js` and `~/.baseline/hooks/contracts.js`.
-2. Establishes the **config folder** — your routes + docs (`config.json` + `docs/`). It lives wherever you point `BASELINE_CFG` (else `~/.baseline/cfg`); when `BASELINE_CFG` is set, `~/.baseline/cfg` is a symlink to it. If empty, it is seeded from a repo **preset** — `default` by plain install (`--preset minimal` for the neutral floor).
-3. **Links** each agent's config dir back into the install root — for example `~/.claude/hooks/baseline-recital.js` + `~/.claude/hooks/contracts.js` and `~/.codex/hooks/baseline-recital.js` + `~/.codex/hooks/contracts.js` → the install-root hook artifacts, with each agent's `cfg/baseline/` → `~/.baseline/cfg` (your config folder).
+2. Establishes the **config folder** — your routes + docs (`config.json` + `docs/`). It lives wherever you point `BASELINE_CFG` (else `<install root>/cfg`); when `BASELINE_CFG` is set, `<install root>/cfg` is a symlink to it. If empty, it is seeded from a repo **preset** — `default` by plain install (`--preset minimal` for the neutral floor).
+3. **Links** each agent's config dir back into the install root — for example `~/.claude/hooks/baseline-recital.js` + `~/.claude/hooks/contracts.js` and `~/.codex/hooks/baseline-recital.js` + `~/.codex/hooks/contracts.js` → the install-root hook artifacts, with each agent's `cfg/baseline/` → `<install root>/cfg` (your config folder).
 4. Deploys the installed control-surface payload. Claude gets the skills-dir plugin as `baseline@skills-dir`; Codex gets the plugin cache at `$CODEX_HOME/plugins/cache/baseline/baseline/local` plus `[plugins."baseline@baseline"]` in `$CODEX_HOME/config.toml`. Control-surface plugins carry **no hooks** — they only make baseline discoverable, not active.
 5. Wires Claude Code `~/.claude/settings.json` and Codex `~/.codex/hooks.json` for **exactly** the events the config's routes use, and unwires events no route references.
 
-When `status` reports a symlink, editing your config folder (`BASELINE_CFG`, else `~/.baseline/cfg`) changes live behavior for every wired agent at once. On Windows without symlink privilege the link layer degrades to a hardlink (dispatcher/contracts) or a plain copy (config folder and skill/plugin payloads); `status`/`doctor` report which mechanism is in effect, and a copy needs a reinstall/update after edits.
+When `status` reports a symlink, editing your config folder (`BASELINE_CFG`, else `<install root>/cfg`) changes live behavior for every wired agent at once. On Windows without symlink privilege the link layer degrades to a hardlink (dispatcher/contracts) or a plain copy (config folder and skill/plugin payloads); `status`/`doctor` report which mechanism is in effect, and a copy needs a reinstall/update after edits.
 
-The **install root** (regenerable artifacts: dispatcher + skill payload) is `~/.baseline` by default; override it with `BASELINE_HOME`. The **config folder** (your routes + docs) defaults to `~/.baseline/cfg`, or set `BASELINE_CFG` to keep it anywhere — e.g. a version-controlled dotfiles repo — in which case `~/.baseline/cfg` becomes a symlink to it. Config and artifacts never share a directory. Claude's config dir comes from `CLAUDE_CONFIG_DIR` or `~/.claude`; Codex's comes from `CODEX_HOME` or `~/.codex`. After install, open `/hooks` in each agent once (or restart) so hook config reloads.
+The **install root** (regenerable artifacts: dispatcher + skill payload) is `~/.baseline` by default; override it with `BASELINE_HOME`. The **config folder** (your routes + docs) defaults to `<install root>/cfg`, or set `BASELINE_CFG` to keep it anywhere — e.g. a version-controlled dotfiles repo — in which case `<install root>/cfg` becomes a symlink to it. Config and artifacts never share a directory. Claude's config dir comes from `CLAUDE_CONFIG_DIR` or `~/.claude`; Codex's comes from `CODEX_HOME` or `~/.codex`. After install, open `/hooks` in each agent once (or restart) so hook config reloads.
 
 ## The config folder (the everyday task)
 
-Everything you tune lives in your config folder — `BASELINE_CFG` if set, else `~/.baseline/cfg`:
+Everything you tune lives in your config folder — `BASELINE_CFG` if set, else `<install root>/cfg`:
 
 ```text
-<config folder>/   # BASELINE_CFG, else ~/.baseline/cfg
+<config folder>/   # BASELINE_CFG, else <install root>/cfg
   config.json     # routes: when/where/how-often/which doc
   docs/           # the verbatim text each route injects
     baseline.md
@@ -175,8 +175,8 @@ baseline/
 ├── resources/
 │   ├── logo.png                 # Repository image / preview source
 │   ├── logo.svg                 # Scalable logo source
-│   ├── logo.txt                 # Plain text ASM logo
-│   └── logo.ans                 # ANSI ASM logo
+│   ├── logo.txt                 # Plain text ASCII logo
+│   └── logo.ans                 # ANSI ASCII logo
 ├── .arca/baseline-sp/goal/      # Canonical goal docs: vision.md, architecture.md, vocabulary.md, plain.md
 ├── .claude-plugin/plugin.json   # Claude plugin manifest (skill-only; deployed as baseline@skills-dir)
 ├── .codex-plugin/plugin.json    # Codex plugin manifest

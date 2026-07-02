@@ -1,6 +1,5 @@
 #Requires -Version 5.1
 param(
-	[switch]$build,
 	[Parameter(ValueFromRemainingArguments = $true)]
 	[string[]]$RemainingArgs
 )
@@ -19,9 +18,6 @@ if (-not $node) {
 
 $manage = Join-Path $root "scripts\manage.js"
 $forwardArgs = @()
-if ($build) {
-	$forwardArgs += "--build"
-}
 if ($RemainingArgs) {
 	$forwardArgs += $RemainingArgs
 }

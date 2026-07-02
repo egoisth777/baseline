@@ -963,6 +963,17 @@ function testPresetsAreValid() {
         assert.ok(!cfg.routes.some((r) => /README/.test(r.doc)), preset + ' must not route the README');
     }
 }
+// R-006 (goal decision #13): the minimal preset is the neutral, project-agnostic
+// guardrail floor — no personal branding, no recital opener, and not a near-copy of
+// the curated default preset doc. testPresetsAreValid covers only JSON/route shape.
+function testMinimalPresetIsNeutral() {
+    const minimal = fs.readFileSync(path.join(root, 'presets', 'minimal', 'docs', 'baseline.md'), 'utf8');
+    const dflt = fs.readFileSync(path.join(root, 'presets', 'default', 'docs', 'baseline.md'), 'utf8');
+    assert.ok(!minimal.includes('LI BASELINE'), 'minimal preset doc must not carry the personal "LI BASELINE" marker');
+    assert.ok(!minimal.includes('LI BASELINE ALIGNED:'), 'minimal preset doc must not use the personal recital opener');
+    const normalize = (s) => s.replace(/\s+/g, ' ').trim();
+    assert.notStrictEqual(normalize(minimal), normalize(dflt), 'minimal preset doc must not be near-identical to the default preset doc');
+}
 function testBrandAssetsAndReadme() {
     for (const name of ['logo.png', 'logo.svg', 'logo.txt', 'logo.ans']) {
         assert.ok(fs.existsSync(path.join(root, 'resources', name)), 'missing resource asset: ' + name);
@@ -977,6 +988,9 @@ function testBrandAssetsAndReadme() {
     assert.match(readme, /resources\/logo\.ans/);
     assert.match(readme, /resources\/logo\.txt/);
     assert.ok(!readme.includes(oldPrefix), 'README still references old resource asset names');
+    // R-007 (I-006): the text/ANSI logos are ASCII, not "ASM".
+    assert.ok(!readme.includes('ASM logo'), 'README must not call the logos "ASM" (typo for ASCII)');
+    assert.match(readme, /ASCII logo/, 'README should describe the ASCII logos');
 }
 function testDocsDescribeRoutesModel() {
     const readme = fs.readFileSync(path.join(root, 'README.md'), 'utf8');
@@ -991,6 +1005,38 @@ function testDocsDescribeRoutesModel() {
         assert.match(text, /cfg\/baseline/, name + ' should describe the cfg/baseline config folder');
         assert.match(text, /config\.json/, name + ' should mention config.json');
         assert.match(text, /route/i, name + ' should describe routes');
+    }
+}
+// R-005 (goal decision #12): install wrappers expose only flags the manager accepts.
+// The paused native runtime (--build/--runtime) must not surface in the install path;
+// parseInstallOpts in src/manage.ts still rejects it as the backstop.
+function testInstallWrappersHaveNoBuildFlag() {
+    const sh = fs.readFileSync(path.join(root, 'install.sh'), 'utf8');
+    const ps1 = fs.readFileSync(path.join(root, 'install.ps1'), 'utf8');
+    for (const [name, text] of [['install.sh', sh], ['install.ps1', ps1]]) {
+        assert.ok(!text.includes('--build'), name + ' must not advertise --build');
+        assert.ok(!text.includes('-build'), name + ' must not advertise -build');
+        assert.ok(!text.includes('--runtime'), name + ' must not advertise --runtime');
+    }
+    assert.ok(!ps1.includes('[switch]$build'), 'install.ps1 must not declare a -build switch');
+    // Wrappers still forward the install invocation to the Node manager.
+    assert.ok(sh.includes('install "$@"'), 'install.sh must still forward install "$@" to the manager');
+    assert.ok(ps1.includes('$RemainingArgs'), 'install.ps1 must still forward $RemainingArgs to the manager');
+}
+// R-007 (goal decision #14): one canonical phrasing states the config-folder default
+// everywhere in docs and generated control-surface text — README, both SKILL docs, and
+// the generated skill text use <install root>/cfg, and none reverts to the divergent
+// bare ~/.baseline/cfg form.
+function testCfgLocationPhrasingIsCanonical() {
+    const sources = [
+        ['root SKILL.md', fs.readFileSync(path.join(root, 'SKILL.md'), 'utf8')],
+        ['skills/baseline/SKILL.md', fs.readFileSync(path.join(root, 'skills', 'baseline', 'SKILL.md'), 'utf8')],
+        ['src/manage.ts', fs.readFileSync(path.join(root, 'src', 'manage.ts'), 'utf8')],
+        ['README.md', fs.readFileSync(path.join(root, 'README.md'), 'utf8')],
+    ];
+    for (const [name, text] of sources) {
+        assert.ok(text.includes('<install root>/cfg'), name + ' must state the config folder as <install root>/cfg');
+        assert.ok(!text.includes('~/.baseline/cfg'), name + ' must not use the divergent bare ~/.baseline/cfg form');
     }
 }
 function testCodexPluginManifest() {
@@ -1358,10 +1404,13 @@ const TESTS = [
     ['testExternalConfigLocation', testExternalConfigLocation],
     ['testChecksumsMatchBinaries', testChecksumsMatchBinaries],
     ['testPresetsAreValid', testPresetsAreValid],
+    ['testMinimalPresetIsNeutral', testMinimalPresetIsNeutral],
     ['testBrandAssetsAndReadme', testBrandAssetsAndReadme],
     ['testDocsDescribeRoutesModel', testDocsDescribeRoutesModel],
+    ['testCfgLocationPhrasingIsCanonical', testCfgLocationPhrasingIsCanonical],
     ['testCodexPluginManifest', testCodexPluginManifest],
     ['testShellWrappersExecutable', testShellWrappersExecutable],
+    ['testInstallWrappersHaveNoBuildFlag', testInstallWrappersHaveNoBuildFlag],
     // guided agent selection (R-004)
     ['testAgentsFlagSelectsSubset', testAgentsFlagSelectsSubset],
     ['testAgentsFlagBothExplicit', testAgentsFlagBothExplicit],

@@ -5,7 +5,7 @@ description: >-
   asks to view, edit, add, or remove baseline docs or routes; change a baseline
   injection event, frequency, or cwd scope; install, verify, check
   status, repair, or uninstall the baseline hook; or manage the baseline config
-  folder (BASELINE_CFG, else ~/.baseline/cfg).
+  folder — BASELINE_CFG, else <install root>/cfg (default install root ~/.baseline).
 ---
 
 # baseline
