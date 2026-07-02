@@ -4,6 +4,7 @@ import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
 import * as crypto from 'crypto';
+import { builtinModules } from 'module';
 import { spawnSync } from 'child_process';
 
 const root = path.resolve(__dirname, '..');
@@ -1207,6 +1208,44 @@ function testChecksumsMatchBinaries(): void {
   }
 }
 
+// R-014 (goal decision #21): zero runtime dependencies is a guarded contract, not a
+// hope. Assert package.json declares none, and that src/ + scripts/ import/require only
+// Node built-ins or in-repo relative paths — never a bare third-party specifier.
+function testNoRuntimeDependencies(): void {
+  const pkg = JSON.parse(fs.readFileSync(path.join(root, 'package.json'), 'utf8'));
+  const deps = pkg.dependencies;
+  assert.ok(
+    deps === undefined || (deps && typeof deps === 'object' && !Array.isArray(deps) && Object.keys(deps).length === 0),
+    'package.json must declare no runtime dependencies (found ' + JSON.stringify(deps) + ')');
+
+  const builtins = new Set(builtinModules);
+  const allowed = (spec: string): boolean => {
+    if (spec.startsWith('./') || spec.startsWith('../')) return true; // in-repo relative
+    const bare = spec.startsWith('node:') ? spec.slice(5) : spec;
+    return builtins.has(bare) || builtins.has(bare.split('/')[0]);
+  };
+  const specifiers = (text: string, res: RegExp[]): string[] => {
+    const code = text.replace(/\/\*[\s\S]*?\*\//g, ' ').replace(/\/\/[^\n]*/g, ' '); // drop comments
+    const out: string[] = [];
+    for (const re of res) {
+      const r = new RegExp(re.source, 'g');
+      let m: RegExpExecArray | null;
+      while ((m = r.exec(code)) !== null) out.push(m[m.length - 1]);
+    }
+    return out;
+  };
+  const scan = (dir: string, ext: string, res: RegExp[]): void => {
+    for (const f of fs.readdirSync(dir)) {
+      if (!f.endsWith(ext)) continue;
+      for (const spec of specifiers(fs.readFileSync(path.join(dir, f), 'utf8'), res)) {
+        assert.ok(allowed(spec), path.join(dir, f) + ' imports a non-builtin, non-relative module "' + spec + '"');
+      }
+    }
+  };
+  scan(path.join(root, 'src'), '.ts', [/\bfrom\s+['"]([^'"]+)['"]/, /\bimport\s+['"]([^'"]+)['"]/]);
+  scan(path.join(root, 'scripts'), '.js', [/\brequire\(\s*['"]([^'"]+)['"]\s*\)/]);
+}
+
 function testPresetsAreValid(): void {
   for (const preset of ['minimal', 'default']) {
     const cfgPath = path.join(root, 'presets', preset, 'config.json');
@@ -1759,6 +1798,7 @@ const TESTS: Array<[string, () => void]> = [
   ['testClaudePluginManifest', testClaudePluginManifest],
   ['testExternalConfigLocation', testExternalConfigLocation],
   ['testChecksumsMatchBinaries', testChecksumsMatchBinaries],
+  ['testNoRuntimeDependencies', testNoRuntimeDependencies],
   ['testPresetsAreValid', testPresetsAreValid],
   ['testMinimalPresetIsNeutral', testMinimalPresetIsNeutral],
   ['testBrandAssetsAndReadme', testBrandAssetsAndReadme],

@@ -36,6 +36,7 @@ Supported injecting events: `UserPromptSubmit`, `SessionStart` (optionally a lif
 
 - **Claude Code or Codex** — the agent harness
 - **Node.js** — runs the installer/manager and the dispatcher
+- **Zero runtime dependencies** — the dispatcher and manager import only the Node standard library (enforced by a regression test); TypeScript is a dev-only build dependency.
 
 **Platforms:** the wired v1 dispatcher is Node-only and works anywhere the target agent and Node.js work. A verified Zig native artifact exists but is paused/not wired; Rust is the future native CLI/dispatcher target.
 
