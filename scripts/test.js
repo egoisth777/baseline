@@ -1626,6 +1626,44 @@ function testBenchHarnessSmoke() {
     // Optional impls must appear as entries (ok or skipped) — never silently dropped.
     assert.ok('ref-python' in byName && 'ref-ts' in byName, 'optional impls are reported (ok or skipped, not absent)');
 }
+// R-014 (goal decision #21): a peak-RSS ceiling for a single dispatch, wired to the
+// benchmark's measured budget. Skips with a notice (never a false green) when the RSS
+// budget is not pinned, or when this platform cannot measure peak RSS. The ceiling gets
+// pinned once the native engine lands / on a platform where /usr/bin/time is available.
+function testDispatchRssWithinCeiling() {
+    const budgets = JSON.parse(fs.readFileSync(path.join(root, 'bench', 'budgets.json'), 'utf8'));
+    const ceiling = budgets.peakRssBytes;
+    if (ceiling === null || ceiling === undefined) {
+        console.log('  (skip) testDispatchRssWithinCeiling: RSS budget not pinned yet (TODO after native engine) — not asserting.');
+        return;
+    }
+    if (process.platform === 'win32') {
+        console.log('  (skip) testDispatchRssWithinCeiling: peak RSS is not measurable on win32 — not asserting.');
+        return;
+    }
+    const cfg = tempConfig();
+    const home = homeFor(cfg);
+    assert.strictEqual(run(['install'], cfg).status, 0);
+    const input = JSON.stringify({ session_id: 'rss', hook_event_name: 'UserPromptSubmit', cwd: cfg });
+    const env = Object.assign({}, process.env, { CLAUDE_CONFIG_DIR: cfg, CODEX_HOME: codexFor(cfg), BASELINE_HOME: home });
+    let rssBytes = null;
+    for (const v of [{ pre: ['-v'], re: /Maximum resident set size \(kbytes\):\s*(\d+)/, scale: 1024 },
+        { pre: ['-l'], re: /(\d+)\s+maximum resident set size/, scale: 1 }]) {
+        const r = (0, child_process_1.spawnSync)('/usr/bin/time', v.pre.concat([process.execPath, dispatcher]), { input, encoding: 'utf8', env });
+        if (!r.error) {
+            const m = (r.stderr || '').match(v.re);
+            if (m) {
+                rssBytes = Number(m[1]) * v.scale;
+                break;
+            }
+        }
+    }
+    if (rssBytes === null) {
+        console.log('  (skip) testDispatchRssWithinCeiling: /usr/bin/time unavailable — not asserting.');
+        return;
+    }
+    assert.ok(rssBytes <= ceiling, 'dispatch peak RSS ' + rssBytes + ' bytes exceeds ceiling ' + ceiling + ' bytes');
+}
 // --- runner -----------------------------------------------------------------
 const TESTS = [
     ['testCentralInstallAndAgentLinks', testCentralInstallAndAgentLinks],
@@ -1692,6 +1730,7 @@ const TESTS = [
     ['testJsonDispatchSimulate', testJsonDispatchSimulate],
     ['testJsonErrorPathExitCode', testJsonErrorPathExitCode],
     ['testBenchHarnessSmoke', testBenchHarnessSmoke],
+    ['testDispatchRssWithinCeiling', testDispatchRssWithinCeiling],
     ['testPresetsAreValid', testPresetsAreValid],
     ['testMinimalPresetIsNeutral', testMinimalPresetIsNeutral],
     ['testBrandAssetsAndReadme', testBrandAssetsAndReadme],
