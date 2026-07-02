@@ -127,14 +127,20 @@ fn run(io: Io, env: *std.process.Environ.Map) !void {
 
     if (due.items.len == 0) return;
 
-    // ---- read due docs, template, apply the combined-context cap, emit in config order ----
+    // ---- read due docs CONCURRENTLY, then template + apply the combined-context cap and emit
+    // in config routes[] order ---- The reads run on the Io's worker threads (R-011, mirroring
+    // the Node Promise.all); templating stays on this thread after they join, so the output
+    // order is deterministic regardless of which read finishes first.
     // Fresh clock snapshot for templating (the oracle also reads the clock again here, after
     // the counter section, for {{date}}/{{time}}).
     const dt = utcDateTime(Io.Clock.real.now(io).toMilliseconds());
+    const raws = readDueDocsConcurrent(io, due.items, cfg_dir);
+
     var bodies: std.ArrayList([]const u8) = .empty;
     var sum_units: usize = 0; // running sum of UTF-16 lengths of pushed bodies
-    for (due.items) |r| {
-        const raw = readDoc(io, r.doc, cfg_dir) orelse continue;
+    for (due.items, 0..) |r, i| {
+        if (i >= raws.len) break;
+        const raw = raws[i] orelse continue;
         const merged = mergeVars(cfg.vars, r.vars);
         const body = applyTemplate(raw, merged, event, data_cwd orelse "", homedir(env) orelse "", dt, env) catch continue;
         const body_units = utf16Len(body);
@@ -620,15 +626,37 @@ fn fmtInt(out: *std.ArrayList(u8), v: i64) !void {
 }
 
 // ---------------------------------------------------------------------------
-// doc read (path-safe, byte + char capped). Returns the verbatim body or null to skip.
-fn readDoc(io: Io, doc: []const u8, cfg_dir: []const u8) ?[]const u8 {
-    const p = safeDocPath(doc, cfg_dir) orelse return null;
-    // Never follow a doc symlink out of the config folder (the realpath-containment guard's
-    // native form): a symlinked doc file is skipped rather than read through.
-    if (isSymlink(io, p)) return null;
-    const body = std.Io.Dir.cwd().readFileAlloc(io, p, A, .limited(MAX_DOC_BYTES)) catch return null;
-    if (utf16Len(body) > MAX_DOC_CHARS) return null;
-    return body;
+// doc read (path-safe, byte + char capped). One worker per due doc, run concurrently on the
+// Io's worker threads. Reads use the THREAD-SAFE page allocator so the workers never touch the
+// run's (non-threadsafe) arena; the verbatim body is stored in `slot` or left null to skip.
+fn readDocWorker(io: Io, path: []const u8, slot: *?[]const u8) void {
+    const body = std.Io.Dir.cwd().readFileAlloc(io, path, std.heap.page_allocator, .limited(MAX_DOC_BYTES)) catch return;
+    if (utf16Len(body) > MAX_DOC_CHARS) return;
+    slot.* = body;
+}
+
+// Read every due route's doc CONCURRENTLY (mirrors the Node Promise.all), returning the
+// verbatim bodies indexed by due[] position (null = missing/oversize/skipped). Path-safety
+// (lexical containment + no symlink escape) is validated on THIS thread first; the reads then
+// run via Io.Group.concurrent on the Io's worker pool. If a task can't be spawned concurrently
+// (concurrency limit), it falls back to an inline read — output is identical either way.
+fn readDueDocsConcurrent(io: Io, due: []const *const Route, cfg_dir: []const u8) []?[]const u8 {
+    const n = due.len;
+    const raws = A.alloc(?[]const u8, n) catch return &[_]?[]const u8{};
+    @memset(raws, null);
+    const paths = A.alloc(?[]const u8, n) catch return raws;
+    for (due, 0..) |r, i| {
+        const p = safeDocPath(r.doc, cfg_dir);
+        // Never follow a doc symlink out of the config folder (native realpath-guard form).
+        paths[i] = if (p) |pp| (if (isSymlink(io, pp)) null else pp) else null;
+    }
+    var group: Io.Group = .init;
+    for (paths, 0..) |mp, i| {
+        const p = mp orelse continue;
+        group.concurrent(io, readDocWorker, .{ io, p, &raws[i] }) catch readDocWorker(io, p, &raws[i]);
+    }
+    group.await(io) catch {};
+    return raws;
 }
 
 // ---------------------------------------------------------------------------
