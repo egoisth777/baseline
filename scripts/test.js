@@ -8,6 +8,7 @@ const path = require("path");
 const crypto = require("crypto");
 const module_1 = require("module");
 const child_process_1 = require("child_process");
+const contracts_1 = require("./contracts");
 const root = path.resolve(__dirname, '..');
 const manage = path.join(root, 'scripts', 'manage.js');
 const dispatcher = path.join(root, 'scripts', 'baseline-recital.js');
@@ -601,6 +602,59 @@ function testEventNameSemantics() {
     // cwd scope: only under the path.
     assert.ok(fireBodies(hook({ session_id: 's4', hook_event_name: 'UserPromptSubmit', cwd: path.join(scoped, 'sub') }, cfg))?.includes('SCOPED'), 'scoped route should fire under its cwd');
     assert.ok(!fireBodies(hook({ session_id: 's5', hook_event_name: 'UserPromptSubmit', cwd: path.join(cfg, 'elsewhere') }, cfg))?.includes('SCOPED'), 'scoped route should not fire outside its cwd');
+}
+// --- {{name}} templating (R-010) -------------------------------------------
+// Fixed-clock context helper so date/time assertions are deterministic.
+function tmplCtx(over) {
+    return Object.assign({ event: 'UserPromptSubmit', cwd: '/work/proj', home: '/home/dev', now: new Date(2026, 0, 9, 4, 7), env: {}, vars: {} }, over);
+}
+function testTemplateResolvesBuiltinsAndVars() {
+    const ctx = tmplCtx({ env: { FOO: 'bar' }, vars: { greeting: 'hello', name: 'Ada' } });
+    const body = 'ev={{event}} cwd={{cwd}} home={{home}} date={{date}} time={{time}} env={{env.FOO}} g={{greeting}} n={{name}}';
+    assert.strictEqual((0, contracts_1.applyTemplate)(body, ctx), 'ev=UserPromptSubmit cwd=/work/proj home=/home/dev date=2026-01-09 time=04:07 env=bar g=hello n=Ada');
+    // Surrounding whitespace inside the braces is trimmed.
+    assert.strictEqual((0, contracts_1.applyTemplate)('{{ event }}', ctx), 'UserPromptSubmit');
+    // env.* miss resolves to empty string (it is a built-in family), not verbatim.
+    assert.strictEqual((0, contracts_1.applyTemplate)('x={{env.NOPE}}y', ctx), 'x=y');
+}
+function testTemplatePerRouteOverrideOrder() {
+    // route vars > config vars.
+    assert.deepStrictEqual((0, contracts_1.mergeVars)({ scope: 'global', keep: 'cfg' }, { scope: 'route' }), { scope: 'route', keep: 'cfg' }, 'route vars must override config vars');
+    // user vars > built-ins: a var named 'event' shadows the hook-event built-in, and a
+    // route-level 'event' wins over a config-level 'event'.
+    const merged = (0, contracts_1.mergeVars)({ event: 'CFG' }, { event: 'ROUTE' });
+    assert.strictEqual((0, contracts_1.applyTemplate)('{{event}}', tmplCtx({ vars: merged })), 'ROUTE', 'route var must win over config var and the built-in');
+    // with no override the built-in resolves.
+    assert.strictEqual((0, contracts_1.applyTemplate)('{{event}}', tmplCtx({ vars: {} })), 'UserPromptSubmit');
+}
+function testTemplateUnknownPlaceholderVerbatim() {
+    const ctx = tmplCtx({ vars: { known: 'K' } });
+    assert.strictEqual((0, contracts_1.applyTemplate)('a {{unknown}} b', ctx), 'a {{unknown}} b');
+    assert.strictEqual((0, contracts_1.applyTemplate)('{{known}}/{{missing}}', ctx), 'K/{{missing}}');
+    // Non-env dotted unknown stays verbatim; only the env.* family blanks on miss.
+    assert.strictEqual((0, contracts_1.applyTemplate)('{{foo.bar}}', ctx), '{{foo.bar}}');
+    // Stray/empty braces are not valid tokens and are left untouched (no escaping syntax).
+    assert.strictEqual((0, contracts_1.applyTemplate)('{{}} {{ }} {{no token here}}', ctx), '{{}} {{ }} {{no token here}}');
+}
+// e2e: drive the real deployed dispatcher with a placeholder doc, config-level vars, and
+// a per-route var override; assert built-ins resolve, route vars beat config vars, and an
+// unknown placeholder is injected verbatim.
+function testTemplateDispatchEndToEnd() {
+    const cfg = tempConfig();
+    const home = homeFor(cfg);
+    assert.strictEqual(run(['install'], cfg).status, 0);
+    write(path.join(home, 'cfg', 'config.json'), JSON.stringify({
+        version: 1,
+        vars: { greeting: 'hello', who: 'config' },
+        routes: [{ id: 'tmpl', event: 'UserPromptSubmit', freq: 1, doc: 'docs/tmpl.md', vars: { who: 'route' } }]
+    }, null, 2));
+    write(path.join(home, 'cfg', 'docs', 'tmpl.md'), 'E={{event}} G={{greeting}} W={{who}} U={{unknown}}\n');
+    const body = fireBodies(hook({ session_id: 'tmpl-sess', hook_event_name: 'UserPromptSubmit', cwd: cfg }, cfg));
+    assert.ok(body, 'templated route should fire');
+    assert.ok(body.includes('E=UserPromptSubmit'), 'built-in {{event}} should resolve: ' + body);
+    assert.ok(body.includes('G=hello'), 'config var {{greeting}} should resolve: ' + body);
+    assert.ok(body.includes('W=route'), 'route var must override config var: ' + body);
+    assert.ok(body.includes('U={{unknown}}'), 'unknown placeholder must stay verbatim: ' + body);
 }
 function testFailOpenMissingConfig() {
     // Point the dispatcher at a config dir with no cfg/baseline at all.
@@ -1464,6 +1518,10 @@ const TESTS = [
     ['testPerRouteCountersIndependent', testPerRouteCountersIndependent],
     ['testMalformedCounterArrayDoesNotBreakFrequency', testMalformedCounterArrayDoesNotBreakFrequency],
     ['testEventNameSemantics', testEventNameSemantics],
+    ['testTemplateResolvesBuiltinsAndVars', testTemplateResolvesBuiltinsAndVars],
+    ['testTemplatePerRouteOverrideOrder', testTemplatePerRouteOverrideOrder],
+    ['testTemplateUnknownPlaceholderVerbatim', testTemplateUnknownPlaceholderVerbatim],
+    ['testTemplateDispatchEndToEnd', testTemplateDispatchEndToEnd],
     ['testFailOpenMissingConfig', testFailOpenMissingConfig],
     ['testMalformedConfigInjectsNothing', testMalformedConfigInjectsNothing],
     ['testBadRouteSkippedOthersFire', testBadRouteSkippedOthersFire],

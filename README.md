@@ -97,6 +97,27 @@ A route is one entry in `config.json` `routes[]`:
 - `doc` — required, path relative to the config folder; must stay inside it.
 - `freq` — optional positive integer, default `1`. Fires when `count % freq == 0`.
 - `cwd` — optional path prefix. Fires only when the session working directory is at or under it.
+- `vars` — optional map of template variable name → string value, overriding any config-level `vars` for this route (see below).
+
+### Placeholders
+
+A doc may contain `{{name}}` placeholders resolved **deterministically at injection time** (in-process — no shell, no model calls, no dynamic file selection):
+
+- **Built-ins:** `{{event}}` (the hook event), `{{cwd}}`, `{{date}}` (`YYYY-MM-DD`), `{{time}}` (`HH:MM`), `{{home}}`, and `{{env.NAME}}` (an environment variable; empty string if unset).
+- **User variables:** an optional config-level `"vars": { "name": "value" }` map, overridable by a per-route `"vars"` map. Precedence is **route vars > config vars > built-ins**.
+- An **unknown** placeholder is left verbatim (no error, no strip). There is no escaping syntax.
+
+```json
+{
+  "version": 1,
+  "vars": { "project": "acme" },
+  "routes": [
+    { "id": "baseline", "event": "UserPromptSubmit", "freq": 5, "doc": "docs/baseline.md", "vars": { "project": "acme-api" } }
+  ]
+}
+```
+
+Configs without `vars` and docs without `{{...}}` are unaffected — they inject byte-for-byte as before.
 
 To add a new injection, copy a pair from `assets/route-templates/` (a doc + its matching route) or ask the plugin to author one. See the `README.md` in your config folder for the runtime caps.
 

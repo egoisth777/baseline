@@ -6,6 +6,7 @@ import * as path from 'path';
 import * as crypto from 'crypto';
 import { builtinModules } from 'module';
 import { spawnSync } from 'child_process';
+import { applyTemplate, mergeVars, TemplateContext, VarMap } from './contracts';
 
 const root = path.resolve(__dirname, '..');
 const manage = path.join(root, 'scripts', 'manage.js');
@@ -742,6 +743,71 @@ function testEventNameSemantics(): void {
     'scoped route should fire under its cwd');
   assert.ok(!fireBodies(hook({ session_id: 's5', hook_event_name: 'UserPromptSubmit', cwd: path.join(cfg, 'elsewhere') }, cfg))?.includes('SCOPED'),
     'scoped route should not fire outside its cwd');
+}
+
+// --- {{name}} templating (R-010) -------------------------------------------
+
+// Fixed-clock context helper so date/time assertions are deterministic.
+function tmplCtx(over: Partial<TemplateContext>): TemplateContext {
+  return Object.assign(
+    { event: 'UserPromptSubmit', cwd: '/work/proj', home: '/home/dev', now: new Date(2026, 0, 9, 4, 7), env: {}, vars: {} },
+    over);
+}
+
+function testTemplateResolvesBuiltinsAndVars(): void {
+  const ctx = tmplCtx({ env: { FOO: 'bar' }, vars: { greeting: 'hello', name: 'Ada' } });
+  const body = 'ev={{event}} cwd={{cwd}} home={{home}} date={{date}} time={{time}} env={{env.FOO}} g={{greeting}} n={{name}}';
+  assert.strictEqual(applyTemplate(body, ctx),
+    'ev=UserPromptSubmit cwd=/work/proj home=/home/dev date=2026-01-09 time=04:07 env=bar g=hello n=Ada');
+  // Surrounding whitespace inside the braces is trimmed.
+  assert.strictEqual(applyTemplate('{{ event }}', ctx), 'UserPromptSubmit');
+  // env.* miss resolves to empty string (it is a built-in family), not verbatim.
+  assert.strictEqual(applyTemplate('x={{env.NOPE}}y', ctx), 'x=y');
+}
+
+function testTemplatePerRouteOverrideOrder(): void {
+  // route vars > config vars.
+  assert.deepStrictEqual(mergeVars({ scope: 'global', keep: 'cfg' }, { scope: 'route' }),
+    { scope: 'route', keep: 'cfg' }, 'route vars must override config vars');
+  // user vars > built-ins: a var named 'event' shadows the hook-event built-in, and a
+  // route-level 'event' wins over a config-level 'event'.
+  const merged: VarMap = mergeVars({ event: 'CFG' }, { event: 'ROUTE' });
+  assert.strictEqual(applyTemplate('{{event}}', tmplCtx({ vars: merged })), 'ROUTE',
+    'route var must win over config var and the built-in');
+  // with no override the built-in resolves.
+  assert.strictEqual(applyTemplate('{{event}}', tmplCtx({ vars: {} })), 'UserPromptSubmit');
+}
+
+function testTemplateUnknownPlaceholderVerbatim(): void {
+  const ctx = tmplCtx({ vars: { known: 'K' } });
+  assert.strictEqual(applyTemplate('a {{unknown}} b', ctx), 'a {{unknown}} b');
+  assert.strictEqual(applyTemplate('{{known}}/{{missing}}', ctx), 'K/{{missing}}');
+  // Non-env dotted unknown stays verbatim; only the env.* family blanks on miss.
+  assert.strictEqual(applyTemplate('{{foo.bar}}', ctx), '{{foo.bar}}');
+  // Stray/empty braces are not valid tokens and are left untouched (no escaping syntax).
+  assert.strictEqual(applyTemplate('{{}} {{ }} {{no token here}}', ctx), '{{}} {{ }} {{no token here}}');
+}
+
+// e2e: drive the real deployed dispatcher with a placeholder doc, config-level vars, and
+// a per-route var override; assert built-ins resolve, route vars beat config vars, and an
+// unknown placeholder is injected verbatim.
+function testTemplateDispatchEndToEnd(): void {
+  const cfg = tempConfig();
+  const home = homeFor(cfg);
+  assert.strictEqual(run(['install'], cfg).status, 0);
+  write(path.join(home, 'cfg', 'config.json'), JSON.stringify({
+    version: 1,
+    vars: { greeting: 'hello', who: 'config' },
+    routes: [{ id: 'tmpl', event: 'UserPromptSubmit', freq: 1, doc: 'docs/tmpl.md', vars: { who: 'route' } }]
+  }, null, 2));
+  write(path.join(home, 'cfg', 'docs', 'tmpl.md'), 'E={{event}} G={{greeting}} W={{who}} U={{unknown}}\n');
+
+  const body = fireBodies(hook({ session_id: 'tmpl-sess', hook_event_name: 'UserPromptSubmit', cwd: cfg }, cfg));
+  assert.ok(body, 'templated route should fire');
+  assert.ok(body!.includes('E=UserPromptSubmit'), 'built-in {{event}} should resolve: ' + body);
+  assert.ok(body!.includes('G=hello'), 'config var {{greeting}} should resolve: ' + body);
+  assert.ok(body!.includes('W=route'), 'route var must override config var: ' + body);
+  assert.ok(body!.includes('U={{unknown}}'), 'unknown placeholder must stay verbatim: ' + body);
 }
 
 function testFailOpenMissingConfig(): void {
@@ -1770,6 +1836,10 @@ const TESTS: Array<[string, () => void]> = [
   ['testPerRouteCountersIndependent', testPerRouteCountersIndependent],
   ['testMalformedCounterArrayDoesNotBreakFrequency', testMalformedCounterArrayDoesNotBreakFrequency],
   ['testEventNameSemantics', testEventNameSemantics],
+  ['testTemplateResolvesBuiltinsAndVars', testTemplateResolvesBuiltinsAndVars],
+  ['testTemplatePerRouteOverrideOrder', testTemplatePerRouteOverrideOrder],
+  ['testTemplateUnknownPlaceholderVerbatim', testTemplateUnknownPlaceholderVerbatim],
+  ['testTemplateDispatchEndToEnd', testTemplateDispatchEndToEnd],
   ['testFailOpenMissingConfig', testFailOpenMissingConfig],
   ['testMalformedConfigInjectsNothing', testMalformedConfigInjectsNothing],
   ['testBadRouteSkippedOthersFire', testBadRouteSkippedOthersFire],

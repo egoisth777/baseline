@@ -47,7 +47,7 @@ const readline = require("readline");
 const child_process_1 = require("child_process");
 const contracts_1 = require("./contracts");
 // --- constants -------------------------------------------------------------
-const KNOWN_ROUTE_KEYS = ['id', 'event', 'freq', 'cwd', 'doc'];
+const KNOWN_ROUTE_KEYS = ['id', 'event', 'freq', 'cwd', 'doc', 'vars'];
 const DEFAULT_PRESET = 'default';
 const CODEX_MARKETPLACE = 'baseline';
 const CODEX_PLUGIN = 'baseline';
@@ -865,7 +865,7 @@ function unwireAll(ap) {
 // Load + validate the central config.json. Mirrors the dispatcher's fail-open
 // selection, but also collects per-route issues so doctor/status can report them.
 function loadCentralConfig() {
-    const report = { present: false, fatal: null, routes: [], issues: [], desiredEvents: [] };
+    const report = { present: false, fatal: null, routes: [], vars: {}, issues: [], desiredEvents: [] };
     let raw;
     try {
         const st = fs.statSync(central.config);
@@ -897,6 +897,9 @@ function loadCentralConfig() {
         report.fatal = 'config.json version must be 1 (got ' + JSON.stringify(cfg.version) + ')';
         return report;
     }
+    // Config-level template vars (a route's own vars override these); malformed vars are a
+    // warn, never fatal — the dispatcher drops them and stays fail-open.
+    report.vars = (0, contracts_1.sanitizeVars)(cfg.vars, 'config', msg => report.issues.push({ level: 'warn', msg }));
     const routes = Array.isArray(cfg.routes) ? cfg.routes : [];
     if (!Array.isArray(cfg.routes))
         report.issues.push({ level: 'warn', msg: 'config.json has no "routes" array; treating as empty' });
@@ -967,8 +970,9 @@ function loadCentralConfig() {
             if (KNOWN_ROUTE_KEYS.indexOf(key) === -1)
                 report.issues.push({ level: 'warn', msg: 'route ' + label + ' has unrecognized key "' + key + '"' });
         }
+        const vars = (0, contracts_1.sanitizeVars)(r.vars, 'route ' + label, msg => report.issues.push({ level: 'warn', msg }));
         seen[r.id] = true;
-        report.routes.push({ id: r.id, event: r.event, freq, cwd: r.cwd, doc: r.doc });
+        report.routes.push({ id: r.id, event: r.event, freq, cwd: r.cwd, doc: r.doc, vars });
     }
     // Wiring is keyed by NATIVE event, so a phase suffix folds into its base: three
     // SessionStart.<phase> routes wire exactly one native SessionStart hook.

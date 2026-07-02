@@ -34,9 +34,13 @@ import {
   SESSION_PHASES,
   SLUG,
   SUPPORTED_EVENTS,
+  VarMap,
+  applyTemplate,
+  mergeVars,
   parseEvent,
   safeDocPath,
   safeRealDocPath,
+  sanitizeVars,
 } from './contracts';
 
 interface CounterEntry {
@@ -85,30 +89,39 @@ const configPath = path.join(cfgDir, 'config.json');
 const counterPath = path.join(agentDir, '.baseline-counters.json');
 const counterLockPath = counterPath + '.lock';
 
-// Load and validate config.json into the routes the dispatcher will act on.
-// Fail-open: any fatal problem (missing/oversize/malformed config, bad version,
-// over-cap route count) returns [] so the hook injects nothing. Individual bad
-// routes are skipped in isolation; a duplicate id keeps the first occurrence.
-function loadValidRoutes(): Route[] {
+interface ValidConfig {
+  routes: Route[];
+  vars: VarMap; // config-level template vars (a route's own vars override these)
+}
+
+// Load and validate config.json into the routes the dispatcher will act on, plus the
+// config-level template vars. Fail-open: any fatal problem (missing/oversize/malformed
+// config, bad version, over-cap route count) returns no routes so the hook injects
+// nothing. Individual bad routes are skipped in isolation; a duplicate id keeps the
+// first occurrence. Malformed `vars` are dropped (never fatal) — configs without vars
+// behave byte-identically to before templating existed.
+function loadValidConfig(): ValidConfig {
+  const empty: ValidConfig = { routes: [], vars: {} };
   let raw: string;
   try {
     const st = fs.statSync(configPath);
-    if (st.size > MAX_CONFIG_BYTES) return [];
+    if (st.size > MAX_CONFIG_BYTES) return empty;
     raw = fs.readFileSync(configPath, 'utf8');
-    if (Buffer.byteLength(raw, 'utf8') > MAX_CONFIG_BYTES) return [];
+    if (Buffer.byteLength(raw, 'utf8') > MAX_CONFIG_BYTES) return empty;
   } catch (e) {
-    return [];
+    return empty;
   }
 
   let cfg: any;
-  try { cfg = JSON.parse(raw); } catch (e) { return []; }
-  if (!cfg || typeof cfg !== 'object' || Array.isArray(cfg)) return [];
+  try { cfg = JSON.parse(raw); } catch (e) { return empty; }
+  if (!cfg || typeof cfg !== 'object' || Array.isArray(cfg)) return empty;
   // version: missing => assume 1; any value other than 1 => inject nothing.
-  if (cfg.version !== undefined && cfg.version !== 1) return [];
+  if (cfg.version !== undefined && cfg.version !== 1) return empty;
 
   const routes = Array.isArray(cfg.routes) ? cfg.routes : [];
-  if (routes.length > MAX_ROUTES) return [];
+  if (routes.length > MAX_ROUTES) return empty;
 
+  const configVars = sanitizeVars(cfg.vars, 'config');
   const seen: { [id: string]: true } = {};
   const out: Route[] = [];
   for (const r of routes) {
@@ -126,10 +139,11 @@ function loadValidRoutes(): Route[] {
       freq = r.freq;
     }
     if (r.cwd !== undefined && typeof r.cwd !== 'string') continue;
+    const vars = sanitizeVars(r.vars, 'route ' + r.id);
     seen[r.id] = true;
-    out.push({ id: r.id, event: r.event, freq, cwd: r.cwd, doc: r.doc });
+    out.push({ id: r.id, event: r.event, freq, cwd: r.cwd, doc: r.doc, vars });
   }
-  return out;
+  return { routes: out, vars: configVars };
 }
 
 // Does this route's event name accept the invocation? The event is the sole
@@ -255,7 +269,8 @@ process.stdin.on('end', () => {
     if (typeof event !== 'string' || SUPPORTED_EVENTS.indexOf(event) === -1) return;
 
     // Select the routes this invocation activates (event name + cwd).
-    const selected = loadValidRoutes().filter(r =>
+    const config = loadValidConfig();
+    const selected = config.routes.filter(r =>
       eventMatches(r, data) && cwdMatches(r, data));
     if (!selected.length) return;
 
@@ -291,11 +306,18 @@ process.stdin.on('end', () => {
 
     // Concatenate the due doc bodies in config routes[] order (selected/due both
     // preserve it), joined by a blank line, with no headers or route-id labels —
-    // labels would break verbatim injection.
+    // labels would break verbatim injection. Each body is templated at injection time
+    // ({{name}} resolved deterministically) before the combined-context cap, so the cap
+    // bounds the text actually injected.
+    const now = new Date();
+    const cwd = typeof data.cwd === 'string' ? data.cwd : '';
     const bodies: string[] = [];
     for (const r of due) {
-      const body = readDoc(r.doc);
-      if (body === null) continue;
+      const raw = readDoc(r.doc);
+      if (raw === null) continue;
+      const body = applyTemplate(raw, {
+        event, cwd, home: os.homedir(), now, env: process.env, vars: mergeVars(config.vars, r.vars)
+      });
       const joined = bodies.length ? bodies.join('\n\n') + '\n\n' + body : body;
       if (joined.length <= MAX_DOC_CHARS) bodies.push(body);
     }

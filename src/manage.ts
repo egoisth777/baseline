@@ -53,9 +53,11 @@ import {
   SESSION_PHASES,
   SLUG,
   SUPPORTED_EVENTS,
+  VarMap,
   parseEvent,
   safeDocPath,
   safeRealDocPath,
+  sanitizeVars,
 } from './contracts';
 
 // --- types -----------------------------------------------------------------
@@ -106,7 +108,8 @@ interface RouteIssue {
 interface ConfigReport {
   present: boolean;
   fatal: string | null;     // config-level fault — the dispatcher injects nothing
-  routes: Route[];          // valid, deduped routes
+  routes: Route[];          // valid, deduped routes (each with its own vars)
+  vars: VarMap;             // config-level template vars (routes override per-route)
   issues: RouteIssue[];     // per-route fail/warn findings (for doctor)
   desiredEvents: string[];  // unique events the valid routes use
 }
@@ -131,7 +134,7 @@ interface InstallOpts {
 
 // --- constants -------------------------------------------------------------
 
-const KNOWN_ROUTE_KEYS = ['id', 'event', 'freq', 'cwd', 'doc'];
+const KNOWN_ROUTE_KEYS = ['id', 'event', 'freq', 'cwd', 'doc', 'vars'];
 const DEFAULT_PRESET = 'default';
 const CODEX_MARKETPLACE = 'baseline';
 const CODEX_PLUGIN = 'baseline';
@@ -910,7 +913,7 @@ function unwireAll(ap: AgentPaths): string[] {
 // Load + validate the central config.json. Mirrors the dispatcher's fail-open
 // selection, but also collects per-route issues so doctor/status can report them.
 function loadCentralConfig(): ConfigReport {
-  const report: ConfigReport = { present: false, fatal: null, routes: [], issues: [], desiredEvents: [] };
+  const report: ConfigReport = { present: false, fatal: null, routes: [], vars: {}, issues: [], desiredEvents: [] };
 
   let raw: string;
   try {
@@ -927,6 +930,10 @@ function loadCentralConfig(): ConfigReport {
   if (!cfg || typeof cfg !== 'object' || Array.isArray(cfg)) { report.fatal = 'config.json root must be an object'; return report; }
   if (cfg.version === undefined) report.issues.push({ level: 'warn', msg: 'config.json has no "version"; assuming 1' });
   else if (cfg.version !== 1) { report.fatal = 'config.json version must be 1 (got ' + JSON.stringify(cfg.version) + ')'; return report; }
+
+  // Config-level template vars (a route's own vars override these); malformed vars are a
+  // warn, never fatal — the dispatcher drops them and stays fail-open.
+  report.vars = sanitizeVars(cfg.vars, 'config', msg => report.issues.push({ level: 'warn', msg }));
 
   const routes = Array.isArray(cfg.routes) ? cfg.routes : [];
   if (!Array.isArray(cfg.routes)) report.issues.push({ level: 'warn', msg: 'config.json has no "routes" array; treating as empty' });
@@ -969,8 +976,9 @@ function loadCentralConfig(): ConfigReport {
     for (const key of Object.keys(r)) {
       if (KNOWN_ROUTE_KEYS.indexOf(key) === -1) report.issues.push({ level: 'warn', msg: 'route ' + label + ' has unrecognized key "' + key + '"' });
     }
+    const vars = sanitizeVars(r.vars, 'route ' + label, msg => report.issues.push({ level: 'warn', msg }));
     seen[r.id] = true;
-    report.routes.push({ id: r.id, event: r.event, freq, cwd: r.cwd, doc: r.doc });
+    report.routes.push({ id: r.id, event: r.event, freq, cwd: r.cwd, doc: r.doc, vars });
   }
 
   // Wiring is keyed by NATIVE event, so a phase suffix folds into its base: three
