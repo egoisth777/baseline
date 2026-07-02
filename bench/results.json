@@ -1,5 +1,5 @@
 {
-  "generatedAt": "2026-07-02T07:43:42.441Z",
+  "generatedAt": "2026-07-02T08:10:27.829Z",
   "machine": {
     "platform": "win32",
     "arch": "x64",
@@ -14,10 +14,21 @@
       "skipped": null,
       "error": null,
       "ok": true,
-      "p50": 37.241,
-      "p95": 39.7431,
+      "p50": 36.5485,
+      "p95": 38.2538,
       "rssBytes": null,
       "note": "the real dispatcher (counters + lock + caps + templating)"
+    },
+    {
+      "name": "baseline-native",
+      "required": false,
+      "skipped": null,
+      "error": null,
+      "ok": true,
+      "p50": 5.3855,
+      "p95": 6.8157,
+      "rssBytes": null,
+      "note": "the native Zig dispatcher (R-009) — same routes/counters/caps/templating"
     },
     {
       "name": "ref-node",
@@ -25,9 +36,9 @@
       "skipped": null,
       "error": null,
       "ok": true,
-      "p50": 32.8943,
-      "p95": 40.8733,
-      "rssBytes": 49319936,
+      "p50": 32.1841,
+      "p95": 33.7819,
+      "rssBytes": 49266688,
       "note": "minimal plain-node hook"
     },
     {
@@ -36,8 +47,8 @@
       "skipped": null,
       "error": null,
       "ok": true,
-      "p50": 29.7248,
-      "p95": 34.2367,
+      "p50": 29.033,
+      "p95": 29.7645,
       "rssBytes": null,
       "note": "minimal python hook (python)"
     },

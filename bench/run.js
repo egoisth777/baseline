@@ -56,6 +56,14 @@ function setupFixture() {
 const fixture = setupFixture();
 const HOOK_INPUT = JSON.stringify({ session_id: 'bench', hook_event_name: 'UserPromptSubmit', cwd: fixture.dir });
 
+// The native prebuilt shipped for this platform, or null where none exists (mirrors
+// manage.js nativePrebuiltName). The baseline-native lane skips-with-notice elsewhere.
+function nativePrebuiltName() {
+  if (process.platform === 'win32' && process.arch === 'x64') return 'baseline-recital-windows-x64.exe';
+  if (process.platform === 'linux' && process.arch === 'x64') return 'baseline-recital-linux-x64';
+  return null;
+}
+
 function detectPython() {
   // Per the toolchain probe, `python3` may be a Windows Store stub — try `python`, then `py -3`.
   for (const cand of [['python'], ['py', '-3']]) {
@@ -80,6 +88,13 @@ function buildImpls() {
     env: { CLAUDE_CONFIG_DIR: fixture.dir },
     note: 'the real dispatcher (counters + lock + caps + templating)'
   });
+  // The native Zig dispatcher (R-009) doing the SAME task — the hook hot path. Optional:
+  // skips-with-notice on a platform with no shipped prebuilt.
+  const nativeName = nativePrebuiltName();
+  const nativeBin = nativeName ? path.join(REPO, 'bin', nativeName) : null;
+  impls.push(nativeBin && fs.existsSync(nativeBin)
+    ? { name: 'baseline-native', required: false, cmd: nativeBin, args: ['--agent-config', fixture.dir], env: {}, note: 'the native Zig dispatcher (R-009) — same routes/counters/caps/templating' }
+    : { name: 'baseline-native', required: false, skipped: 'no native prebuilt for ' + process.platform + '-' + process.arch });
   impls.push({
     name: 'ref-node', required: true,
     cmd: process.execPath, args: [path.join(__dirname, 'refs', 'node-min.js')],
@@ -197,7 +212,7 @@ function writeResults(results) {
     lines.push('');
   }
   lines.push('Budgets live in `bench/budgets.json`; `npm run bench:check` fails when `baseline-node` exceeds them. '
-    + 'Budgets are **PROVISIONAL** (Node-path) until the native engine (R-009) lands and final numbers are pinned on a CI reference platform.');
+    + 'The enforced gate is the Node-path `baseline-node` budget (**PROVISIONAL**); `baseline-native` (R-009, the hook hot path) is reported here for comparison. Final budgets pinned on a CI reference platform remain pending.');
   lines.push('');
   fs.writeFileSync(path.join(__dirname, 'results.md'), lines.join('\n'));
 }

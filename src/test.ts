@@ -2081,6 +2081,11 @@ function testBenchHarnessSmoke(): void {
   for (const i of obj.impls) byName[i.name] = i;
   assert.ok(byName['baseline-node'] && byName['baseline-node'].ok === true, 'baseline dispatcher produces correct injection output');
   assert.ok(byName['ref-node'] && byName['ref-node'].ok === true, 'ref-node produces correct injection output');
+  // The native lane (R-009) must be reported and, when a prebuilt exists for this platform,
+  // produce correct output; on platforms with no prebuilt it skips-with-notice (never dropped).
+  assert.ok('baseline-native' in byName, 'baseline-native lane is reported');
+  assert.ok(byName['baseline-native'].skipped || byName['baseline-native'].ok === true,
+    'baseline-native produces correct injection output when a prebuilt exists');
   // Optional impls must appear as entries (ok or skipped) — never silently dropped.
   assert.ok('ref-python' in byName && 'ref-ts' in byName, 'optional impls are reported (ok or skipped, not absent)');
 }
