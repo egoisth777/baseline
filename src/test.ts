@@ -1939,6 +1939,25 @@ function testJsonErrorPathExitCode(): void {
   assert.strictEqual((res.stderr || '').trim(), '', 'json error must not also write stderr');
 }
 
+// --- benchmark harness smoke (R-013) ---------------------------------------
+
+// The bench harness must not rot: shape-check it (one run per impl, correctness only, NO
+// timing assertions). Required impls (baseline-node, ref-node) must produce correct
+// output; optional impls (python/ts) may skip cleanly but must still be reported.
+function testBenchHarnessSmoke(): void {
+  const res = spawnSync(process.execPath, [path.join(root, 'bench', 'run.js'), '--smoke'], { cwd: root, encoding: 'utf8' });
+  assert.strictEqual(res.status, 0, 'bench --smoke should exit 0: ' + (res.stderr || res.stdout));
+  const lastLine = (res.stdout || '').trim().split('\n').filter(Boolean).pop() || '';
+  const obj = JSON.parse(lastLine);
+  assert.strictEqual(obj.smoke, true, 'smoke summary shape');
+  const byName: { [k: string]: any } = {};
+  for (const i of obj.impls) byName[i.name] = i;
+  assert.ok(byName['baseline-node'] && byName['baseline-node'].ok === true, 'baseline dispatcher produces correct injection output');
+  assert.ok(byName['ref-node'] && byName['ref-node'].ok === true, 'ref-node produces correct injection output');
+  // Optional impls must appear as entries (ok or skipped) — never silently dropped.
+  assert.ok('ref-python' in byName && 'ref-ts' in byName, 'optional impls are reported (ok or skipped, not absent)');
+}
+
 // --- runner -----------------------------------------------------------------
 
 const TESTS: Array<[string, () => void]> = [
@@ -2005,6 +2024,7 @@ const TESTS: Array<[string, () => void]> = [
   ['testJsonRouteAddRemove', testJsonRouteAddRemove],
   ['testJsonDispatchSimulate', testJsonDispatchSimulate],
   ['testJsonErrorPathExitCode', testJsonErrorPathExitCode],
+  ['testBenchHarnessSmoke', testBenchHarnessSmoke],
   ['testPresetsAreValid', testPresetsAreValid],
   ['testMinimalPresetIsNeutral', testMinimalPresetIsNeutral],
   ['testBrandAssetsAndReadme', testBrandAssetsAndReadme],

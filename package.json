@@ -6,7 +6,9 @@
   "license": "MIT",
   "scripts": {
     "build": "tsc -p tsconfig.json",
-    "test": "tsc -p tsconfig.json && node scripts/test.js"
+    "test": "tsc -p tsconfig.json && node scripts/test.js",
+    "bench": "node bench/run.js",
+    "bench:check": "node bench/run.js --check"
   },
   "devDependencies": {
     "@types/node": "^22.10.2",

@@ -1,0 +1,5 @@
+{
+  "$comment": "PROVISIONAL Node-path budgets seeded from the first bench run (win32, 2026-07-02: baseline-node p95 = 42.2 ms; ref-node 38.5 ms; ref-python 32.7 ms; ref-ts skipped). Latency headroom is generous because cold-start timing is noisy across machines and bench:check is not part of `npm test`. TODO: pin final latency and RSS budgets after the native engine (R-009) lands and on a Linux CI reference platform where peak RSS is measurable via /usr/bin/time (peakRssBytes stays null until then, so the RSS gate is skipped, never a false green).",
+  "latencyP95Ms": 150,
+  "peakRssBytes": null
+}

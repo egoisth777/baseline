@@ -247,6 +247,17 @@ npm test         # runs tsc, then node scripts/test.js
 
 The tests use temporary `CLAUDE_CONFIG_DIR`, `CODEX_HOME`, `BASELINE_HOME`, and `BASELINE_CFG` directories and do not touch your real config.
 
+## Benchmark
+
+`bench/` races the real dispatcher against minimal JS, Python, and TS reference hooks doing the same injection task, reporting cold-start p50/p95 latency (and peak RSS on Linux/macOS):
+
+```bash
+npm run bench          # measure; writes bench/results.md + bench/results.json
+npm run bench:check    # measure, then fail if baseline-node exceeds bench/budgets.json
+```
+
+The harness is zero-dependency and is **not** part of `npm test` (cold-start timing is noisy); a suite test only shape-checks it. Python is the prerequisite for the Python reference — invoke `python` (or `py -3`), not `python3` (a Windows Store stub); it is skipped with a notice when absent, never a false green. The TS reference needs `tsx`/`ts-node` (running TS at runtime is what it measures) and is skipped otherwise. Peak RSS is measured on Linux/macOS via `/usr/bin/time`; it is `n/a` on Windows. Budgets in `bench/budgets.json` are provisional Node-path numbers until the native engine lands.
+
 ## License
 
 MIT

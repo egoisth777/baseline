@@ -1,0 +1,56 @@
+{
+  "generatedAt": "2026-07-02T07:25:24.222Z",
+  "machine": {
+    "platform": "win32",
+    "arch": "x64",
+    "node": "v24.15.0",
+    "cpus": 32
+  },
+  "n": 20,
+  "results": [
+    {
+      "name": "baseline-node",
+      "required": true,
+      "skipped": null,
+      "error": null,
+      "ok": true,
+      "p50": 37.9305,
+      "p95": 39.9042,
+      "rssBytes": null,
+      "note": "the real dispatcher (counters + lock + caps + templating)"
+    },
+    {
+      "name": "ref-node",
+      "required": true,
+      "skipped": null,
+      "error": null,
+      "ok": true,
+      "p50": 33.4217,
+      "p95": 38.9747,
+      "rssBytes": null,
+      "note": "minimal plain-node hook"
+    },
+    {
+      "name": "ref-python",
+      "required": false,
+      "skipped": null,
+      "error": null,
+      "ok": true,
+      "p50": 29.8218,
+      "p95": 30.6908,
+      "rssBytes": null,
+      "note": "minimal python hook (python)"
+    },
+    {
+      "name": "ref-ts",
+      "required": false,
+      "skipped": "no tsx / ts-node available (TS-at-runtime needs one)",
+      "error": null,
+      "ok": null,
+      "p50": null,
+      "p95": null,
+      "rssBytes": null,
+      "note": null
+    }
+  ]
+}
