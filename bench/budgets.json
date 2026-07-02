@@ -1,5 +1,5 @@
 {
-  "$comment": "PROVISIONAL Node-path budgets seeded from the first bench run (win32, 2026-07-02: baseline-node p95 = 42.2 ms; ref-node 38.5 ms; ref-python 32.7 ms; ref-ts skipped). Latency headroom is generous because cold-start timing is noisy across machines and bench:check is not part of `npm test`. TODO: pin final latency and RSS budgets after the native engine (R-009) lands and on a Linux CI reference platform where peak RSS is measurable via /usr/bin/time (peakRssBytes stays null until then, so the RSS gate is skipped, never a false green).",
+  "$comment": "PROVISIONAL Node-path budgets seeded from the first bench runs (win32, 2026-07-02). latencyP95Ms: baseline-node p95 ~38-42 ms, pinned generously at 150 ms so it never flakes across machines (cold-start timing is noisy; bench:check is not part of `npm test`). peakRssBytes: a Node-path near-peak RSS ceiling — measured ref-node self-report ~47 MiB, pinned generously at 256 MiB so it never flakes across machines/Node versions. Both are NODE-PATH numbers. TODO: pin the FINAL latency + RSS budgets after the native engine (R-009) lands (that final-budget task is a separate unchecked box in R-014). Where peak RSS is not obtainable (e.g. baseline-node on Windows via /usr/bin/time), that gate skips-with-notice — never a false green.",
   "latencyP95Ms": 150,
-  "peakRssBytes": null
+  "peakRssBytes": 268435456
 }

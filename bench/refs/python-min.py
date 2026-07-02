@@ -36,3 +36,12 @@ def main():
 
 if __name__ == "__main__":
     main()
+    # Self-report peak RSS on stderr where the platform supports it (posix `resource`);
+    # on Windows `resource` is absent, so RSS is reported as n/a there.
+    try:
+        import resource
+        maxrss = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+        scale = 1 if sys.platform == "darwin" else 1024  # bytes on macOS, KiB on Linux
+        sys.stderr.write("##RSS:%d\n" % (maxrss * scale))
+    except Exception:
+        pass

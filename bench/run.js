@@ -114,21 +114,24 @@ function pctile(sorted, p) {
   return sorted[idx];
 }
 
-// Peak RSS via /usr/bin/time on POSIX; null where not portably measurable (e.g. Windows) —
-// reported honestly as "n/a", never as a passing measurement.
+// Near-peak RSS: prefer the impl's own cross-platform self-report (`##RSS:<bytes>` on
+// stderr — works on Windows too); fall back to `/usr/bin/time` on POSIX for impls that
+// don't self-report (the real dispatcher). null where neither is available (e.g.
+// baseline-node on Windows) — reported honestly as "n/a", never as a passing measurement.
 function measureRss(impl) {
-  if (process.platform === 'win32') return null;
-  const variants = [
-    { pre: ['-v'], re: /Maximum resident set size \(kbytes\):\s*(\d+)/, scale: 1024 },
-    { pre: ['-l'], re: /(\d+)\s+maximum resident set size/, scale: 1 }
-  ];
-  for (const v of variants) {
-    const r = spawnSync('/usr/bin/time', v.pre.concat([impl.cmd], impl.args), {
-      input: HOOK_INPUT, encoding: 'utf8', env: Object.assign({}, process.env, impl.env || {})
-    });
-    if (r.error) continue;
-    const m = (r.stderr || '').match(v.re);
-    if (m) return Number(m[1]) * v.scale;
+  const self = runOnce(impl);
+  const sm = (self.stderr || '').match(/##RSS:(\d+)/);
+  if (sm) return Number(sm[1]);
+  if (process.platform !== 'win32') {
+    for (const v of [{ pre: ['-v'], re: /Maximum resident set size \(kbytes\):\s*(\d+)/, scale: 1024 },
+                     { pre: ['-l'], re: /(\d+)\s+maximum resident set size/, scale: 1 }]) {
+      const r = spawnSync('/usr/bin/time', v.pre.concat([impl.cmd], impl.args), {
+        input: HOOK_INPUT, encoding: 'utf8', env: Object.assign({}, process.env, impl.env || {})
+      });
+      if (r.error) continue;
+      const m = (r.stderr || '').match(v.re);
+      if (m) return Number(m[1]) * v.scale;
+    }
   }
   return null;
 }

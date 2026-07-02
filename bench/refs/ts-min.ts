@@ -5,6 +5,10 @@
 import * as fs from 'fs';
 import * as path from 'path';
 
+// Self-report RSS on stderr (cross-platform) so the harness can measure a Node-path
+// footprint on Windows too. stderr never touches the hook's stdout output.
+process.on('exit', () => { try { process.stderr.write('##RSS:' + process.memoryUsage().rss + '\n'); } catch (e) { /* ignore */ } });
+
 let input = '';
 process.stdin.on('data', (c) => (input += c));
 process.stdin.on('end', () => {
