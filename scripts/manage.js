@@ -1108,7 +1108,7 @@ function installedControlSurfaceSkill(host, repoRootPath) {
         'Use the installed baseline manager and artifacts. Do not assume the original source',
         'checkout still exists; it is only recorded below for source-development refreshes.',
         '',
-        'Install root:',
+        "Install root: `BASELINE_HOME`, else the installed manager's own root, else `~/.baseline`. This install resolved it to:",
         '',
         '    ' + central.root,
         '',

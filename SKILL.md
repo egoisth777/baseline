@@ -26,7 +26,7 @@ Content and routing are kept separate: **docs** (`docs/*.md`) hold the verbatim 
 |---|---|---|
 | Dispatcher (canonical) | `src/baseline-recital.ts` → `scripts/baseline-recital.js` | TypeScript source of truth; `npm run build` compiles it. Reads the event, loads `config.json`, selects routes, counts per route, injects due docs verbatim. |
 | Zig artifact | `src/baseline-recital.zig`, `bin/baseline-recital-*`, `bin/SHA256SUMS` | Verified native hook artifact exists, but it is paused/not wired for v1. Node remains the wired runtime. |
-| Install root | `BASELINE_HOME`, else `~/.baseline` | Holds regenerable artifacts only: deployed dispatcher (`hooks/`) + skill payload (`skills/`), plus `cfg` → your config folder. |
+| Install root | `BASELINE_HOME`, else the installed manager's own root, else `~/.baseline` | Holds regenerable artifacts only: deployed dispatcher (`hooks/`) + skill payload (`skills/`), plus `cfg` → your config folder. |
 | Deployed dispatcher | `~/.baseline/hooks/baseline-recital.js` | Canonical deployed hook artifact. |
 | Agent dispatcher link | `~/.claude/hooks/baseline-recital.js`, `~/.codex/hooks/baseline-recital.js` | Installed command path wired in hook config; links to the install root. |
 | Config folder | `BASELINE_CFG`, else `<install root>/cfg` (`config.json` + `docs/` + `README.md`) | **Everything tunable**: routes in `config.json`, injected text in `docs/`. Pure config — no artifacts. `<install root>/cfg` symlinks here when `BASELINE_CFG` is set. |

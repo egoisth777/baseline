@@ -302,6 +302,44 @@ function testSourceLikeInstalledManagerDoesNotInferInstallRoot(): void {
     'source-like manager must not infer the source-like root as installed:\n' + status.stdout);
 }
 
+// R-009 (goal decision #17): the install-root default is a pinned, tested contract.
+// This consolidates the resolution ORDER in one place — BASELINE_HOME > the installed
+// manager's own root > the ~/.baseline literal — driving all three rungs of the same
+// installed manager (the scenario tests above each cover one rung; this pins the order).
+function testInstallRootDefaultContract(): void {
+  const cfg = tempConfig();
+  const home = homeFor(cfg);
+  assert.strictEqual(run(['install'], cfg).status, 0);
+
+  // Rung 1: BASELINE_HOME wins even though this installed manager could infer a root.
+  const overrideHome = cfg + '-order-override';
+  const r1 = runInstalled(['status'], cfg, home, {
+    BASELINE_HOME: overrideHome,
+    BASELINE_CFG: path.join(overrideHome, 'cfg')
+  });
+  assert.strictEqual(r1.status, 0, r1.stderr || r1.stdout);
+  assert.ok(r1.stdout.includes('install root   : ' + overrideHome),
+    'BASELINE_HOME must win over the inferred install root:\n' + r1.stdout);
+
+  // Rung 2: no BASELINE_HOME — the installed manager infers its OWN root, ahead of ~/.baseline.
+  const fakeUserHome = cfg + '-order-userhome';
+  fs.mkdirSync(fakeUserHome, { recursive: true });
+  const r2 = runInstalledWithoutBaselineEnv(['status'], cfg, home, { HOME: fakeUserHome, USERPROFILE: fakeUserHome });
+  assert.strictEqual(r2.status, 0, r2.stderr || r2.stdout);
+  assert.ok(r2.stdout.includes('install root   : ' + home),
+    'installed manager must infer its own root ahead of ~/.baseline:\n' + r2.stdout);
+  assert.ok(!r2.stdout.includes('install root   : ' + path.join(fakeUserHome, '.baseline')),
+    'the inferred root must take precedence over the ~/.baseline literal:\n' + r2.stdout);
+
+  // Rung 3: no BASELINE_HOME and a source-like manager (src/manage.ts present) → the
+  // ~/.baseline literal under the user home is the final fallback.
+  write(path.join(home, 'src', 'manage.ts'), '// source checkout marker\n');
+  const r3 = runInstalledWithoutBaselineEnv(['status'], cfg, home, { HOME: fakeUserHome, USERPROFILE: fakeUserHome });
+  assert.strictEqual(r3.status, 0, r3.stderr || r3.stdout);
+  assert.ok(r3.stdout.includes('install root   : ' + path.join(fakeUserHome, '.baseline')),
+    'source-like manager with no BASELINE_HOME must fall back to the ~/.baseline literal:\n' + r3.stdout);
+}
+
 // The minimal preset is bare baseline only: one UserPromptSubmit route, nothing else.
 function testMinimalPresetWiresOnlyUserPromptSubmit(): void {
   const cfg = tempConfig();
@@ -1268,6 +1306,27 @@ function testCfgLocationPhrasingIsCanonical(): void {
   }
 }
 
+// R-009 (goal decision #17): one canonical sentence states the install-root resolution
+// order everywhere in docs and generated control-surface text, and the divergent
+// two-rung phrasing (which omits the installed-manager rung) no longer survives.
+function testInstallRootPhrasingIsCanonical(): void {
+  const clause = '`BASELINE_HOME`, else the installed manager\'s own root, else `~/.baseline`';
+  const divergent = '`BASELINE_HOME`, else `~/.baseline`'; // two-rung form, must not survive
+  const readme = fs.readFileSync(path.join(root, 'README.md'), 'utf8');
+  const sources: Array<[string, string]> = [
+    ['README.md', readme],
+    ['root SKILL.md', fs.readFileSync(path.join(root, 'SKILL.md'), 'utf8')],
+    ['skills/baseline/SKILL.md', fs.readFileSync(path.join(root, 'skills', 'baseline', 'SKILL.md'), 'utf8')],
+    ['src/manage.ts', fs.readFileSync(path.join(root, 'src', 'manage.ts'), 'utf8')],
+  ];
+  for (const [name, text] of sources) {
+    assert.ok(text.includes(clause), name + ' must state the canonical install-root resolution order');
+    assert.ok(!text.includes(divergent), name + ' must not use the divergent two-rung install-root phrasing');
+  }
+  // Singular in the primary doc: the canonical order is stated once, not competing forms.
+  assert.strictEqual(readme.split(clause).length - 1, 1, 'README must state the install-root order exactly once');
+}
+
 function testCodexPluginManifest(): void {
   const manifestPath = path.join(root, '.codex-plugin', 'plugin.json');
   assert.ok(fs.existsSync(manifestPath), 'Codex plugin manifest missing');
@@ -1660,6 +1719,7 @@ const TESTS: Array<[string, () => void]> = [
   ['testInstalledManagerInfersInstallRootWithoutBaselineHome', testInstalledManagerInfersInstallRootWithoutBaselineHome],
   ['testBaselineHomeOverridesInstalledManagerLocation', testBaselineHomeOverridesInstalledManagerLocation],
   ['testSourceLikeInstalledManagerDoesNotInferInstallRoot', testSourceLikeInstalledManagerDoesNotInferInstallRoot],
+  ['testInstallRootDefaultContract', testInstallRootDefaultContract],
   ['testMinimalPresetWiresOnlyUserPromptSubmit', testMinimalPresetWiresOnlyUserPromptSubmit],
   ['testDefaultPresetWiresBaseEventsBothAgents', testDefaultPresetWiresBaseEventsBothAgents],
   ['testInvalidSettingsFailsClosed', testInvalidSettingsFailsClosed],
@@ -1704,6 +1764,7 @@ const TESTS: Array<[string, () => void]> = [
   ['testBrandAssetsAndReadme', testBrandAssetsAndReadme],
   ['testDocsDescribeRoutesModel', testDocsDescribeRoutesModel],
   ['testCfgLocationPhrasingIsCanonical', testCfgLocationPhrasingIsCanonical],
+  ['testInstallRootPhrasingIsCanonical', testInstallRootPhrasingIsCanonical],
   ['testCodexPluginManifest', testCodexPluginManifest],
   ['testShellWrappersExecutable', testShellWrappersExecutable],
   ['testInstallWrappersHaveNoBuildFlag', testInstallWrappersHaveNoBuildFlag],
