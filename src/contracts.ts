@@ -88,7 +88,7 @@ export function safeRealDocPath(doc: string, cfgDir: string): string | null {
   }
 }
 
-// --- {{name}} deterministic templating (R-010, goal decision #18) ------------
+// --- {{name}} deterministic templating (R-010, goal decision #19) ------------
 // Docs may carry {{name}} placeholders resolved at dispatch time. Resolution is
 // deterministic and in-process: NO exec, NO model calls, NO dynamic file selection
 // (decision #5). Unknown placeholders are left byte-for-byte verbatim (no error, no
@@ -149,7 +149,7 @@ export function mergeVars(configVars?: VarMap, routeVars?: VarMap): VarMap {
   return Object.assign({}, configVars || {}, routeVars || {});
 }
 
-// Resolve one token: user vars first (they override built-ins, per decision #18), then
+// Resolve one token: user vars first (they override built-ins, per decision #19), then
 // each provider in order. Returns undefined when nothing resolves it.
 function resolveToken(token: string, ctx: TemplateContext, providers: TemplateProvider[]): string | undefined {
   if (Object.prototype.hasOwnProperty.call(ctx.vars, token)) return ctx.vars[token];

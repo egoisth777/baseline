@@ -122,7 +122,7 @@ const TOKEN_RE = /\{\{\s*([A-Za-z0-9_.-]+)\s*\}\}/g;
 function mergeVars(configVars, routeVars) {
     return Object.assign({}, configVars || {}, routeVars || {});
 }
-// Resolve one token: user vars first (they override built-ins, per decision #18), then
+// Resolve one token: user vars first (they override built-ins, per decision #19), then
 // each provider in order. Returns undefined when nothing resolves it.
 function resolveToken(token, ctx, providers) {
     if (Object.prototype.hasOwnProperty.call(ctx.vars, token))

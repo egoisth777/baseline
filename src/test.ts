@@ -304,7 +304,7 @@ function testSourceLikeInstalledManagerDoesNotInferInstallRoot(): void {
     'source-like manager must not infer the source-like root as installed:\n' + status.stdout);
 }
 
-// R-009 (goal decision #17): the install-root default is a pinned, tested contract.
+// R-014 (goal decision #17): the install-root default is a pinned, tested contract.
 // This consolidates the resolution ORDER in one place — BASELINE_HOME > the installed
 // manager's own root > the ~/.baseline literal — driving all three rungs of the same
 // installed manager (the scenario tests above each cover one rung; this pins the order).
@@ -1004,7 +1004,7 @@ function testTemplateDispatchEndToEnd(): void {
   assert.ok(body!.includes('U={{unknown}}'), 'unknown placeholder must stay verbatim: ' + body);
 }
 
-// R-011 (goal decision #19): due docs are read concurrently but assembled strictly in
+// R-011 (goal decision #18): due docs are read concurrently but assembled strictly in
 // config routes[] order. Four routes with very different doc sizes (so read-completion
 // order differs from config order) must still emit in declared order.
 function testConcurrentDispatchDeterministicOrder(): void {
@@ -1497,7 +1497,7 @@ function testChecksumsMatchBinaries(): void {
   }
 }
 
-// R-014 (goal decision #21): zero runtime dependencies is a guarded contract, not a
+// R-014 (goal decision #20): zero runtime dependencies is a guarded contract, not a
 // hope. Assert package.json declares none, and that src/ + scripts/ import/require only
 // Node built-ins or in-repo relative paths — never a bare third-party specifier.
 function testNoRuntimeDependencies(): void {
@@ -1635,7 +1635,7 @@ function testCfgLocationPhrasingIsCanonical(): void {
   }
 }
 
-// R-009 (goal decision #17): one canonical sentence states the install-root resolution
+// R-014 (goal decision #17): one canonical sentence states the install-root resolution
 // order everywhere in docs and generated control-surface text, and the divergent
 // two-rung phrasing (which omits the installed-manager rung) no longer survives.
 function testInstallRootPhrasingIsCanonical(): void {
@@ -2158,7 +2158,7 @@ function testBenchHarnessSmoke(): void {
   assert.ok('ref-python' in byName && 'ref-ts' in byName, 'optional impls are reported (ok or skipped, not absent)');
 }
 
-// R-014 (goal decision #21): a PROVISIONAL peak-RSS ceiling for the Node dispatch path,
+// R-014 (goal decision #20): a PROVISIONAL peak-RSS ceiling for the Node dispatch path,
 // pinned generously from the benchmark (bench/budgets.json). Measured cross-platform via
 // the reference injection's own ##RSS self-report (the shipped dispatcher is a peer Node
 // process). Enforced now with ample headroom so it never flakes; skips-with-notice only
