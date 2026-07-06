@@ -494,7 +494,13 @@ function linkState(linkPath, target) {
             return { ok: false, mechanism: 'broken' };
         }
         const abs = path.isAbsolute(resolved) ? resolved : path.resolve(path.dirname(linkPath), resolved);
-        return samePath(abs, target) ? { ok: true, mechanism: 'symlink' } : { ok: false, mechanism: 'wrong' };
+        if (!samePath(abs, target))
+            return { ok: false, mechanism: 'wrong' };
+        // existsSync follows symlinks: false for a right-target link means the central
+        // target file was deleted (e.g. the whole install root) — the link is dangling.
+        if (!fs.existsSync(linkPath))
+            return { ok: false, mechanism: 'dangling' };
+        return { ok: true, mechanism: 'symlink' };
     }
     try {
         const a = fs.statSync(linkPath);
@@ -513,7 +519,7 @@ function linkState(linkPath, target) {
 function describeLink(s) {
     if (s.ok)
         return 'OK (' + s.mechanism + (s.mechanism === 'copy' ? ' — degraded, edits will not propagate' : '') + ')';
-    return s.mechanism.toUpperCase();
+    return s.mechanism.toUpperCase() + (s.mechanism === 'dangling' ? ' (target missing)' : '');
 }
 // Remove a per-agent FILE link we created (symlink or matching copy/hardlink).
 // Refuses to delete a real, divergent file.
@@ -600,7 +606,12 @@ function dirLinkState(linkPath, target, marker) {
             return { ok: false, mechanism: 'broken' };
         }
         const abs = path.isAbsolute(resolved) ? resolved : path.resolve(path.dirname(linkPath), resolved);
-        return samePath(abs, target) ? { ok: true, mechanism: 'symlink' } : { ok: false, mechanism: 'wrong' };
+        if (!samePath(abs, target))
+            return { ok: false, mechanism: 'wrong' };
+        // existsSync follows symlinks: false means the central target dir was deleted.
+        if (!fs.existsSync(linkPath))
+            return { ok: false, mechanism: 'dangling' };
+        return { ok: true, mechanism: 'symlink' };
     }
     if (lst.isDirectory()) {
         try {
@@ -1652,6 +1663,11 @@ async function cmdUpdate() {
 // Inspect the installation and return a list of checks.
 function doctorChecks() {
     const checks = [];
+    // A deleted install root (e.g. rm -rf ~/.baseline) leaves every per-agent link
+    // dangling; report the real cause first, ahead of the symptoms below.
+    if (!fs.existsSync(central.root)) {
+        checks.push({ name: 'install root', level: 'fail', detail: 'missing — ' + central.root + ' does not exist; agent hook links are dangling. Run doctor --fix (or install) from the source checkout to re-deploy', fixable: true });
+    }
     const dispatcherPresent = fs.existsSync(central.hookJs) && fs.existsSync(central.hookContractsJs);
     if (!dispatcherPresent) {
         checks.push({ name: 'central dispatcher', level: 'fail', detail: 'not fully deployed under ' + central.hooksDir, fixable: true });
@@ -1789,6 +1805,8 @@ function doctorChecks() {
             checks.push({ name: 'dispatcher link', level: 'ok', detail: 'linked to center (' + js.mechanism + ')' });
         else if (js.ok)
             checks.push({ name: 'dispatcher link', level: 'warn', detail: 'degraded copy (edits will not propagate; install will relink)', fixable: true });
+        else if (js.mechanism === 'dangling')
+            checks.push({ name: 'dispatcher link', level: 'fail', detail: 'dangling — target ' + central.hookJs + ' missing', fixable: true });
         else
             checks.push({ name: 'dispatcher link', level: 'fail', detail: js.mechanism + ' — not linked to ' + central.hookJs, fixable: true });
         const contracts = linkState(ap.hookContractsJs, central.hookContractsJs);
@@ -1796,6 +1814,8 @@ function doctorChecks() {
             checks.push({ name: 'contracts link', level: 'ok', detail: 'linked to center (' + contracts.mechanism + ')' });
         else if (contracts.ok)
             checks.push({ name: 'contracts link', level: 'warn', detail: 'degraded copy (edits will not propagate; install will relink)', fixable: true });
+        else if (contracts.mechanism === 'dangling')
+            checks.push({ name: 'contracts link', level: 'fail', detail: 'dangling — target ' + central.hookContractsJs + ' missing', fixable: true });
         else
             checks.push({ name: 'contracts link', level: 'fail', detail: contracts.mechanism + ' — not linked to ' + central.hookContractsJs, fixable: true });
         const cl = dirLinkState(ap.cfgDir, central.cfgLink, CONFIG_MARKER);
@@ -1803,6 +1823,8 @@ function doctorChecks() {
             checks.push({ name: 'config link', level: 'ok', detail: 'linked to center (' + cl.mechanism + ')' });
         else if (cl.ok)
             checks.push({ name: 'config link', level: 'warn', detail: 'degraded copy (edits will not propagate; install will relink)', fixable: true });
+        else if (cl.mechanism === 'dangling')
+            checks.push({ name: 'config link', level: 'fail', detail: 'dangling — target ' + central.cfgLink + ' missing', fixable: true });
         else if (!cfg.present)
             checks.push({ name: 'config link', level: 'warn', detail: 'central config missing — install will seed + link', fixable: true });
         else

@@ -104,7 +104,9 @@ interface HookEntry {
 
 interface LinkState {
   ok: boolean;
-  mechanism: string;
+  mechanism: 'symlink' | 'hardlink' | 'copy'          // ok mechanisms
+    | 'missing' | 'broken' | 'wrong' | 'dangling' | 'stale'  // link faults
+    | 'present' | 'inactive' | 'unreadable';          // codex plugin activation states
 }
 
 interface RouteIssue {
@@ -589,7 +591,11 @@ function linkState(linkPath: string, target: string): LinkState {
     try { resolved = fs.readlinkSync(linkPath); }
     catch (e) { return { ok: false, mechanism: 'broken' }; }
     const abs = path.isAbsolute(resolved) ? resolved : path.resolve(path.dirname(linkPath), resolved);
-    return samePath(abs, target) ? { ok: true, mechanism: 'symlink' } : { ok: false, mechanism: 'wrong' };
+    if (!samePath(abs, target)) return { ok: false, mechanism: 'wrong' };
+    // existsSync follows symlinks: false for a right-target link means the central
+    // target file was deleted (e.g. the whole install root) — the link is dangling.
+    if (!fs.existsSync(linkPath)) return { ok: false, mechanism: 'dangling' };
+    return { ok: true, mechanism: 'symlink' };
   }
 
   try {
@@ -605,7 +611,7 @@ function linkState(linkPath: string, target: string): LinkState {
 
 function describeLink(s: LinkState): string {
   if (s.ok) return 'OK (' + s.mechanism + (s.mechanism === 'copy' ? ' — degraded, edits will not propagate' : '') + ')';
-  return s.mechanism.toUpperCase();
+  return s.mechanism.toUpperCase() + (s.mechanism === 'dangling' ? ' (target missing)' : '');
 }
 
 // Remove a per-agent FILE link we created (symlink or matching copy/hardlink).
@@ -668,7 +674,10 @@ function dirLinkState(linkPath: string, target: string, marker: string): LinkSta
     try { resolved = fs.readlinkSync(linkPath); }
     catch (e) { return { ok: false, mechanism: 'broken' }; }
     const abs = path.isAbsolute(resolved) ? resolved : path.resolve(path.dirname(linkPath), resolved);
-    return samePath(abs, target) ? { ok: true, mechanism: 'symlink' } : { ok: false, mechanism: 'wrong' };
+    if (!samePath(abs, target)) return { ok: false, mechanism: 'wrong' };
+    // existsSync follows symlinks: false means the central target dir was deleted.
+    if (!fs.existsSync(linkPath)) return { ok: false, mechanism: 'dangling' };
+    return { ok: true, mechanism: 'symlink' };
   }
   if (lst.isDirectory()) {
     try {
@@ -1644,6 +1653,12 @@ async function cmdUpdate(): Promise<void> {
 function doctorChecks(): Check[] {
   const checks: Check[] = [];
 
+  // A deleted install root (e.g. rm -rf ~/.baseline) leaves every per-agent link
+  // dangling; report the real cause first, ahead of the symptoms below.
+  if (!fs.existsSync(central.root)) {
+    checks.push({ name: 'install root', level: 'fail', detail: 'missing — ' + central.root + ' does not exist; agent hook links are dangling. Run doctor --fix (or install) from the source checkout to re-deploy', fixable: true });
+  }
+
   const dispatcherPresent = fs.existsSync(central.hookJs) && fs.existsSync(central.hookContractsJs);
   if (!dispatcherPresent) {
     checks.push({ name: 'central dispatcher', level: 'fail', detail: 'not fully deployed under ' + central.hooksDir, fixable: true });
@@ -1762,16 +1777,19 @@ function doctorChecks(): Check[] {
     const js = linkState(ap.hookJs, central.hookJs);
     if (js.ok && js.mechanism !== 'copy') checks.push({ name: 'dispatcher link', level: 'ok', detail: 'linked to center (' + js.mechanism + ')' });
     else if (js.ok) checks.push({ name: 'dispatcher link', level: 'warn', detail: 'degraded copy (edits will not propagate; install will relink)', fixable: true });
+    else if (js.mechanism === 'dangling') checks.push({ name: 'dispatcher link', level: 'fail', detail: 'dangling — target ' + central.hookJs + ' missing', fixable: true });
     else checks.push({ name: 'dispatcher link', level: 'fail', detail: js.mechanism + ' — not linked to ' + central.hookJs, fixable: true });
 
     const contracts = linkState(ap.hookContractsJs, central.hookContractsJs);
     if (contracts.ok && contracts.mechanism !== 'copy') checks.push({ name: 'contracts link', level: 'ok', detail: 'linked to center (' + contracts.mechanism + ')' });
     else if (contracts.ok) checks.push({ name: 'contracts link', level: 'warn', detail: 'degraded copy (edits will not propagate; install will relink)', fixable: true });
+    else if (contracts.mechanism === 'dangling') checks.push({ name: 'contracts link', level: 'fail', detail: 'dangling — target ' + central.hookContractsJs + ' missing', fixable: true });
     else checks.push({ name: 'contracts link', level: 'fail', detail: contracts.mechanism + ' — not linked to ' + central.hookContractsJs, fixable: true });
 
     const cl = dirLinkState(ap.cfgDir, central.cfgLink, CONFIG_MARKER);
     if (cl.ok && cl.mechanism !== 'copy') checks.push({ name: 'config link', level: 'ok', detail: 'linked to center (' + cl.mechanism + ')' });
     else if (cl.ok) checks.push({ name: 'config link', level: 'warn', detail: 'degraded copy (edits will not propagate; install will relink)', fixable: true });
+    else if (cl.mechanism === 'dangling') checks.push({ name: 'config link', level: 'fail', detail: 'dangling — target ' + central.cfgLink + ' missing', fixable: true });
     else if (!cfg.present) checks.push({ name: 'config link', level: 'warn', detail: 'central config missing — install will seed + link', fixable: true });
     else checks.push({ name: 'config link', level: 'fail', detail: cl.mechanism + ' — not linked to ' + central.cfgLink, fixable: true });
 
