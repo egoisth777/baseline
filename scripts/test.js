@@ -665,6 +665,31 @@ function testDoctorReportsAndFixes() {
     assert.strictEqual(fixed.status, 0, fixed.stderr || fixed.stdout);
     assert.match(fixed.stdout, /doctor: installation repaired/);
 }
+// Deleting the whole install root leaves the per-agent symlinks DANGLING (they resolve
+// to the right path, but the target is gone). doctor must report that as a failure —
+// not [ OK ] — and --fix must re-deploy.
+function testDoctorDetectsDanglingHookLinks() {
+    const cfg = tempConfig();
+    const home = homeFor(cfg);
+    assert.strictEqual(run(['install'], cfg).status, 0);
+    // The bug is symlink-specific; if install fell back to hardlink/copy here, skip.
+    if (!fs.lstatSync(agentHookDispatcher(cfg)).isSymbolicLink()) {
+        console.log('SKIP testDoctorDetectsDanglingHookLinks: install did not use symlinks on this machine');
+        return;
+    }
+    fs.rmSync(home, { recursive: true, force: true }); // kill the entire install root
+    const broken = run(['doctor'], cfg);
+    assert.strictEqual(broken.status, 1, broken.stdout);
+    assert.match(broken.stdout, /\[FAIL\] install root: missing/);
+    assert.match(broken.stdout, /\[FAIL\] dispatcher link: dangling/);
+    assert.ok(broken.stdout.indexOf('[ OK ] dispatcher link') === -1, 'doctor reported a dangling dispatcher link as OK');
+    const fixed = run(['doctor', '--fix'], cfg);
+    assert.strictEqual(fixed.status, 0, fixed.stderr || fixed.stdout);
+    assert.match(fixed.stdout, /doctor: installation repaired/);
+    const healthy = run(['doctor'], cfg);
+    assert.strictEqual(healthy.status, 0, healthy.stderr || healthy.stdout);
+    assert.match(healthy.stdout, /doctor: healthy/);
+}
 function testStatusAndDoctorRepairPerAgentContracts() {
     const cfg = tempConfig();
     const home = homeFor(cfg);
@@ -757,6 +782,21 @@ function testUninstallKeepsCentralConfig() {
     assert.ok(!fs.existsSync(agentHookContracts(cfg)), 'agent contracts link not removed');
     assert.ok(!fs.existsSync(agentHookContracts(codex)), 'codex contracts link not removed');
     assert.ok(fs.existsSync(path.join(home, 'cfg', 'config.json')), 'central config was wrongly removed');
+}
+// A half-dead install (install root deleted, per-agent wiring + dangling links left
+// behind) must still uninstall cleanly: unwire the hook and remove the dangling links.
+function testUninstallCleansHalfDeadInstall() {
+    const cfg = tempConfig();
+    const home = homeFor(cfg);
+    assert.strictEqual(run(['install'], cfg).status, 0);
+    fs.rmSync(home, { recursive: true, force: true }); // kill the entire install root
+    const uninstall = run(['uninstall'], cfg);
+    assert.strictEqual(uninstall.status, 0, uninstall.stderr || uninstall.stdout);
+    const settings = JSON.parse(fs.readFileSync(path.join(cfg, 'settings.json'), 'utf8'));
+    assert.ok(!settings.hooks || !settings.hooks.UserPromptSubmit || settings.hooks.UserPromptSubmit.length === 0, 'uninstall left a wired hook');
+    // fs.existsSync follows symlinks (false for a dangling link), so assert via lstat.
+    assert.throws(() => fs.lstatSync(agentHookDispatcher(cfg)), /ENOENT/, 'dangling dispatcher link not removed');
+    assert.throws(() => fs.lstatSync(agentHookContracts(cfg)), /ENOENT/, 'dangling contracts link not removed');
 }
 function testUninstallPreservesDivergentPerAgentContracts() {
     const cfg = tempConfig();
@@ -1336,6 +1376,7 @@ const TESTS = [
     ['testDocSymlinkEscapeRejected', testDocSymlinkEscapeRejected],
     ['testOversizeDocSkipped', testOversizeDocSkipped],
     ['testDoctorReportsAndFixes', testDoctorReportsAndFixes],
+    ['testDoctorDetectsDanglingHookLinks', testDoctorDetectsDanglingHookLinks],
     ['testDoctorDetectsMissingDoc', testDoctorDetectsMissingDoc],
     ['testStatusAndDoctorRepairPerAgentContracts', testStatusAndDoctorRepairPerAgentContracts],
     ['testDoctorFixRefusesInvalidSettings', testDoctorFixRefusesInvalidSettings],
@@ -1343,6 +1384,7 @@ const TESTS = [
     ['testVerifyToolEventFires', testVerifyToolEventFires],
     ['testUpdateRedeploysDispatcher', testUpdateRedeploysDispatcher],
     ['testUninstallKeepsCentralConfig', testUninstallKeepsCentralConfig],
+    ['testUninstallCleansHalfDeadInstall', testUninstallCleansHalfDeadInstall],
     ['testUninstallPreservesDivergentPerAgentContracts', testUninstallPreservesDivergentPerAgentContracts],
     ['testControlSurfacePluginsDeployed', testControlSurfacePluginsDeployed],
     ['testCodexPluginPayloadDeployedAndActivated', testCodexPluginPayloadDeployedAndActivated],
