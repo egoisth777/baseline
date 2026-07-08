@@ -24,11 +24,11 @@ Content and routing are kept separate: **docs** (`docs/*.md`) hold the verbatim 
 
 | Piece | Path | Role |
 |---|---|---|
-| Dispatcher (canonical) | `src/baseline-recital.ts` → `scripts/baseline-recital.js` | TypeScript source of truth; `npm run build` compiles it. Reads the event, loads `config.json`, selects routes, counts per route, injects due docs verbatim. |
-| Zig artifact | `src/baseline-recital.zig`, `bin/baseline-recital-*`, `bin/SHA256SUMS` | Verified native hook artifact exists, but it is paused/not wired for v1. Node remains the wired runtime. |
+| Dispatcher (Node fallback) | `src/baseline-recital.ts` → `scripts/baseline-recital.js` | TypeScript source for the Node dispatcher. Reads the event, loads `config.json`, selects routes, counts per route, injects due docs verbatim. Used when no native prebuilt is available or `--runtime node` is selected. |
+| Zig/native hook runtime | `src/baseline-recital.zig`, `bin/baseline-recital-*`, `bin/SHA256SUMS` | Default hook hot path when a shipped prebuilt exists. `--runtime prebuilt` selects it explicitly; `--runtime build` compiles it first; missing/undeployable prebuilts fall back to Node. |
 | Install root | `BASELINE_HOME`, else the installed manager's own root, else `~/.baseline` | Holds regenerable artifacts only: deployed dispatcher (`hooks/`) + skill payload (`skills/`), plus `cfg` → your config folder. |
-| Deployed dispatcher | `~/.baseline/hooks/baseline-recital.js` | Canonical deployed hook artifact. |
-| Agent dispatcher link | `~/.claude/hooks/baseline-recital.js`, `~/.codex/hooks/baseline-recital.js` | Installed command path wired in hook config; links to the install root. |
+| Deployed dispatcher artifacts | `~/.baseline/hooks/baseline-recital.js`, native hook binary when active | Hook artifacts deployed by the Node manager. |
+| Agent dispatcher link | `~/.claude/hooks/`, `~/.codex/hooks/` | Installed command path wired in hook config; links to the install root. Native runtime wiring executes the native binary directly; Node wiring runs `baseline-recital.js`. |
 | Config folder | `BASELINE_CFG`, else `<install root>/cfg` (`config.json` + `docs/` + `README.md`) | **Everything tunable**: routes in `config.json`, injected text in `docs/`. Pure config — no artifacts. `<install root>/cfg` symlinks here when `BASELINE_CFG` is set. |
 | Agent config link | `~/.claude/cfg/baseline/`, `~/.codex/cfg/baseline/` | Links to `<install root>/cfg` (your config folder). Read live via symlink; a copy fallback needs install/update after edits. |
 | Control-surface plugins | `.claude-plugin/plugin.json`, `.codex-plugin/plugin.json`, `skills/baseline/SKILL.md`, installed `~/.baseline/skills/baseline/` | Plugin manifests and skill payloads make baseline discoverable. The installed control surface should be self-contained; Claude+Codex parity is an in-scope implementation goal. Control surfaces carry no hooks. |
@@ -44,7 +44,7 @@ For canonical goal, architecture, and vocabulary docs, read `.arca/baseline-sp/g
 
 ## Requirements and runtime
 
-Requires Claude Code or Codex, plus Node.js. Node runs the manager and the wired dispatcher. A verified Zig native artifact exists but is paused/not wired, and Rust is the future native CLI/dispatcher target.
+Requires Claude Code or Codex, plus Node.js. Node runs the manager and remains the fallback/explicit dispatcher; when a shipped Zig/native prebuilt exists, plain install/update uses it as the default hook hot path. `--runtime node` forces Node.
 
 ## Trust boundary
 
@@ -93,7 +93,7 @@ For scripting, add `--json` to `status`, `route list`/`add`/`remove`, and `dispa
 1. **Identify the intent.** Editing docs/routes → it's a `cfg/baseline/` edit. Installing/repairing/removing → it's a `manage.js` run. Adding or removing an *event* always needs install/update afterward (wiring re-sync).
 2. **Resolve the baseline root before any command.** Do not assume the current working directory is this repo/plugin; users invoke skills from their own projects.
 3. **For data edits:** read the relevant doc or `config.json`, make the change, keep docs short, keep `config.json` routing-only (never put injected text in it). Then run `node scripts/manage.js status` from the baseline root to show the live result.
-4. **For mechanism changes** (how selection/counting/injection works): edit `src/baseline-recital.ts` first, then run `npm test` from the baseline root to regenerate and verify `scripts/*.js`. The Zig artifact is paused/not wired; the Rust CLI rewrite is a future architecture slice.
+4. **For mechanism changes** (how selection/counting/injection works): edit source first and do not hand-edit generated `scripts/*.js`. The default hook hot path is Zig/native when a shipped prebuilt exists; the Node dispatcher remains the fallback and explicit `--runtime node` path; the Rust CLI rewrite is a future architecture slice.
 5. **For config-only changes:** do not run the user's project tests. End with `status` or `verify` from the baseline root. After any hook-config change, remind them: open `/hooks` once in the relevant agent, or restart, so hook config reloads.
 
 ## Vocabulary

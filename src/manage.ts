@@ -36,10 +36,11 @@
 // - The config folder is seeded from a repo PRESET (presets/<name>/) and is never
 //   clobbered without --force. There is no legacy baseline.md migration — the
 //   system is pre-release and install seeds the new model fresh.
-// - Native Zig runtime (R-009): `--runtime prebuilt` deploys the prebuilt binary as the
-//   hook hot path; `--runtime build` compiles it from source first; `--runtime node`
-//   forces the Node dispatcher. A plain reinstall/update keeps whatever was chosen. A
-//   platform with no shipped prebuilt falls back to the Node dispatcher automatically.
+// - Native Zig runtime (R-009): the repo-shipped prebuilt is the default hook hot
+//   path when available; `--runtime build` compiles it from source first;
+//   `--runtime prebuilt` explicitly selects the shipped prebuilt; `--runtime node`
+//   forces the Node dispatcher. A platform with no shipped prebuilt falls back to
+//   the Node dispatcher automatically.
 
 import * as fs from 'fs';
 import * as path from 'path';
@@ -132,6 +133,23 @@ interface Check {
   fixable?: boolean;
 }
 
+
+type HookRuntime = 'native' | 'node';
+
+interface CommandHook {
+  command: string;
+}
+
+interface WiredHook {
+  event: string;
+  hook: CommandHook;
+  runtime: HookRuntime;
+}
+
+interface NativeBinaryState {
+  ok: boolean;
+  detail: string;
+}
 interface InstallOpts {
   preset: string;
   force: boolean;
@@ -139,9 +157,9 @@ interface InstallOpts {
   // agent or install fails. Undefined => selection is resolved at install time
   // (recorded set, interactive prompt, or all detected).
   agents?: string[];
-  // Native runtime selection (--runtime). Undefined => plain install: keep whatever
-  // runtime is already deployed (Node by default). 'prebuilt'/'build' opt into the
-  // native Zig binary; 'node' forces the Node dispatcher.
+  // Native runtime selection (--runtime). Undefined => plain install/update: prefer
+  // the repo-shipped Zig prebuilt when available, else use Node. 'prebuilt'/'build'
+  // explicitly select the native Zig binary; 'node' forces the Node dispatcher.
   runtime?: 'node' | 'prebuilt' | 'build';
 }
 
@@ -257,6 +275,7 @@ const central = {
   installedClaudeManifest: path.join(installRoot, '.claude-plugin', 'plugin.json'),
   installedCodexManifest:  path.join(installRoot, '.codex-plugin', 'plugin.json'),
   installedPresetsDir:     path.join(installRoot, 'presets'),
+  installedBinDir:         path.join(installRoot, 'bin'),
   // Claude skills-dir plugin payload (skill-only; no hooks). Linked into each
   // skill-capable agent's skills dir so Claude recognizes baseline + loads its skill.
   skillDir:      path.join(installRoot, 'skills', 'baseline'),
@@ -274,6 +293,7 @@ const repo = {
   hookSourceJs:    path.join(repoRoot, 'scripts', 'baseline-recital.js'),
   contractsSourceJs: path.join(repoRoot, 'scripts', 'contracts.js'),
   presetsDir:      path.join(repoRoot, 'presets'),
+  binDir:          path.join(repoRoot, 'bin'),
   // Source of truth for plugin manifests, copied into installed control-surface payloads.
   claudePluginManifest: path.join(repoRoot, '.claude-plugin', 'plugin.json'),
   codexPluginManifest:  path.join(repoRoot, '.codex-plugin', 'plugin.json'),
@@ -476,6 +496,27 @@ function buildNativeFromSource(): void {
   }
 }
 
+function deployRepoNativePrebuilt(prebuiltName: string | null, repoPrebuilt: string | null): { useNative: boolean; runtimeLabel: string; removeNative: boolean } {
+  const fallback = (reason: string): { useNative: boolean; runtimeLabel: string; removeNative: boolean } => {
+    console.log('[baseline] ' + reason + '; using the Node dispatcher.');
+    return { useNative: false, runtimeLabel: 'node js', removeNative: true };
+  };
+
+  if (!prebuiltName || !repoPrebuilt) {
+    return fallback('no native prebuilt for ' + process.platform + '-' + process.arch);
+  }
+  if (!fs.existsSync(repoPrebuilt)) {
+    return fallback('native prebuilt ' + prebuiltName + ' not found under ' + path.dirname(repoPrebuilt));
+  }
+  try {
+    fs.mkdirSync(central.hooksDir, { recursive: true });
+    deployNativeBinary(repoPrebuilt, central.hookBin);
+    return { useNative: true, runtimeLabel: 'native (prebuilt ' + prebuiltName + ')', removeNative: false };
+  } catch (e) {
+    return fallback('failed to deploy native prebuilt ' + prebuiltName + ' (' + (e && e.message ? e.message : String(e)) + ')');
+  }
+}
+
 // Recursively copy a directory tree (used to deploy a preset/artifact payload and
 // as the config/plugin link copy-fallback).
 function copyDir(src: string, dest: string): void {
@@ -612,6 +653,37 @@ function linkState(linkPath: string, target: string): LinkState {
 function describeLink(s: LinkState): string {
   if (s.ok) return 'OK (' + s.mechanism + (s.mechanism === 'copy' ? ' — degraded, edits will not propagate' : '') + ')';
   return s.mechanism.toUpperCase() + (s.mechanism === 'dangling' ? ' (target missing)' : '');
+}
+
+function nativeBinaryState(file: string): NativeBinaryState {
+  let st: fs.Stats;
+  try {
+    st = fs.statSync(file);
+  } catch (e) {
+    if (e && e.code === 'ENOENT') return { ok: false, detail: 'missing at ' + file };
+    return { ok: false, detail: 'unreadable at ' + file + ' (' + e.message + ')' };
+  }
+  if (!st.isFile()) return { ok: false, detail: 'not a file at ' + file };
+  if (st.size === 0) return { ok: false, detail: 'empty file at ' + file };
+  if (!isWin && (st.mode & 0o111) === 0) return { ok: false, detail: 'not executable at ' + file };
+  return { ok: true, detail: 'present at ' + file };
+}
+
+function nativeRuntimeFaults(ap: AgentPaths): string[] {
+  const faults: string[] = [];
+  const centralBin = nativeBinaryState(central.hookBin);
+  const nativeLink = linkState(ap.hookBin, central.hookBin);
+  const agentBin = nativeBinaryState(ap.hookBin);
+  if (!centralBin.ok) faults.push('central native binary ' + centralBin.detail);
+  if (!nativeLink.ok) faults.push('native link ' + describeLink(nativeLink) + ' at ' + ap.hookBin);
+  if (!agentBin.ok) faults.push('agent native binary ' + agentBin.detail);
+  return faults;
+}
+
+function describeNativeRuntime(ap: AgentPaths): string {
+  const faults = nativeRuntimeFaults(ap);
+  if (!faults.length) return describeLink(linkState(ap.hookBin, central.hookBin)) + '; central ' + central.hookBin;
+  return 'UNHEALTHY — ' + faults.join('; ');
 }
 
 // Remove a per-agent FILE link we created (symlink or matching copy/hardlink).
@@ -921,43 +993,88 @@ function parseCommandLine(command: unknown): string[] | null {
   return args.length ? args : null;
 }
 
+function commandRuntime(command: unknown, ap: AgentPaths): HookRuntime | null {
+  const argv = parseCommandLine(command);
+  if (!argv) return null;
+  if (samePath(argv[0], ap.hookBin)) return 'native';
+  if (argv.length >= 2 && samePath(argv[1], ap.hookJs)) return 'node';
+  return null;
+}
+
 // A settings command is ours when it runs this agent's deployed dispatcher — either the
 // native binary directly (argv[0]) or Node running the .js (argv[1]). Recognizing both
 // keeps unwire/update/status runtime-agnostic across a native<->node switch.
 function isOurCommand(command: unknown, ap: AgentPaths): boolean {
-  const argv = parseCommandLine(command);
-  if (!argv) return false;
-  if (samePath(argv[0], ap.hookBin)) return true; // native binary
-  return argv.length >= 2 && samePath(argv[1], ap.hookJs); // node .js
+  return commandRuntime(command, ap) !== null;
+}
+
+function isCommandHook(value: unknown): value is CommandHook {
+  return !!value && typeof value === 'object' && !Array.isArray(value) &&
+    'command' in value && typeof value.command === 'string';
+}
+
+function eventHookGroups(settings: unknown, event: string): unknown {
+  if (!settings || typeof settings !== 'object' || Array.isArray(settings) || !('hooks' in settings)) return null;
+  const hooks = settings.hooks;
+  if (!hooks || typeof hooks !== 'object' || Array.isArray(hooks)) return null;
+  return (hooks as Record<string, unknown>)[event];
+}
+
+function commandHooksInGroups(groups: unknown): CommandHook[] {
+  const out: CommandHook[] = [];
+  if (!Array.isArray(groups)) return out;
+  for (const group of groups) {
+    if (!group || typeof group !== 'object' || Array.isArray(group) || !('hooks' in group)) continue;
+    const hooks = group.hooks;
+    if (!Array.isArray(hooks)) continue;
+    for (const hook of hooks) {
+      if (isCommandHook(hook)) out.push(hook);
+    }
+  }
+  return out;
 }
 
 // --- hook config surgery (config-driven, across all events) -----------------
 
-function findOurHookInGroups(groups: any, ap: AgentPaths): HookEntry | null {
-  if (!Array.isArray(groups)) return null;
-  for (const group of groups) {
-    for (const h of (Array.isArray(group.hooks) ? group.hooks : [])) {
-      if (h && isOurCommand(h.command, ap)) return h;
-    }
+function findOurHookInGroups(groups: unknown, ap: AgentPaths): CommandHook | null {
+  for (const hook of commandHooksInGroups(groups)) {
+    if (isOurCommand(hook.command, ap)) return hook;
   }
   return null;
 }
 
-function findOurCommand(settings: any, ap: AgentPaths): HookEntry | null {
-  if (!settings.hooks) return null;
+function findOurCommand(settings: unknown, ap: AgentPaths): CommandHook | null {
   for (const event of SUPPORTED_EVENTS) {
-    const h = findOurHookInGroups(settings.hooks[event], ap);
+    const h = findOurHookInGroups(eventHookGroups(settings, event), ap);
     if (h) return h;
   }
   return null;
 }
 
-// Which supported events currently carry our hook.
-function wiredEvents(settings: any, ap: AgentPaths): string[] {
-  const out: string[] = [];
-  if (!settings.hooks) return out;
+function wiredHooks(settings: unknown, ap: AgentPaths): WiredHook[] {
+  const out: WiredHook[] = [];
   for (const event of SUPPORTED_EVENTS) {
-    if (findOurHookInGroups(settings.hooks[event], ap)) out.push(event);
+    for (const hook of commandHooksInGroups(eventHookGroups(settings, event))) {
+      const runtime = commandRuntime(hook.command, ap);
+      if (runtime) out.push({ event, hook, runtime });
+    }
+  }
+  return out;
+}
+
+function eventsForRuntime(hooks: WiredHook[], runtime: HookRuntime): string[] {
+  const out: string[] = [];
+  for (const h of hooks) {
+    if (h.runtime === runtime && out.indexOf(h.event) === -1) out.push(h.event);
+  }
+  return out;
+}
+
+// Which supported events currently carry our hook.
+function wiredEvents(settings: unknown, ap: AgentPaths): string[] {
+  const out: string[] = [];
+  for (const h of wiredHooks(settings, ap)) {
+    if (out.indexOf(h.event) === -1) out.push(h.event);
   }
   return out;
 }
@@ -1153,8 +1270,9 @@ function sameFileContents(left: string, right: string): boolean {
 
 // Deploy the small set of source artifacts an installed control surface needs to
 // keep working even when the original checkout moves: the manager, dispatcher,
-// shared contracts, manifests, and presets. When the manager is run from the
-// install root these paths are already identical, so this is a no-op.
+// shared contracts, manifests, presets, and shipped native prebuilts. When the
+// manager is run from the install root these paths are already identical, so this
+// is a no-op.
 function ensureInstalledManagerArtifacts(): void {
   if (!fs.existsSync(repo.managerSourceJs)) {
     throw new Error('manager artifact missing at ' + repo.managerSourceJs + ' — run `npm run build` first.');
@@ -1181,6 +1299,7 @@ function ensureInstalledManagerArtifacts(): void {
   copyFileIfDifferent(repo.claudePluginManifest, central.installedClaudeManifest);
   copyFileIfDifferent(repo.codexPluginManifest, central.installedCodexManifest);
   copyDir(repo.presetsDir, central.installedPresetsDir);
+  if (fs.existsSync(repo.binDir)) copyDir(repo.binDir, central.installedBinDir);
 }
 
 // The deployed SKILL.md is self-contained enough for normal operation: it points
@@ -1349,32 +1468,26 @@ async function cmdInstall(opts: InstallOpts): Promise<void> {
   try { ensureInstalledManagerArtifacts(); }
   catch (e) { fail('install: ' + e.message, 1); }
 
-  // 2c. Native runtime selection (R-009, decision #18). Opt in with --runtime prebuilt|build;
-  // a plain reinstall keeps a previously-deployed binary so `update` never silently
-  // downgrades native to Node; --runtime node forces Node. When no prebuilt exists for this
-  // platform, fall back to the Node dispatcher with a notice.
+  // 2c. Native runtime selection (R-009, decision #18). Plain install/update prefers
+  // the repo-shipped prebuilt as the hook hot path; --runtime prebuilt makes that
+  // choice explicit, --runtime build refreshes bin/ first, and --runtime node forces
+  // the Node dispatcher. Missing/deploy-failed prebuilts fail open to Node.
   const prebuiltName = nativePrebuiltName();
-  const repoPrebuilt = prebuiltName ? path.join(repoRoot, 'bin', prebuiltName) : null;
+  const repoPrebuilt = prebuiltName ? path.join(repo.binDir, prebuiltName) : null;
   let useNative = false;
   let runtimeLabel = 'node js';
-  if (opts.runtime === 'build') buildNativeFromSource();
-  if (opts.runtime === 'prebuilt' || opts.runtime === 'build') {
-    if (repoPrebuilt && fs.existsSync(repoPrebuilt)) {
-      fs.mkdirSync(central.hooksDir, { recursive: true });
-      deployNativeBinary(repoPrebuilt, central.hookBin);
-      useNative = true;
-      runtimeLabel = 'native (prebuilt ' + prebuiltName + ')';
-    } else {
-      console.log('[baseline] no native prebuilt for ' + process.platform + '-' + process.arch + '; using the Node dispatcher.');
-      removeCentralNative();
+  let removeNative = false;
+  if (opts.runtime === 'node') {
+    removeNative = true; // explicit downgrade to Node after per-agent native links are unwired
+  } else {
+    if (opts.runtime === 'build') {
+      buildNativeFromSource();
+      if (fs.existsSync(repo.binDir)) copyDir(repo.binDir, central.installedBinDir);
     }
-  } else if (opts.runtime === 'node') {
-    removeCentralNative(); // explicit downgrade to Node
-  } else if (fs.existsSync(central.hookBin)) {
-    // Plain install with a native binary already present: keep it (refresh from repo if we can).
-    if (repoPrebuilt && fs.existsSync(repoPrebuilt)) deployNativeBinary(repoPrebuilt, central.hookBin);
-    useNative = true;
-    runtimeLabel = 'native (prebuilt ' + (prebuiltName || 'installed') + ')';
+    const native = deployRepoNativePrebuilt(prebuiltName, repoPrebuilt);
+    useNative = native.useNative;
+    runtimeLabel = native.runtimeLabel;
+    removeNative = native.removeNative;
   }
 
   // 3. Establish the config folder LOCATION (symlink to BASELINE_CFG, or a real dir).
@@ -1407,6 +1520,7 @@ async function cmdInstall(opts: InstallOpts): Promise<void> {
     const sync = syncWiring(ap, command, cfg.desiredEvents);
     perAgent.push({ name: ap.name, configDir: ap.configDir, jsMech, contractsMech, binMech, cfgMech, skillMech, codexPlugin, sync });
   }
+  if (removeNative) removeCentralNative();
 
   console.log('[baseline] install complete');
   console.log('  install root  : ' + central.root);
@@ -1473,11 +1587,15 @@ function collectStatusData(): any {
 
   const agents = allAgentPaths().map(ap => {
     const { settings, error } = settingsForRead(ap);
-    const links: any = {
+    const hooks = error ? [] : wiredHooks(settings, ap);
+    const nativeEvents = eventsForRuntime(hooks, 'native');
+    const nodeEvents = eventsForRuntime(hooks, 'node');
+    const links: Record<string, LinkState> = {
       dispatcher: linkState(ap.hookJs, central.hookJs),
       contracts: linkState(ap.hookContractsJs, central.hookContractsJs),
       cfg: dirLinkState(ap.cfgDir, central.cfgLink, CONFIG_MARKER),
     };
+    if (nativeEvents.length) links.native = linkState(ap.hookBin, central.hookBin);
     if (ap.skillDir) links.skill = dirLinkState(ap.skillDir, central.skillDir, SKILL_MARKER);
     if (ap.codexPluginDir && ap.codexConfigToml) {
       links.codexCache = dirLinkState(ap.codexPluginDir, central.codexPluginDir, CODEX_PLUGIN_MARKER);
@@ -1488,10 +1606,13 @@ function collectStatusData(): any {
       configDir: ap.configDir,
       settingsValid: !error,
       settingsError: error ? error.message : null,
-      wiredEvents: error ? [] : wiredEvents(settings, ap),
+      wiredEvents: hooks.map(h => h.event),
+      runtime: { nativeEvents, nodeEvents },
+      nativeBinary: nativeEvents.length ? nativeBinaryState(ap.hookBin) : null,
       links
     };
   });
+  const nativeConfigured = agents.some(a => a.runtime.nativeEvents.length > 0);
 
   return {
     installRoot: central.root,
@@ -1500,6 +1621,7 @@ function collectStatusData(): any {
     manager: { present: managerPresent },
     claudeSkill: { present: skillPresent },
     codexPlugin: { present: codexPluginPresent },
+    nativeDispatcher: { active: nativeConfigured, state: nativeConfigured ? nativeBinaryState(central.hookBin) : null },
     config: { fatal: cfg.fatal, vars: cfg.vars, routes: cfg.routes, issues: cfg.issues, desiredEvents: cfg.desiredEvents },
     agents
   };
@@ -1540,16 +1662,32 @@ function cmdStatus(): void {
     console.log('    [' + issue.level + '] ' + issue.msg);
   }
 
+  const nativeConfigured = agentsP.some(ap => {
+    const { settings, error } = settingsForRead(ap);
+    return !error && eventsForRuntime(wiredHooks(settings, ap), 'native').length > 0;
+  });
+  if (nativeConfigured) {
+    const native = nativeBinaryState(central.hookBin);
+    console.log('  native binary  : ' + (native.ok ? native.detail : 'UNHEALTHY — ' + native.detail));
+  }
+
   for (const ap of agentsP) {
     const { settings, error } = settingsForRead(ap);
+    const hooks = error ? [] : wiredHooks(settings, ap);
+    const nativeEvents = eventsForRuntime(hooks, 'native');
+    const nodeEvents = eventsForRuntime(hooks, 'node');
     console.log('  agent ' + ap.name + ' @ ' + ap.configDir);
     if (error) {
       console.log('    ' + ap.settingsLabel.padEnd(13) + ': INVALID (' + error.message + ')');
     } else {
       const wired = wiredEvents(settings, ap);
-      console.log('    ' + ap.settingsLabel.padEnd(13) + ': ' + (wired.length ? 'wired [' + wired.join(', ') + ']' : 'not wired'));
+      const runtimeBits: string[] = [];
+      if (nativeEvents.length) runtimeBits.push('native [' + nativeEvents.join(', ') + ']');
+      if (nodeEvents.length) runtimeBits.push('node [' + nodeEvents.join(', ') + ']');
+      console.log('    ' + ap.settingsLabel.padEnd(13) + ': ' + (wired.length ? 'wired [' + wired.join(', ') + '] via ' + runtimeBits.join('; ') : 'not wired'));
     }
     console.log('    dispatcher   : ' + describeLink(linkState(ap.hookJs, central.hookJs)));
+    if (nativeEvents.length) console.log('    native       : ' + describeNativeRuntime(ap));
     console.log('    contracts    : ' + describeLink(linkState(ap.hookContractsJs, central.hookContractsJs)));
     console.log('    cfg folder   : ' + describeLink(dirLinkState(ap.cfgDir, central.cfgLink, CONFIG_MARKER)));
     if (ap.skillDir) console.log('    skill plugin : ' + describeLink(dirLinkState(ap.skillDir, central.skillDir, SKILL_MARKER)));
@@ -1590,15 +1728,25 @@ function cmdVerify(): void {
   // Prefer a UserPromptSubmit route (no phase, fires every turn — deterministic); else the first.
   const route = cfg.routes.filter(r => r.event === 'UserPromptSubmit')[0] || cfg.routes[0];
 
-  const ourHook = findOurHookInGroups(sr.settings.hooks && sr.settings.hooks[route.event], ap);
+  const routeEvent = parseEvent(route.event).base;
+  const ourHook = findOurHookInGroups(eventHookGroups(sr.settings, routeEvent), ap);
   if (!ourHook) {
-    console.log('[baseline] verify: FAIL — no baseline hook wired for ' + route.event + '. Run install.');
+    console.log('[baseline] verify: FAIL — no baseline hook wired for ' + routeEvent + '. Run install.');
     process.exit(1);
   }
+  const runtime = commandRuntime(ourHook.command, ap);
   const argv = parseCommandLine(ourHook.command);
-  if (!argv) {
+  if (!argv || !runtime) {
     console.log('[baseline] verify: FAIL — cannot parse wired command.');
     process.exit(1);
+  }
+  if (runtime === 'native') {
+    const faults = nativeRuntimeFaults(ap);
+    if (faults.length) {
+      console.log('[baseline] verify: FAIL — native hook command is unhealthy.');
+      for (const fault of faults) console.log('  native fault  : ' + fault);
+      process.exit(1);
+    }
   }
   const cwd = route.cwd || process.cwd();
   const sid = 'baseline-verify-' + process.pid;
@@ -1634,7 +1782,7 @@ function cmdVerify(): void {
 
 // Re-deploy the central dispatcher + re-sync hook wiring from the CURRENT repo
 // source and central config. Keeps the existing config folder (no preset reseed).
-async function cmdUpdate(): Promise<void> {
+async function cmdUpdate(runtime?: InstallOpts['runtime']): Promise<void> {
   console.log('[baseline] update — redeploying dispatcher + re-syncing wiring from current config');
   console.log('');
   // Ensure the recorded set exists (D6): a legacy install with no record infers it from
@@ -1646,7 +1794,7 @@ async function cmdUpdate(): Promise<void> {
     const inferred = inferWiredAgentNames();
     if (inferred.length) writeRecordedAgents(inferred);
   }
-  await cmdInstall({ preset: DEFAULT_PRESET, force: false });
+  await cmdInstall({ preset: DEFAULT_PRESET, force: false, runtime });
 }
 
 // Inspect the installation and return a list of checks.
@@ -1761,7 +1909,9 @@ function doctorChecks(): Check[] {
     }
     checks.push({ name: 'hook config', level: 'ok', detail: ap.name + ' ' + ap.settingsLabel + ' valid JSON' });
 
+    const hooks = wiredHooks(sr.settings, ap);
     const wired = wiredEvents(sr.settings, ap);
+    const nativeEvents = eventsForRuntime(hooks, 'native');
     const missing = cfg.desiredEvents.filter(e => wired.indexOf(e) === -1);
     const stale = wired.filter(e => cfg.desiredEvents.indexOf(e) === -1);
     if (!missing.length && !stale.length) {
@@ -1772,6 +1922,23 @@ function doctorChecks(): Check[] {
       if (missing.length) parts.push('missing [' + missing.join(', ') + ']');
       if (stale.length) parts.push('stale [' + stale.join(', ') + ']');
       checks.push({ name: 'hook wiring', level: 'fail', detail: 'wiring drift: ' + parts.join('; '), fixable: true });
+    }
+
+    if (nativeEvents.length) {
+      const scope = ap.name + ' wired native [' + nativeEvents.join(', ') + ']';
+      const centralBin = nativeBinaryState(central.hookBin);
+      if (centralBin.ok) checks.push({ name: 'native binary', level: 'ok', detail: scope + '; central ' + centralBin.detail });
+      else checks.push({ name: 'native binary', level: 'fail', detail: scope + '; central ' + centralBin.detail, fixable: true });
+
+      const nativeLink = linkState(ap.hookBin, central.hookBin);
+      if (nativeLink.ok && nativeLink.mechanism !== 'copy') checks.push({ name: 'native link', level: 'ok', detail: scope + '; linked to center (' + nativeLink.mechanism + ')' });
+      else if (nativeLink.ok) checks.push({ name: 'native link', level: 'warn', detail: scope + '; degraded copy (edits will not propagate; install will relink)', fixable: true });
+      else if (nativeLink.mechanism === 'dangling') checks.push({ name: 'native link', level: 'fail', detail: scope + '; dangling — target ' + central.hookBin + ' missing', fixable: true });
+      else checks.push({ name: 'native link', level: 'fail', detail: scope + '; ' + nativeLink.mechanism + ' — not linked to ' + central.hookBin, fixable: true });
+
+      const agentBin = nativeBinaryState(ap.hookBin);
+      if (agentBin.ok) checks.push({ name: 'native executable', level: 'ok', detail: scope + '; agent ' + agentBin.detail });
+      else checks.push({ name: 'native executable', level: 'fail', detail: scope + '; agent ' + agentBin.detail, fixable: true });
     }
 
     const js = linkState(ap.hookJs, central.hookJs);
@@ -2028,7 +2195,7 @@ function printHelp(): void {
   console.log('  node scripts/manage.js dispatch simulate --event <e> [--cwd <d>] [--source <phase>]  Dry-run: show what would be injected.');
   console.log('  node scripts/manage.js install [--preset <n>] [--agents <a,b>]  Deploy the dispatcher, seed the config preset, link agents, wire hook config.');
   console.log('  node scripts/manage.js verify                  Functionally test a wired route (does it fire?).');
-  console.log('  node scripts/manage.js update                  Redeploy dispatcher + re-sync hook wiring from current config.');
+  console.log('  node scripts/manage.js update [--runtime <r>]    Redeploy dispatcher + re-sync hook wiring from current config.');
   console.log('  node scripts/manage.js doctor [--fix]          Validate config + wiring and report health; --fix repairs it.');
   console.log('  node scripts/manage.js uninstall               Remove per-agent wiring + links (keeps the central config folder).');
   console.log('  node scripts/manage.js help                    Show this help.');
@@ -2037,7 +2204,7 @@ function printHelp(): void {
   console.log('  --preset <minimal|default>   Which repo preset to seed when no config folder exists. Default: default.');
   console.log('  --force                      Replace an existing central config folder with the preset (DESTRUCTIVE — user edits lost).');
   console.log('  --agents <a,b>               Comma list of agents to wire (claude-code,codex). Each must be detected. Default: prompt on a TTY, else all detected.');
-  console.log('  --runtime <node|prebuilt|build>  Hook runtime: prebuilt wires the native Zig binary as the hot path, build compiles it first, node forces Node. Default: keep current (Node on a fresh install).');
+  console.log('  --runtime <node|prebuilt|build>  Hook runtime: default uses the shipped native Zig prebuilt when available; node forces Node, build compiles first. Also accepted by update.');
   console.log('');
   console.log('route options:');
   console.log('  add    --id <slug> --event <e> --doc <config-relative path> [--freq <n>] [--cwd <dir>]');
@@ -2048,7 +2215,7 @@ function printHelp(): void {
   console.log('exits nonzero. This CLI plus --json is the whole programmatic surface — no Node library, no daemon.');
   console.log('');
   console.log('Agents are detected by config-dir existence; an install/update/uninstall scopes to the agents recorded in <install root>/state.json.');
-  console.log('Native runtime: install --runtime prebuilt wires the prebuilt Zig binary as the hook hot path (build compiles it first, node forces Node); a platform without a shipped prebuilt falls back to the Node dispatcher.');
+  console.log('Native runtime: plain install/update wires the shipped Zig prebuilt as the hook hot path when available; --runtime node forces Node; a missing or undeployable prebuilt falls back to the Node dispatcher.');
   console.log('Installed manager artifacts are deployed under <install root>/scripts so generated control surfaces do not depend on the source checkout.');
   console.log('A Claude skills-dir plugin (baseline@skills-dir) is deployed + linked so Claude recognizes baseline; it carries no hooks.');
   console.log('A Codex plugin (' + CODEX_PLUGIN_KEY + ') is deployed under <install root>/codex-plugin/baseline, materialized at $CODEX_HOME/plugins/cache/' + CODEX_MARKETPLACE + '/' + CODEX_PLUGIN + '/' + CODEX_PLUGIN_VERSION + ', and activated by ' + CODEX_PLUGIN_TABLE + ' in config.toml.');
@@ -2140,12 +2307,13 @@ switch (cmd) {
   case 'verify':
     cmdVerify();
     break;
-  case 'update':
-    parseInstallOpts(process.argv.slice(3), 'update'); // reject native flags
-    cmdUpdate().catch((e) => fail('update: ' + e.message, 1));
+  case 'update': {
+    const opts = parseInstallOpts(process.argv.slice(3), 'update');
+    cmdUpdate(opts.runtime).catch((e) => fail('update: ' + e.message, 1));
     break;
+  }
   case 'doctor':
-    parseInstallOpts(process.argv.slice(3), 'doctor'); // reject native flags
+    parseInstallOpts(process.argv.slice(3), 'doctor'); // keep shared option validation consistent
     cmdDoctor(process.argv.slice(3).some(a => a === '--fix' || a === '-fix')).catch((e) => fail('doctor: ' + e.message, 1));
     break;
   default:

@@ -205,7 +205,15 @@ function testDefaultInstallAndVerify(): void {
   const home = homeFor(cfg);
   const install = run(['install'], cfg);
   assert.strictEqual(install.status, 0, install.stderr || install.stdout);
-  assert.match(install.stdout, /runtime\s+: node js/);
+  // R-009: a plain install now prefers the shipped native Zig prebuilt as the hook hot path
+  // when one is available for this platform; it only falls back to Node where none ships.
+  const target = nativePrebuiltForPlatform();
+  const havePrebuilt = target !== null && fs.existsSync(path.join(root, 'bin', target));
+  if (havePrebuilt) {
+    assert.match(install.stdout, /runtime\s+: native \(prebuilt /);
+  } else {
+    assert.match(install.stdout, /runtime\s+: node js/);
+  }
   // No --preset → DEFAULT_PRESET is now 'default'.
   assert.match(install.stdout, /config folder : .*\(seeded, preset: default\)/);
   assert.ok(install.stdout.includes('manager       : ' + installedManager(home)),
@@ -224,7 +232,14 @@ function testDefaultInstallAndVerify(): void {
 
   const settings = JSON.parse(fs.readFileSync(path.join(cfg, 'settings.json'), 'utf8'));
   const command = settings.hooks.UserPromptSubmit[0].hooks[0].command;
-  assert.ok(command.includes('baseline-recital.js'), command);
+  // On POSIX nativeBinName ("baseline-recital") is a substring of the Node .js path, so the
+  // native branch pairs the positive include with a negative /baseline-recital\.js/ check.
+  if (havePrebuilt) {
+    assert.ok(command.includes(nativeBinName), 'plain install with a prebuilt should wire the native binary: ' + command);
+    assert.ok(!/baseline-recital\.js/.test(command), 'native hot path must not wire the Node .js: ' + command);
+  } else {
+    assert.ok(/baseline-recital\.js/.test(command), 'plain install without a prebuilt should wire Node: ' + command);
+  }
   // default preset wires UserPromptSubmit + SessionStart (the 3 phase routes collapse to
   // one native SessionStart hook); PreToolUse stays unwired.
   assert.ok(settings.hooks.SessionStart, 'default preset should wire SessionStart');
@@ -395,8 +410,8 @@ function testDefaultPresetWiresBaseEventsBothAgents(): void {
       assert.strictEqual(s.hooks[ev].length, 1, label + ' ' + ev + ' should have exactly one group');
       assert.strictEqual(s.hooks[ev][0].hooks.length, 1, label + ' ' + ev + ' should have exactly one hook entry');
       assert.strictEqual(s.hooks[ev][0].matcher, undefined, label + ' ' + ev + ' group must carry no matcher');
-      assert.ok(s.hooks[ev][0].hooks[0].command.includes('baseline-recital.js'),
-        label + ' ' + ev + ' hook should be the baseline dispatcher');
+      assert.ok(s.hooks[ev][0].hooks[0].command.includes('baseline-recital'),
+        label + ' ' + ev + ' hook should be the baseline dispatcher (native binary or Node .js)');
     }
   }
 
@@ -444,7 +459,7 @@ function testCodexInstallAndAgentLinks(): void {
 
   const hooksJson = JSON.parse(fs.readFileSync(path.join(codex, 'hooks.json'), 'utf8'));
   const command = hooksJson.hooks.UserPromptSubmit[0].hooks[0].command;
-  assert.ok(command.includes('baseline-recital.js'), command);
+  assert.ok(command.includes('baseline-recital'), 'codex hook should be the baseline dispatcher (native binary or Node .js): ' + command);
   assert.ok(command.includes('--agent-config'), command);
   assert.ok(command.includes(codex), command);
   const agentContracts = agentHookContracts(codex);
@@ -586,25 +601,109 @@ function testNativeRuntimeInstallsAndWires(): void {
   assert.strictEqual(verify.status, 0, 'verify should pass against the wired native binary: ' + (verify.stderr || verify.stdout));
 }
 
-// With no native runtime requested the platform binary is absent, and the Node dispatcher
-// is wired + dispatches. Deterministic on every platform (no prebuilt is deployed).
+// Fallback to Node when the native prebuilt is unavailable even on a platform that normally
+// ships one. Seed the install from the checkout (this deploys the installed manager AND
+// copies bin/<prebuilt> into the isolated install root), remove ONLY that prebuilt copy, then
+// re-run via the INSTALLED manager whose repo.binDir is the install root. The vanished
+// prebuilt forces the Node dispatcher: no native binary stays deployed/linked, Node is wired,
+// and the wired Node command fires. The checkout's real bin/ asset is never touched. Skips
+// where no prebuilt ships for the platform (plain install is already Node there).
 function testNativeFallbackToNodeWhenBinaryAbsent(): void {
+  const target = nativePrebuiltForPlatform();
+  if (!target || !fs.existsSync(path.join(root, 'bin', target))) {
+    console.log('  (skip) testNativeFallbackToNodeWhenBinaryAbsent: no native prebuilt for ' + process.platform + '-' + process.arch + '.');
+    return;
+  }
   const cfg = tempConfig();
   const home = homeFor(cfg);
-  const install = run(['install'], cfg);
+  // 1. Seed from the checkout: deploys the installed manager and copies bin/<prebuilt> in.
+  assert.strictEqual(run(['install'], cfg).status, 0, 'seed install failed');
+
+  // 2. Remove ONLY the prebuilt copy inside the isolated install root (never the checkout).
+  const isolatedPrebuilt = path.join(home, 'bin', target);
+  assert.ok(fs.existsSync(isolatedPrebuilt), 'seed install should copy the prebuilt into the install root bin/');
+  fs.rmSync(isolatedPrebuilt, { force: true });
+
+  // 3. Re-run the INSTALLED manager: its repo.binDir is <home>/bin, so the vanished prebuilt
+  //    forces a Node fallback (removeNative clears the previously-deployed native binary).
+  const install = runInstalled(['update'], cfg, home);
   assert.strictEqual(install.status, 0, install.stderr || install.stdout);
   assert.match(install.stdout, /runtime\s+: node js/);
-  assert.ok(!fs.existsSync(path.join(home, 'hooks', nativeBinName)), 'no native binary should deploy without --runtime');
-  assert.ok(!fs.existsSync(agentHookBin(cfg)), 'no native binary should link into the agent without --runtime');
+  assert.ok(install.stdout.includes('using the Node dispatcher'),
+    'fallback should announce it is using the Node dispatcher: ' + install.stdout);
+  assert.ok(!fs.existsSync(path.join(home, 'hooks', nativeBinName)),
+    'native binary must be removed from the center after falling back to Node');
+  assert.ok(!fs.existsSync(agentHookBin(cfg)),
+    'native binary must be unlinked from the agent after falling back to Node');
 
   const cmd = wiredCommandFor(cfg, 'UserPromptSubmit');
-  assert.ok(/baseline-recital\.js/.test(cmd), 'binary absent -> the Node .js must be wired: ' + cmd);
+  assert.ok(/baseline-recital\.js/.test(cmd), 'fallback -> the Node .js must be wired: ' + cmd);
 
-  setCentralConfig(home, [
-    { id: 'fb', event: 'UserPromptSubmit', freq: 1, doc: 'docs/fb.md' }
-  ], { 'docs/fb.md': 'FALLBACK OK\n' });
-  const body = fireBodies(hook({ session_id: 'fallback', hook_event_name: 'UserPromptSubmit', cwd: cfg }, cfg));
-  assert.ok(body && body.includes('FALLBACK OK'), 'the Node dispatcher should fire when the native binary is absent');
+  // verify parses the WIRED command and spawns it, so this exercises the actually-wired Node
+  // command end-to-end (not just the source dispatcher driven directly by hook()).
+  const verify = run(['verify'], cfg);
+  assert.strictEqual(verify.status, 0, 'the wired Node command should fire after fallback: ' + (verify.stderr || verify.stdout));
+  assert.match(verify.stdout, /verify: PASS/);
+}
+
+// A plain update prefers native even when no native binary was deployed beforehand: starting
+// from a Node install, update re-selects the shipped prebuilt, deploys + links it, and rewires
+// the native hot path. Defends that update's default is "prefer native", not "keep whatever was
+// there". Skips where no prebuilt ships for the platform.
+function testUpdatePrefersNativeWithoutPreexistingBinary(): void {
+  const target = nativePrebuiltForPlatform();
+  if (!target || !fs.existsSync(path.join(root, 'bin', target))) {
+    console.log('  (skip) testUpdatePrefersNativeWithoutPreexistingBinary: no native prebuilt for ' + process.platform + '-' + process.arch + '.');
+    return;
+  }
+  const cfg = tempConfig();
+  const home = homeFor(cfg);
+  // Start from Node: no native binary deployed or linked.
+  assert.strictEqual(run(['install', '--runtime', 'node'], cfg).status, 0, 'node install failed');
+  assert.ok(!fs.existsSync(path.join(home, 'hooks', nativeBinName)), 'node install must not deploy a native binary');
+  assert.ok(!fs.existsSync(agentHookBin(cfg)), 'node install must not link a native binary');
+  assert.ok(/baseline-recital\.js/.test(wiredCommandFor(cfg, 'UserPromptSubmit')), 'node install must wire the Node .js');
+
+  // Plain update (no --runtime) re-selects the shipped prebuilt as the hot path.
+  const update = run(['update'], cfg);
+  assert.strictEqual(update.status, 0, update.stderr || update.stdout);
+  assert.match(update.stdout, /runtime\s+: native \(prebuilt /);
+  assert.ok(fs.existsSync(path.join(home, 'hooks', nativeBinName)), 'update should deploy the native binary');
+  assert.ok(fs.existsSync(agentHookBin(cfg)), 'update should link the native binary into the agent');
+  const cmd = wiredCommandFor(cfg, 'UserPromptSubmit');
+  assert.ok(cmd.includes(nativeBinName), 'update should wire the native binary: ' + cmd);
+  assert.ok(!/baseline-recital\.js/.test(cmd), 'native hot path must not wire the Node .js: ' + cmd);
+
+  const verify = run(['verify'], cfg);
+  assert.strictEqual(verify.status, 0, 'the wired native command should fire after update: ' + (verify.stderr || verify.stdout));
+}
+
+// update --runtime node forces the Node dispatcher even when native is the current hot path:
+// starting from a native install, the explicit downgrade removes the native binary, unwires
+// it, and rewires Node. Skips where no prebuilt ships (native is never the hot path there).
+function testUpdateRuntimeNodeForcesNode(): void {
+  const target = nativePrebuiltForPlatform();
+  if (!target || !fs.existsSync(path.join(root, 'bin', target))) {
+    console.log('  (skip) testUpdateRuntimeNodeForcesNode: no native prebuilt for ' + process.platform + '-' + process.arch + '.');
+    return;
+  }
+  const cfg = tempConfig();
+  const home = homeFor(cfg);
+  // Start from native (the new default): confirm the downgrade actually has something to undo.
+  assert.strictEqual(run(['install'], cfg).status, 0, 'native install failed');
+  assert.ok(fs.existsSync(path.join(home, 'hooks', nativeBinName)), 'precondition: native binary should be deployed');
+  assert.ok(fs.existsSync(agentHookBin(cfg)), 'precondition: native binary should be linked');
+
+  const update = run(['update', '--runtime', 'node'], cfg);
+  assert.strictEqual(update.status, 0, update.stderr || update.stdout);
+  assert.match(update.stdout, /runtime\s+: node js/);
+  assert.ok(!fs.existsSync(path.join(home, 'hooks', nativeBinName)), 'update --runtime node must remove the native binary');
+  assert.ok(!fs.existsSync(agentHookBin(cfg)), 'update --runtime node must unlink the native binary from the agent');
+  const cmd = wiredCommandFor(cfg, 'UserPromptSubmit');
+  assert.ok(/baseline-recital\.js/.test(cmd), 'update --runtime node must wire the Node .js: ' + cmd);
+
+  const verify = run(['verify'], cfg);
+  assert.strictEqual(verify.status, 0, 'the wired Node command should fire after --runtime node: ' + (verify.stderr || verify.stdout));
 }
 
 // End-to-end byte-parity: identical stdin fixtures to the native binary and the Node
@@ -740,6 +839,129 @@ function testNativeCounterLock(): void {
     fs.rmSync(dir, { recursive: true, force: true });
   }
 }
+// Native HEALTH checks (R-009): once the default/native hot path is wired, status and
+// doctor must surface a fault when the central or per-agent native binary/link goes
+// missing — a native-wired install must never read back as healthy against a dangling
+// or absent native binary. The previous behavior only inspected the JS dispatcher and
+// contracts links, so a vanished native binary was invisible. Skips cleanly where no
+// prebuilt ships for the platform (native is never the hot path there).
+//
+// Link-layer note: install links the central native binary into each agent via symlink,
+// falling back to hardlink/copy where symlinks are unavailable. With a hardlink/copy the
+// per-agent file SURVIVES a central deletion (it is still present and executable), so the
+// per-agent native link/executable checks are mechanism-dependent for a CENTRAL fault.
+// We therefore assert only the deterministic, mechanism-independent surfaces: the central
+// binary state (checked directly), and — for the per-agent fault — the agent file deleted.
+function testNativeHealthCentralBinaryMissing(): void {
+  const target = nativePrebuiltForPlatform();
+  if (!target || !fs.existsSync(path.join(root, 'bin', target))) {
+    console.log('  (skip) testNativeHealthCentralBinaryMissing: no native prebuilt for ' + process.platform + '-' + process.arch + '.');
+    return;
+  }
+  const cfg = tempConfig();
+  const home = homeFor(cfg);
+  // A PLAIN (default) install prefers the shipped native prebuilt as the hot path.
+  assert.strictEqual(run(['install'], cfg).status, 0, 'native install failed');
+  const centralBin = path.join(home, 'hooks', nativeBinName);
+  assert.ok(fs.existsSync(centralBin), 'precondition: native binary should be deployed to the center');
+
+  // Precondition: status --json reports the native dispatcher active + healthy.
+  const before = run(['status', '--json'], cfg);
+  assert.strictEqual(before.status, 0, before.stderr || before.stdout);
+  const beforeObj = JSON.parse(before.stdout.trim());
+  assert.strictEqual(beforeObj.data.nativeDispatcher.active, true, 'native hot path should be active');
+  assert.strictEqual(beforeObj.data.nativeDispatcher.state.ok, true, 'central native binary should be healthy pre-fault');
+
+  // BREAK IT: delete ONLY the central native binary (never the repo checkout's bin/).
+  fs.rmSync(centralBin, { force: true });
+
+  // status --json must surface the central native fault. The central binary state is
+  // checked directly (nativeBinaryState(central.hookBin)), so this is deterministic
+  // across the symlink/hardlink/copy link layer. status keeps exit 0: it reports.
+  const res = run(['status', '--json'], cfg);
+  assert.strictEqual(res.status, 0, res.stderr || res.stdout);
+  const obj = JSON.parse(res.stdout.trim());
+  assert.strictEqual(obj.data.nativeDispatcher.active, true, 'native wiring is unchanged; still active');
+  assert.strictEqual(obj.data.nativeDispatcher.state.ok, false, 'central native binary must be unhealthy after deletion');
+  assert.match(obj.data.nativeDispatcher.state.detail, /missing at/,
+    'state.detail should name the missing central binary: ' + obj.data.nativeDispatcher.state.detail);
+
+  // Human status prints the central native binary line as UNHEALTHY.
+  const human = run(['status'], cfg);
+  assert.strictEqual(human.status, 0, human.stderr || human.stdout);
+  assert.match(human.stdout, /native binary\s+: UNHEALTHY/,
+    'human status must print the central native binary unhealthy: ' + human.stdout);
+
+  // doctor must FAIL (exit 1) and name a native binary fault — the old JS-only doctor
+  // would report healthy here. At least one native check fails regardless of link layer.
+  const broken = run(['doctor'], cfg);
+  assert.strictEqual(broken.status, 1, 'doctor should exit 1 when the central native binary is missing');
+  assert.match(broken.stdout, /\[FAIL\] native binary/, 'doctor must surface a [FAIL] native binary check: ' + broken.stdout);
+  assert.ok(!/doctor: healthy/.test(broken.stdout), 'doctor must not report healthy with a missing native binary');
+
+  // doctor --fix redeploys via update (which re-selects the repo prebuilt) and repairs.
+  const fixed = run(['doctor', '--fix'], cfg);
+  assert.strictEqual(fixed.status, 0, fixed.stderr || fixed.stdout);
+  assert.match(fixed.stdout, /doctor: installation repaired/);
+  assert.ok(fs.existsSync(centralBin), 'doctor --fix should redeploy the central native binary');
+  const healthy = run(['doctor'], cfg);
+  assert.strictEqual(healthy.status, 0, healthy.stderr || healthy.stdout);
+  assert.match(healthy.stdout, /doctor: healthy/);
+}
+
+// Deleting ONLY the per-agent native binary/link (central intact) is deterministic across
+// the link layer — the agent file is gone — so the per-agent native state and link can be
+// asserted directly, in both status JSON and doctor.
+function testNativeHealthAgentBinaryMissing(): void {
+  const target = nativePrebuiltForPlatform();
+  if (!target || !fs.existsSync(path.join(root, 'bin', target))) {
+    console.log('  (skip) testNativeHealthAgentBinaryMissing: no native prebuilt for ' + process.platform + '-' + process.arch + '.');
+    return;
+  }
+  const cfg = tempConfig();
+  const home = homeFor(cfg);
+  assert.strictEqual(run(['install'], cfg).status, 0, 'native install failed');
+  assert.ok(fs.existsSync(path.join(home, 'hooks', nativeBinName)), 'precondition: central native binary present');
+  assert.ok(fs.existsSync(agentHookBin(cfg)), 'precondition: agent native binary linked');
+
+  // BREAK IT: delete ONLY the per-agent native binary/link; the central binary is intact.
+  fs.rmSync(agentHookBin(cfg), { force: true });
+
+  // status --json: central stays healthy, but the agent's native binary state AND its
+  // native link must read unhealthy. claude-code is the first registered agent.
+  const res = run(['status', '--json'], cfg);
+  assert.strictEqual(res.status, 0, res.stderr || res.stdout);
+  const obj = JSON.parse(res.stdout.trim());
+  assert.strictEqual(obj.data.nativeDispatcher.state.ok, true, 'central native binary is intact');
+  const claude = obj.data.agents[0];
+  assert.strictEqual(claude.name, 'claude-code', 'first agent should be claude-code');
+  assert.ok(claude.nativeBinary, 'agent nativeBinary state should be reported when native is wired');
+  assert.strictEqual(claude.nativeBinary.ok, false, 'agent native binary must be unhealthy after deletion');
+  assert.match(claude.nativeBinary.detail, /missing at/, 'agent nativeBinary.detail should name the missing file');
+  assert.ok(claude.links && claude.links.native, 'agent native link state should be reported when native is wired');
+  assert.strictEqual(claude.links.native.ok, false, 'agent native link must be unhealthy after deletion');
+
+  // Human status: the per-agent native runtime line must read UNHEALTHY.
+  const human = run(['status'], cfg);
+  assert.strictEqual(human.status, 0, human.stderr || human.stdout);
+  assert.match(statusAgentSection(human.stdout, 'claude-code'), /native\s+: UNHEALTHY/,
+    'human status must print the agent native runtime unhealthy');
+
+  // doctor: the native link + native executable checks must FAIL (the agent file is gone).
+  const broken = run(['doctor'], cfg);
+  assert.strictEqual(broken.status, 1, 'doctor should exit 1 when the agent native binary is missing');
+  assert.match(broken.stdout, /\[FAIL\] native link/, 'doctor must flag the missing native link: ' + broken.stdout);
+  assert.match(broken.stdout, /\[FAIL\] native executable/, 'doctor must flag the missing agent native executable: ' + broken.stdout);
+
+  // doctor --fix relinks the agent native binary; rescan comes back healthy.
+  const fixed = run(['doctor', '--fix'], cfg);
+  assert.strictEqual(fixed.status, 0, fixed.stderr || fixed.stdout);
+  assert.match(fixed.stdout, /doctor: installation repaired/);
+  assert.ok(fs.existsSync(agentHookBin(cfg)), 'doctor --fix should relink the agent native binary');
+  const healthy = run(['doctor'], cfg);
+  assert.strictEqual(healthy.status, 0, healthy.stderr || healthy.stdout);
+  assert.match(healthy.stdout, /doctor: healthy/);
+}
 
 function testInvalidSettingsFailsClosed(): void {
   const cfg = tempConfig();
@@ -822,7 +1044,7 @@ function testCoResidentHookPreserved(): void {
   const settings = JSON.parse(fs.readFileSync(path.join(cfg, 'settings.json'), 'utf8'));
   const cmds = settings.hooks.UserPromptSubmit.flatMap((g: any) => g.hooks.map((h: any) => h.command));
   assert.ok(cmds.some((c: string) => c === 'echo theirs'), 'co-resident hook was dropped');
-  assert.ok(cmds.some((c: string) => c.includes('baseline-recital.js')), 'baseline hook not added');
+  assert.ok(cmds.some((c: string) => c.includes('baseline-recital')), 'baseline hook not added');
 
   // Uninstall removes only ours.
   assert.strictEqual(run(['uninstall'], cfg).status, 0);
@@ -847,7 +1069,7 @@ function testBaselineHookDoesNotInheritMatcher(): void {
   const groups = settings.hooks.PreToolUse;
   assert.ok(groups.some((g: any) => g.matcher === 'Read' && g.hooks.some((h: any) => h.command === 'echo theirs')),
     'co-resident matched group was not preserved');
-  assert.ok(groups.some((g: any) => g.matcher === undefined && g.hooks.some((h: any) => h.command.includes('baseline-recital.js'))),
+  assert.ok(groups.some((g: any) => g.matcher === undefined && g.hooks.some((h: any) => h.command.includes('baseline-recital'))),
     'baseline hook should be installed in its own matcher-free group');
 
   const verify = run(['verify'], cfg);
@@ -2256,8 +2478,12 @@ const TESTS: Array<[string, () => void]> = [
   ['testUnknownPresetFails', testUnknownPresetFails],
   ['testNativeRuntimeInstallsAndWires', testNativeRuntimeInstallsAndWires],
   ['testNativeFallbackToNodeWhenBinaryAbsent', testNativeFallbackToNodeWhenBinaryAbsent],
+  ['testUpdatePrefersNativeWithoutPreexistingBinary', testUpdatePrefersNativeWithoutPreexistingBinary],
+  ['testUpdateRuntimeNodeForcesNode', testUpdateRuntimeNodeForcesNode],
   ['testNativeDispatchParity', testNativeDispatchParity],
   ['testNativeCounterLock', testNativeCounterLock],
+  ['testNativeHealthCentralBinaryMissing', testNativeHealthCentralBinaryMissing],
+  ['testNativeHealthAgentBinaryMissing', testNativeHealthAgentBinaryMissing],
   ['testDefaultInstallAndVerify', testDefaultInstallAndVerify],
   ['testInstalledManagerInfersInstallRootWithoutBaselineHome', testInstalledManagerInfersInstallRootWithoutBaselineHome],
   ['testBaselineHomeOverridesInstalledManagerLocation', testBaselineHomeOverridesInstalledManagerLocation],
