@@ -1,5 +1,19 @@
 node_modules/
 .arca/
+
+# Local agent / IDE artifacts — never ship editor or agent state.
+# Exception: .claude/rules/routing.md stays tracked (arca routing pointer, R-008).
+.idea/
+.vscode/
+.omp/
+.codex/
+.opencode/
+.cursor/
+.pi/
+.claude/*
+!.claude/rules/
+.claude/rules/*
+!.claude/rules/routing.md
 resources/*
 !resources/logo.png
 !resources/logo.svg
