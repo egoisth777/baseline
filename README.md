@@ -9,7 +9,7 @@
   <a href="resources/logo.txt">plain text logo</a>
 </p>
 
-A drift-correction system for Claude Code and Codex. Over a long session the agent forgets standing rules (e.g. "route file operations through subagents, don't do them inline"). baseline periodically injects small, trusted text into the model's context at chosen hook events — most often a **recital**: every Nth user prompt the agent must open its reply with a fixed prefix line and restate the rules verbatim before continuing. Reciting both re-aligns the agent (generating the rule primes the next action) and exposes drift (you see in the recital whether it got the rules right).
+A drift-correction system for AI coding agents — Claude Code, Codex, pi, oh-my-pi, and opencode. Over a long session the agent forgets standing rules (e.g. "route file operations through subagents, don't do them inline"). baseline periodically injects small, trusted text into the model's context at chosen hook events — most often a **recital**: every Nth user prompt the agent must open its reply with a fixed prefix line and restate the rules verbatim before continuing. Reciting both re-aligns the agent (generating the rule primes the next action) and exposes drift (you see in the recital whether it got the rules right).
 
 Inspired by the Blade Runner 2049 baseline test.
 
@@ -22,7 +22,7 @@ Two things are kept strictly separate:
 - **Docs** (`docs/*.md`) hold *what* is injected — the exact text, verbatim. No wrapper is added by code, so any "open with this line, restate verbatim" scaffolding lives inside the doc.
 - **`config.json`** holds *when/where* — routing only: which doc fires at which event, how often, and under what scope. It carries no injected text.
 
-This package targets Claude Code and Codex. Both use the same route config and runtime selection: plain install/update wires the shipped Zig/native dispatcher as the default hook hot path when available; Node remains the lifecycle manager, fallback dispatcher, and explicit `--runtime node` path.
+This package targets five agents sharing one route config and one dispatcher. Claude Code and Codex read a JSON hook config the manager edits surgically. pi, oh-my-pi, and opencode host in-process extensions instead, so the manager generates a small marker-tagged **shim** (a pi/omp extension or an opencode plugin) that spawns the same dispatcher and injects its output; pi/oh-my-pi extensions can deliver `UserPromptSubmit` + `SessionStart` routes, opencode delivers all four events. Runtime selection is shared: plain install/update wires the shipped Zig/native dispatcher as the default hook hot path when available; Node remains the lifecycle manager, fallback dispatcher, and explicit `--runtime node` path.
 
 Canonical goal docs live under `.arca/baseline-sp/goal/`: `vision.md`, `architecture.md`, and `vocabulary.md`, with `plain.md` recording the current decision summary. They define stable external contracts as the CLI lifecycle, config schema, hook stdin/stdout protocol, and plugin manifests. Static docs are the current default; dynamic placeholder replacement is future opt-in.
 
@@ -34,7 +34,7 @@ Supported injecting events: `UserPromptSubmit`, `SessionStart` (optionally a lif
 
 ## Requirements
 
-- **Claude Code or Codex** — the agent harness
+- **Claude Code, Codex, pi, oh-my-pi, or opencode** — the agent harness
 - **Node.js** — runs the installer/manager and the Node fallback/explicit dispatcher
 - **Zero runtime dependencies** — the Node dispatcher and manager import only the Node standard library (enforced by a regression test); TypeScript is a dev-only build dependency.
 
@@ -59,11 +59,11 @@ Both delegate to `node scripts/manage.js install`, which:
 2. Establishes the **config folder** — your routes + docs (`config.json` + `docs/`). It lives wherever you point `BASELINE_CFG` (else `<install root>/cfg`); when `BASELINE_CFG` is set, `<install root>/cfg` is a symlink to it. If empty, it is seeded from a repo **preset** — `default` by plain install (`--preset minimal` for the neutral floor).
 3. **Links** each agent's config dir back into the install root — for example `~/.claude/hooks/baseline-recital.js` + `~/.claude/hooks/contracts.js` and `~/.codex/hooks/baseline-recital.js` + `~/.codex/hooks/contracts.js` → the install-root hook artifacts, with the native hook binary linked when active and each agent's `cfg/baseline/` → `<install root>/cfg` (your config folder).
 4. Deploys the installed control-surface payload. Claude gets the skills-dir plugin as `baseline@skills-dir`; Codex gets a manager-owned local marketplace registered and installed through `codex plugin`. The manager does not edit Codex's private cache or plugin tables directly. Control-surface plugins carry **no hooks** — they only make baseline discoverable, not active.
-5. Wires Claude Code `~/.claude/settings.json` and Codex `~/.codex/hooks.json` for **exactly** the events the config's routes use, and unwires events no route references.
+5. Wires Claude Code `~/.claude/settings.json` and Codex `~/.codex/hooks.json` for **exactly** the events the config's routes use, and unwires events no route references. For pi (`~/.pi/agent/extensions/`), oh-my-pi (`~/.omp/agent/extensions/`), and opencode (`~/.config/opencode/plugins/baseline/` plus a `plugin` entry in `opencode.json`) it deploys the generated shim when the config has events that agent can deliver, and removes it when none remain.
 
 When `status` reports a symlink, editing your config folder (`BASELINE_CFG`, else `<install root>/cfg`) changes live behavior for every wired agent at once. On Windows without symlink privilege the link layer degrades to a hardlink (dispatcher/contracts) or a plain copy (config folder and skill/plugin payloads); `status`/`doctor` report which mechanism is in effect, and a copy needs a reinstall/update after edits.
 
-The **install root** (regenerable artifacts: dispatcher + skill payload) resolves as `BASELINE_HOME`, else the installed manager's own root, else `~/.baseline`. The **config folder** (your routes + docs) defaults to `<install root>/cfg`, or set `BASELINE_CFG` to keep it anywhere — e.g. a version-controlled dotfiles repo — in which case `<install root>/cfg` becomes a symlink to it. Config and artifacts never share a directory. Claude's config dir comes from `CLAUDE_CONFIG_DIR` or `~/.claude`; Codex's comes from `CODEX_HOME` or `~/.codex`. After install, open `/hooks` in each agent once (or restart) so hook config reloads.
+The **install root** (regenerable artifacts: dispatcher + skill payload) resolves as `BASELINE_HOME`, else the installed manager's own root, else `~/.baseline`. The **config folder** (your routes + docs) defaults to `<install root>/cfg`, or set `BASELINE_CFG` to keep it anywhere — e.g. a version-controlled dotfiles repo — in which case `<install root>/cfg` becomes a symlink to it. Config and artifacts never share a directory. Claude's config dir comes from `CLAUDE_CONFIG_DIR` or `~/.claude`; Codex's comes from `CODEX_HOME` or `~/.codex`; pi's from `BASELINE_PI_HOME` or `~/.pi/agent`; oh-my-pi's from `BASELINE_OMP_HOME` or `~/.omp/agent`; opencode's from `BASELINE_OPENCODE_HOME`, else `$XDG_CONFIG_HOME/opencode`, else `~/.config/opencode` (the `BASELINE_*` variables are manager-owned detection overrides — those agents define none of their own). After install, open `/hooks` in each agent once (or restart) so hook config reloads.
 
 ## The config folder (the everyday task)
 

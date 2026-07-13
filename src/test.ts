@@ -33,6 +33,31 @@ function codexFor(cfg: string): string {
   return cfg + '-codex';
 }
 
+// Extension-host agent config dirs (pi / oh-my-pi / opencode). NOT created by
+// default, so detection-driven tests keep seeing exactly claude-code + codex;
+// shim tests create the dirs they need explicitly.
+function piFor(cfg: string): string {
+  return cfg + '-pi';
+}
+
+function ompFor(cfg: string): string {
+  return cfg + '-omp';
+}
+
+function opencodeFor(cfg: string): string {
+  return cfg + '-opencode';
+}
+
+// Manager-owned detection overrides for the extension-host agents; always set so a
+// developer's real ~/.pi, ~/.omp, or ~/.config/opencode is never detected or touched.
+function shimAgentEnv(cfg: string): { [k: string]: string } {
+  return {
+    BASELINE_PI_HOME: piFor(cfg),
+    BASELINE_OMP_HOME: ompFor(cfg),
+    BASELINE_OPENCODE_HOME: opencodeFor(cfg),
+  };
+}
+
 // Run the manager with isolated install root + agent config dirs. extraEnv can set
 // BASELINE_CFG to exercise an external (symlinked) config folder.
 function run(args: string[], cfg: string, home?: string, extraEnv?: { [k: string]: string }, workingDirectory = root) {
@@ -50,7 +75,7 @@ function run(args: string[], cfg: string, home?: string, extraEnv?: { [k: string
       // exercise external config pass their own BASELINE_CFG via extraEnv, which wins.
       BASELINE_CFG: path.join(baseHome, 'cfg'),
       BASELINE_CODEX_CLI: fakeCodexCli,
-    }, extraEnv || {}),
+    }, shimAgentEnv(cfg), extraEnv || {}),
     encoding: 'utf8'
   });
 }
@@ -65,7 +90,7 @@ function runInstalled(args: string[], cfg: string, home?: string, extraEnv?: { [
       BASELINE_HOME: baseHome,
       BASELINE_CFG: path.join(baseHome, 'cfg'),
       BASELINE_CODEX_CLI: fakeCodexCli
-    }, extraEnv || {}),
+    }, shimAgentEnv(cfg), extraEnv || {}),
     encoding: 'utf8'
   });
 }
@@ -75,7 +100,7 @@ function runInstalledWithoutBaselineEnv(args: string[], cfg: string, home: strin
     CLAUDE_CONFIG_DIR: cfg,
     CODEX_HOME: codexFor(cfg),
     BASELINE_CODEX_CLI: fakeCodexCli,
-  }, extraEnv || {});
+  }, shimAgentEnv(cfg), extraEnv || {});
   delete env.BASELINE_HOME;
   delete env.BASELINE_CFG;
   return spawnSync(process.execPath, [installedManager(home)].concat(args), {
@@ -90,7 +115,7 @@ function runInstalledWithoutBaselineEnv(args: string[], cfg: string, home: strin
 function hook(input: any, cfg: string) {
   return spawnSync(process.execPath, [dispatcher], {
     input: JSON.stringify(input),
-    env: Object.assign({}, process.env, { CLAUDE_CONFIG_DIR: cfg, CODEX_HOME: codexFor(cfg), BASELINE_HOME: homeFor(cfg) }),
+    env: Object.assign({}, process.env, { CLAUDE_CONFIG_DIR: cfg, CODEX_HOME: codexFor(cfg), BASELINE_HOME: homeFor(cfg) }, shimAgentEnv(cfg)),
     encoding: 'utf8'
   });
 }
@@ -1088,8 +1113,9 @@ function testUpdateReplacesLegacyWindowsHookCommand(): void {
   assert.match(statusAgentSection(status.stdout, 'codex'), /invocation\s+: UNHEALTHY/);
   const jsonStatus = run(['status', '--json'], cfg);
   assert.strictEqual(jsonStatus.status, 0, jsonStatus.stderr || jsonStatus.stdout);
-  const jsonAgents = JSON.parse(jsonStatus.stdout).data.agents;
-  assert.ok(jsonAgents.every((agent: any) => agent.invocation.canonical === false),
+  const jsonAgents = JSON.parse(jsonStatus.stdout).data.agents
+    .filter((agent: any) => agent.name === 'claude-code' || agent.name === 'codex');
+  assert.ok(jsonAgents.length === 2 && jsonAgents.every((agent: any) => agent.invocation.canonical === false),
     'JSON status must expose noncanonical invocation drift for both agents');
 
   const update = run(['update', '--runtime', 'node'], cfg);
@@ -2983,6 +3009,146 @@ function testUpdateDropsVanishedRecordedAgent(): void {
   assert.ok(!fs.existsSync(path.join(codex, 'hooks.json')), 'dropped codex must not be wired');
 }
 
+// --- extension-shim agents (pi / oh-my-pi / opencode) ------------------------
+
+// install --agents pi deploys the marker-tagged extension shim with the agent dir
+// baked in, links the dispatcher artifacts, and uninstall removes exactly our shim.
+function testPiShimInstallUninstall(): void {
+  const cfg = tempConfig();
+  const pi = piFor(cfg);
+  fs.mkdirSync(pi, { recursive: true });
+  const install = run(['install', '--agents', 'pi'], cfg);
+  assert.strictEqual(install.status, 0, install.stderr || install.stdout);
+
+  const shim = path.join(pi, 'extensions', 'baseline-recital.ts');
+  const text = fs.readFileSync(shim, 'utf8');
+  assert.ok(text.startsWith('// baseline-shim v1'), 'shim must start with the ownership marker');
+  assert.ok(text.includes(JSON.stringify(pi)), 'shim must bake in the agent config dir');
+  assert.ok(text.includes('before_agent_start') && text.includes('session_start'),
+    'pi shim must handle before_agent_start and session_start');
+  assert.ok(fs.existsSync(path.join(pi, 'hooks', 'baseline-recital.js')), 'dispatcher link deployed');
+  assert.ok(fs.existsSync(path.join(pi, 'cfg', 'baseline', 'config.json')), 'cfg link deployed');
+  assert.ok(!fs.existsSync(path.join(pi, 'settings.json')), 'pi settings.json must never be created or rewritten');
+
+  const state = JSON.parse(fs.readFileSync(path.join(homeFor(cfg), 'state.json'), 'utf8'));
+  assert.deepStrictEqual(state, { agents: ['pi'] }, 'state.json should record exactly the selected set');
+
+  const status = run(['status'], cfg);
+  assert.match(statusAgentSection(status.stdout, 'pi'), /shim\s+: OK \(generated, current\)/);
+
+  const uninstall = run(['uninstall'], cfg);
+  assert.strictEqual(uninstall.status, 0, uninstall.stderr || uninstall.stdout);
+  assert.ok(!fs.existsSync(shim), 'uninstall must remove our shim');
+}
+
+// oh-my-pi shares the pi extension surface but its own config dir.
+function testOmpShimInstall(): void {
+  const cfg = tempConfig();
+  const omp = ompFor(cfg);
+  fs.mkdirSync(omp, { recursive: true });
+  const install = run(['install', '--agents', 'oh-my-pi'], cfg);
+  assert.strictEqual(install.status, 0, install.stderr || install.stdout);
+  const shim = path.join(omp, 'extensions', 'baseline-recital.ts');
+  const text = fs.readFileSync(shim, 'utf8');
+  assert.ok(text.startsWith('// baseline-shim v1'), 'marker-tagged shim deployed');
+  assert.ok(text.includes(JSON.stringify(omp)), 'shim must bake in the oh-my-pi config dir');
+}
+
+// opencode gets a generated plugin dir plus a surgical opencode.json plugin-array
+// entry; co-resident config keys and entries survive install and uninstall.
+function testOpencodeShimInstallUninstall(): void {
+  const cfg = tempConfig();
+  const oc = opencodeFor(cfg);
+  fs.mkdirSync(oc, { recursive: true });
+  write(path.join(oc, 'opencode.json'),
+    JSON.stringify({ theme: 'dark', plugin: ['./plugins/other/plugin.js'] }, null, 2) + '\n');
+  const install = run(['install', '--agents', 'opencode'], cfg);
+  assert.strictEqual(install.status, 0, install.stderr || install.stdout);
+
+  const shim = path.join(oc, 'plugins', 'baseline', 'plugin.js');
+  const text = fs.readFileSync(shim, 'utf8');
+  assert.ok(text.startsWith('// baseline-shim v1'), 'shim must start with the ownership marker');
+  assert.ok(text.includes('experimental.chat.system.transform'), 'delivery hook present');
+  assert.ok(fs.existsSync(path.join(oc, 'plugins', 'baseline', 'package.json')), 'plugin package.json deployed');
+
+  const oj = JSON.parse(fs.readFileSync(path.join(oc, 'opencode.json'), 'utf8'));
+  assert.strictEqual(oj.theme, 'dark', 'co-resident keys preserved');
+  assert.ok(oj.plugin.indexOf('./plugins/baseline/plugin.js') !== -1, 'our plugin entry added');
+  assert.ok(oj.plugin.indexOf('./plugins/other/plugin.js') !== -1, 'co-resident plugin entries preserved');
+
+  const uninstall = run(['uninstall'], cfg);
+  assert.strictEqual(uninstall.status, 0, uninstall.stderr || uninstall.stdout);
+  assert.ok(!fs.existsSync(shim), 'plugin.js removed');
+  assert.ok(!fs.existsSync(path.join(oc, 'plugins', 'baseline')), 'empty plugin dir removed');
+  const after = JSON.parse(fs.readFileSync(path.join(oc, 'opencode.json'), 'utf8'));
+  assert.deepStrictEqual(after.plugin, ['./plugins/other/plugin.js'], 'only our entry removed');
+}
+
+// A file at the shim path without our marker is foreign: hard error, left untouched.
+function testShimForeignFileRefused(): void {
+  const cfg = tempConfig();
+  const pi = piFor(cfg);
+  const shim = path.join(pi, 'extensions', 'baseline-recital.ts');
+  write(shim, 'export default function () {}\n');
+  const install = run(['install', '--agents', 'pi'], cfg);
+  assert.notStrictEqual(install.status, 0, 'foreign file at the shim path must be a hard error');
+  assert.match(install.stdout + install.stderr, /foreign file/);
+  assert.strictEqual(fs.readFileSync(shim, 'utf8'), 'export default function () {}\n', 'foreign file untouched');
+}
+
+// No deliverable events → no shim (pi cannot deliver tool events; opencode can).
+function testShimSkippedWhenNoDeliverableEvents(): void {
+  const cfg = tempConfig();
+  const home = homeFor(cfg);
+  const pi = piFor(cfg);
+  const oc = opencodeFor(cfg);
+  fs.mkdirSync(pi, { recursive: true });
+  fs.mkdirSync(oc, { recursive: true });
+  assert.strictEqual(run(['install', '--agents', 'pi,opencode'], cfg).status, 0);
+
+  setCentralConfig(home, [{ id: 'tools', event: 'PreToolUse', freq: 1, doc: 'docs/tools.md' }],
+    { 'docs/tools.md': 'tool doc\n' });
+  const update = run(['update'], cfg);
+  assert.strictEqual(update.status, 0, update.stderr || update.stdout);
+  assert.ok(!fs.existsSync(path.join(pi, 'extensions', 'baseline-recital.ts')),
+    'pi shim must be removed when the config has no pi-deliverable events');
+  assert.match(update.stdout, /shim NOTICE : events \[PreToolUse\]/, 'undeliverable notice for pi');
+  assert.ok(fs.existsSync(path.join(oc, 'plugins', 'baseline', 'plugin.js')),
+    'opencode shim must stay (PreToolUse is deliverable there)');
+}
+
+// A hand-edited (stale) shim is reported by status/doctor and restored by update.
+function testShimStaleRefreshedOnUpdate(): void {
+  const cfg = tempConfig();
+  const pi = piFor(cfg);
+  fs.mkdirSync(pi, { recursive: true });
+  assert.strictEqual(run(['install', '--agents', 'pi'], cfg).status, 0);
+  const shim = path.join(pi, 'extensions', 'baseline-recital.ts');
+  const original = fs.readFileSync(shim, 'utf8');
+  fs.writeFileSync(shim, original + '// drifted\n', 'utf8');
+
+  const status = run(['status'], cfg);
+  assert.match(statusAgentSection(status.stdout, 'pi'), /STALE/);
+  const doctor = run(['doctor'], cfg);
+  assert.notStrictEqual(doctor.status, 0, 'doctor must flag the stale shim');
+  assert.match(doctor.stdout, /\[WARN\] shim wiring: pi shim differs from expected/);
+
+  const update = run(['update'], cfg);
+  assert.strictEqual(update.status, 0, update.stderr || update.stdout);
+  assert.strictEqual(fs.readFileSync(shim, 'utf8'), original, 'update must restore the canonical shim');
+}
+
+// verify drives the same dispatcher a shim agent spawns, within the recorded scope.
+function testVerifyThroughShimAgent(): void {
+  const cfg = tempConfig();
+  const pi = piFor(cfg);
+  fs.mkdirSync(pi, { recursive: true });
+  assert.strictEqual(run(['install', '--agents', 'pi'], cfg).status, 0);
+  const verify = run(['verify'], cfg);
+  assert.strictEqual(verify.status, 0, verify.stderr || verify.stdout);
+  assert.match(verify.stdout, /agent tested\s+: pi/);
+}
+
 // --- CLI --json machine surface (R-012) ------------------------------------
 
 function testJsonStatusShape(): void {
@@ -3246,6 +3412,14 @@ const TESTS: Array<[string, () => void]> = [
   ['testUpdateMigrationInfersFromWired', testUpdateMigrationInfersFromWired],
   ['testUninstallScopesToRecordedSet', testUninstallScopesToRecordedSet],
   ['testUpdateDropsVanishedRecordedAgent', testUpdateDropsVanishedRecordedAgent],
+  // extension-shim agents (pi / oh-my-pi / opencode)
+  ['testPiShimInstallUninstall', testPiShimInstallUninstall],
+  ['testOmpShimInstall', testOmpShimInstall],
+  ['testOpencodeShimInstallUninstall', testOpencodeShimInstallUninstall],
+  ['testShimForeignFileRefused', testShimForeignFileRefused],
+  ['testShimSkippedWhenNoDeliverableEvents', testShimSkippedWhenNoDeliverableEvents],
+  ['testShimStaleRefreshedOnUpdate', testShimStaleRefreshedOnUpdate],
+  ['testVerifyThroughShimAgent', testVerifyThroughShimAgent],
 ];
 
 const filterRaw = process.env.BASELINE_TEST_FILTER;
