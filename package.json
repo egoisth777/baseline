@@ -2,7 +2,7 @@
   "name": "baseline-recital",
   "version": "1.0.0",
   "private": true,
-  "description": "baseline-recital UserPromptSubmit hook + cross-platform manager (TypeScript source compiled to scripts/).",
+  "description": "baseline drift-correction dispatcher and Claude Code/Codex lifecycle manager (TypeScript source compiled to scripts/).",
   "license": "MIT",
   "scripts": {
     "build": "tsc -p tsconfig.json",

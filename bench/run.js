@@ -86,14 +86,14 @@ function buildImpls() {
     name: 'baseline-node', required: true,
     cmd: process.execPath, args: [path.join(REPO, 'scripts', 'baseline-recital.js')],
     env: { CLAUDE_CONFIG_DIR: fixture.dir },
-    note: 'the real dispatcher (counters + lock + caps + templating)'
+    note: 'the real dispatcher (counters + lock + caps)'
   });
   // The native Zig dispatcher (R-009) doing the SAME task — the hook hot path. Optional:
   // skips-with-notice on a platform with no shipped prebuilt.
   const nativeName = nativePrebuiltName();
   const nativeBin = nativeName ? path.join(REPO, 'bin', nativeName) : null;
   impls.push(nativeBin && fs.existsSync(nativeBin)
-    ? { name: 'baseline-native', required: false, cmd: nativeBin, args: ['--agent-config', fixture.dir], env: {}, note: 'the native Zig dispatcher (R-009) — same routes/counters/caps/templating' }
+    ? { name: 'baseline-native', required: false, cmd: nativeBin, args: ['--agent-config', fixture.dir], env: {}, note: 'the native Zig dispatcher (R-009) — same routes/counters/lock/caps' }
     : { name: 'baseline-native', required: false, skipped: 'no native prebuilt for ' + process.platform + '-' + process.arch });
   impls.push({
     name: 'ref-node', required: true,
@@ -196,7 +196,7 @@ function writeResults(results) {
     + ', ' + machine.cpus + ' CPUs, N=' + N + ' cold-start runs each (regenerate with `npm run bench`).');
   lines.push('');
   lines.push('Each implementation runs the SAME injection task — read config, match the event, read the doc, print '
-    + '`additionalContext`. `baseline-node` is the real dispatcher (counters + lock + caps + templating); the refs are minimal.');
+    + '`additionalContext`. `baseline-node` is the real dispatcher (counters + lock + caps); the refs are minimal.');
   lines.push('');
   lines.push('| impl | p50 (ms) | p95 (ms) | peak RSS | notes |');
   lines.push('|------|---------:|---------:|---------:|-------|');

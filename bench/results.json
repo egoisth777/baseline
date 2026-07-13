@@ -17,7 +17,7 @@
       "p50": 37.4815,
       "p95": 41.3911,
       "rssBytes": null,
-      "note": "the real dispatcher (counters + lock + caps + templating)"
+      "note": "the real dispatcher (counters + lock + caps)"
     },
     {
       "name": "baseline-native",
@@ -28,7 +28,7 @@
       "p50": 5.1159,
       "p95": 6.5758,
       "rssBytes": null,
-      "note": "the native Zig dispatcher (R-009) — same routes/counters/caps/templating"
+      "note": "the native Zig dispatcher (R-009) — same routes/counters/lock/caps"
     },
     {
       "name": "ref-node",

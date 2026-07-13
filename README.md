@@ -15,7 +15,7 @@ Inspired by the Blade Runner 2049 baseline test.
 
 ## What it is
 
-baseline generalizes "recite the rules every N prompts" into **user-configurable injection routes**. A route binds a trusted **doc** (the verbatim text to inject) to a hook **event**, on its own **frequency**, optionally scoped to a session phase, a tool, or a working directory. You can run the classic recital every 5 prompts, drop compact-resume instructions on session resume, or remind the agent before certain tool calls — each independently.
+baseline generalizes "recite the rules every N prompts" into **user-configurable injection routes**. A route binds a trusted **doc** (the verbatim text to inject) to a hook **event**, on its own **frequency**, optionally scoped to a session phase or working directory. You can run the classic recital every 5 prompts, drop compact-resume instructions on session resume, or remind the agent before tool calls — each independently.
 
 Two things are kept strictly separate:
 
@@ -58,7 +58,7 @@ Both delegate to `node scripts/manage.js install`, which:
 1. Deploys the Node dispatcher/contracts and, when selected or available, the shipped Zig/native hook binary to the **install root**, under `~/.baseline/hooks/`.
 2. Establishes the **config folder** — your routes + docs (`config.json` + `docs/`). It lives wherever you point `BASELINE_CFG` (else `<install root>/cfg`); when `BASELINE_CFG` is set, `<install root>/cfg` is a symlink to it. If empty, it is seeded from a repo **preset** — `default` by plain install (`--preset minimal` for the neutral floor).
 3. **Links** each agent's config dir back into the install root — for example `~/.claude/hooks/baseline-recital.js` + `~/.claude/hooks/contracts.js` and `~/.codex/hooks/baseline-recital.js` + `~/.codex/hooks/contracts.js` → the install-root hook artifacts, with the native hook binary linked when active and each agent's `cfg/baseline/` → `<install root>/cfg` (your config folder).
-4. Deploys the installed control-surface payload. Claude gets the skills-dir plugin as `baseline@skills-dir`; Codex gets the plugin cache at `$CODEX_HOME/plugins/cache/baseline/baseline/local` plus `[plugins."baseline@baseline"]` in `$CODEX_HOME/config.toml`. Control-surface plugins carry **no hooks** — they only make baseline discoverable, not active.
+4. Deploys the installed control-surface payload. Claude gets the skills-dir plugin as `baseline@skills-dir`; Codex gets a manager-owned local marketplace registered and installed through `codex plugin`. The manager does not edit Codex's private cache or plugin tables directly. Control-surface plugins carry **no hooks** — they only make baseline discoverable, not active.
 5. Wires Claude Code `~/.claude/settings.json` and Codex `~/.codex/hooks.json` for **exactly** the events the config's routes use, and unwires events no route references.
 
 When `status` reports a symlink, editing your config folder (`BASELINE_CFG`, else `<install root>/cfg`) changes live behavior for every wired agent at once. On Windows without symlink privilege the link layer degrades to a hardlink (dispatcher/contracts) or a plain copy (config folder and skill/plugin payloads); `status`/`doctor` report which mechanism is in effect, and a copy needs a reinstall/update after edits.
@@ -97,27 +97,10 @@ A route is one entry in `config.json` `routes[]`:
 - `doc` — required, path relative to the config folder; must stay inside it.
 - `freq` — optional positive integer, default `1`. Fires when `count % freq == 0`.
 - `cwd` — optional path prefix. Fires only when the session working directory is at or under it.
-- `vars` — optional map of template variable name → string value, overriding any config-level `vars` for this route (see below).
 
-### Placeholders
-
-A doc may contain `{{name}}` placeholders resolved **deterministically at injection time** (in-process — no shell, no model calls, no dynamic file selection):
-
-- **Built-ins:** `{{event}}` (the hook event), `{{cwd}}`, `{{date}}` (`YYYY-MM-DD`, UTC), `{{time}}` (`HH:MM`, UTC), `{{home}}`, and `{{env.NAME}}` (an environment variable; empty string if unset). `{{date}}`/`{{time}}` are UTC on both the Node and native runtimes.
-- **User variables:** an optional config-level `"vars": { "name": "value" }` map, overridable by a per-route `"vars"` map. Precedence is **route vars > config vars > built-ins**.
-- An **unknown** placeholder is left verbatim (no error, no strip). There is no escaping syntax.
-
-```json
-{
-  "version": 1,
-  "vars": { "project": "acme" },
-  "routes": [
-    { "id": "baseline", "event": "UserPromptSubmit", "freq": 5, "doc": "docs/baseline.md", "vars": { "project": "acme-api" } }
-  ]
-}
-```
-
-Configs without `vars` and docs without `{{...}}` are unaffected — they inject byte-for-byte as before.
+Docs are static in schema v1. Their contents are injected byte-for-byte; text that
+looks like a placeholder, such as `{{event}}`, remains literal text. Dynamic
+replacement is reserved for a future explicit opt-in contract.
 
 To add a new injection, copy a pair from `assets/route-templates/` (a doc + its matching route) or ask the plugin to author one. See the `README.md` in your config folder for the runtime caps.
 
@@ -182,7 +165,7 @@ node scripts/manage.js route remove --id notes --json
 node scripts/manage.js dispatch simulate --event UserPromptSubmit --cwd . --json
 ```
 
-`dispatch simulate` is a **dry run**: it reports which routes a given `(event, cwd, source)` would select and the templated text that would be injected, without touching counters or any other state.
+`dispatch simulate` is a **dry run**: it reports which routes a given `(event, cwd, source)` would select and the exact static text that would be injected, without touching counters or any other state.
 
 ## Repository layout
 
@@ -208,7 +191,7 @@ baseline/
 │   └── test.js
 ├── presets/
 │   ├── minimal/                 # Neutral floor preset (config.json + docs + README)
-│   └── default/                 # Author's curated preset (opt-in)
+│   └── default/                 # Curated preset used by plain install
 ├── assets/route-templates/      # Doc+route authoring references (never deployed/injected)
 ├── bin/
 │   ├── baseline-recital-windows-x64.exe

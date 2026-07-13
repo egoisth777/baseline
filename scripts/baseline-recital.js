@@ -56,14 +56,12 @@ const cfgDir = path.join(agentDir, 'cfg', 'baseline');
 const configPath = path.join(cfgDir, 'config.json');
 const counterPath = path.join(agentDir, '.baseline-counters.json');
 const counterLockPath = counterPath + '.lock';
-// Load and validate config.json into the routes the dispatcher will act on, plus the
-// config-level template vars. Fail-open: any fatal problem (missing/oversize/malformed
-// config, bad version, over-cap route count) returns no routes so the hook injects
-// nothing. Individual bad routes are skipped in isolation; a duplicate id keeps the
-// first occurrence. Malformed `vars` are dropped (never fatal) — configs without vars
-// behave byte-identically to before templating existed.
+// Load and validate config.json into the routes the dispatcher will act on. Fail-open:
+// any fatal problem (missing/oversize/malformed config, bad version, over-cap route
+// count) returns no routes so the hook injects nothing. Individual bad routes are
+// skipped in isolation; a duplicate id keeps the first occurrence.
 function loadValidConfig() {
-    const empty = { routes: [], vars: {} };
+    const empty = { routes: [] };
     let raw;
     try {
         const st = fs.statSync(configPath);
@@ -91,7 +89,6 @@ function loadValidConfig() {
     const routes = Array.isArray(cfg.routes) ? cfg.routes : [];
     if (routes.length > contracts_1.MAX_ROUTES)
         return empty;
-    const configVars = (0, contracts_1.sanitizeVars)(cfg.vars, 'config');
     const seen = {};
     const out = [];
     for (const r of routes) {
@@ -103,10 +100,7 @@ function loadValidConfig() {
             continue; // duplicate id — first wins, never double-count
         if (typeof r.event !== 'string')
             continue;
-        const ev = (0, contracts_1.parseEvent)(r.event);
-        if (contracts_1.SUPPORTED_EVENTS.indexOf(ev.base) === -1)
-            continue;
-        if (ev.phase !== undefined && (ev.base !== 'SessionStart' || contracts_1.SESSION_PHASES.indexOf(ev.phase) === -1))
+        if (!(0, contracts_1.isSupportedRouteEvent)(r.event))
             continue;
         if (!(0, contracts_1.safeDocPath)(r.doc, cfgDir))
             continue;
@@ -118,11 +112,10 @@ function loadValidConfig() {
         }
         if (r.cwd !== undefined && typeof r.cwd !== 'string')
             continue;
-        const vars = (0, contracts_1.sanitizeVars)(r.vars, 'route ' + r.id);
         seen[r.id] = true;
-        out.push({ id: r.id, event: r.event, freq, cwd: r.cwd, doc: r.doc, vars });
+        out.push({ id: r.id, event: r.event, freq, cwd: r.cwd, doc: r.doc });
     }
-    return { routes: out, vars: configVars };
+    return { routes: out };
 }
 // Selection predicates delegate to the shared contract matchers so the dispatcher and
 // `dispatch simulate` agree exactly. The event name is the sole moment-resolver (base
@@ -283,21 +276,14 @@ process.stdin.on('end', async () => {
             return;
         // Read the due docs CONCURRENTLY (R-011), then assemble strictly in config routes[]
         // order — Promise.all preserves input order, so output is deterministic regardless of
-        // which read finishes first. No headers or route-id labels (they would break verbatim
-        // injection). Each body is templated at injection time ({{name}} resolved
-        // deterministically) before the combined-context cap, so the cap bounds the text
-        // actually injected.
-        const now = new Date();
-        const cwd = typeof data.cwd === 'string' ? data.cwd : '';
+        // which read finishes first. No headers, route-id labels, or replacement pass: every
+        // accepted body is injected byte-for-byte as read from its static doc.
         const rawBodies = await Promise.all(due.map(r => readDocAsync(r.doc)));
         const bodies = [];
         for (let i = 0; i < due.length; i++) {
-            const raw = rawBodies[i];
-            if (raw === null)
+            const body = rawBodies[i];
+            if (body === null)
                 continue;
-            const body = (0, contracts_1.applyTemplate)(raw, {
-                event, cwd, home: os.homedir(), now, env: process.env, vars: (0, contracts_1.mergeVars)(config.vars, due[i].vars)
-            });
             const joined = bodies.length ? bodies.join('\n\n') + '\n\n' + body : body;
             if (joined.length <= contracts_1.MAX_DOC_CHARS)
                 bodies.push(body);

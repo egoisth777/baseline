@@ -31,18 +31,13 @@ import {
   MAX_DOC_CHARS,
   MAX_ROUTES,
   Route,
-  SESSION_PHASES,
   SLUG,
   SUPPORTED_EVENTS,
-  VarMap,
-  applyTemplate,
   cwdMatches as matchCwd,
   eventMatches as matchEvent,
-  mergeVars,
-  parseEvent,
+  isSupportedRouteEvent,
   safeDocPath,
   safeRealDocPath,
-  sanitizeVars,
 } from './contracts';
 
 interface CounterEntry {
@@ -93,17 +88,14 @@ const counterLockPath = counterPath + '.lock';
 
 interface ValidConfig {
   routes: Route[];
-  vars: VarMap; // config-level template vars (a route's own vars override these)
 }
 
-// Load and validate config.json into the routes the dispatcher will act on, plus the
-// config-level template vars. Fail-open: any fatal problem (missing/oversize/malformed
-// config, bad version, over-cap route count) returns no routes so the hook injects
-// nothing. Individual bad routes are skipped in isolation; a duplicate id keeps the
-// first occurrence. Malformed `vars` are dropped (never fatal) — configs without vars
-// behave byte-identically to before templating existed.
+// Load and validate config.json into the routes the dispatcher will act on. Fail-open:
+// any fatal problem (missing/oversize/malformed config, bad version, over-cap route
+// count) returns no routes so the hook injects nothing. Individual bad routes are
+// skipped in isolation; a duplicate id keeps the first occurrence.
 function loadValidConfig(): ValidConfig {
-  const empty: ValidConfig = { routes: [], vars: {} };
+  const empty: ValidConfig = { routes: [] };
   let raw: string;
   try {
     const st = fs.statSync(configPath);
@@ -123,7 +115,6 @@ function loadValidConfig(): ValidConfig {
   const routes = Array.isArray(cfg.routes) ? cfg.routes : [];
   if (routes.length > MAX_ROUTES) return empty;
 
-  const configVars = sanitizeVars(cfg.vars, 'config');
   const seen: { [id: string]: true } = {};
   const out: Route[] = [];
   for (const r of routes) {
@@ -131,9 +122,7 @@ function loadValidConfig(): ValidConfig {
     if (typeof r.id !== 'string' || !SLUG.test(r.id)) continue;
     if (seen[r.id]) continue; // duplicate id — first wins, never double-count
     if (typeof r.event !== 'string') continue;
-    const ev = parseEvent(r.event);
-    if (SUPPORTED_EVENTS.indexOf(ev.base) === -1) continue;
-    if (ev.phase !== undefined && (ev.base !== 'SessionStart' || SESSION_PHASES.indexOf(ev.phase) === -1)) continue;
+    if (!isSupportedRouteEvent(r.event)) continue;
     if (!safeDocPath(r.doc, cfgDir)) continue;
     let freq = 1;
     if (r.freq !== undefined) {
@@ -141,11 +130,10 @@ function loadValidConfig(): ValidConfig {
       freq = r.freq;
     }
     if (r.cwd !== undefined && typeof r.cwd !== 'string') continue;
-    const vars = sanitizeVars(r.vars, 'route ' + r.id);
     seen[r.id] = true;
-    out.push({ id: r.id, event: r.event, freq, cwd: r.cwd, doc: r.doc, vars });
+    out.push({ id: r.id, event: r.event, freq, cwd: r.cwd, doc: r.doc });
   }
-  return { routes: out, vars: configVars };
+  return { routes: out };
 }
 
 // Selection predicates delegate to the shared contract matchers so the dispatcher and
@@ -297,20 +285,13 @@ process.stdin.on('end', async () => {
 
     // Read the due docs CONCURRENTLY (R-011), then assemble strictly in config routes[]
     // order — Promise.all preserves input order, so output is deterministic regardless of
-    // which read finishes first. No headers or route-id labels (they would break verbatim
-    // injection). Each body is templated at injection time ({{name}} resolved
-    // deterministically) before the combined-context cap, so the cap bounds the text
-    // actually injected.
-    const now = new Date();
-    const cwd = typeof data.cwd === 'string' ? data.cwd : '';
+    // which read finishes first. No headers, route-id labels, or replacement pass: every
+    // accepted body is injected byte-for-byte as read from its static doc.
     const rawBodies = await Promise.all(due.map(r => readDocAsync(r.doc)));
     const bodies: string[] = [];
     for (let i = 0; i < due.length; i++) {
-      const raw = rawBodies[i];
-      if (raw === null) continue;
-      const body = applyTemplate(raw, {
-        event, cwd, home: os.homedir(), now, env: process.env, vars: mergeVars(config.vars, due[i].vars)
-      });
+      const body = rawBodies[i];
+      if (body === null) continue;
       const joined = bodies.length ? bodies.join('\n\n') + '\n\n' + body : body;
       if (joined.length <= MAX_DOC_CHARS) bodies.push(body);
     }

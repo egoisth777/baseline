@@ -16,7 +16,7 @@
 // - Regenerable ARTIFACTS live in a per-skill install root, BASELINE_HOME or
 //   ~/.baseline: the deployed dispatcher (hooks/baseline-recital.js + hooks/contracts.js), installed
 //   manager/source artifacts (scripts/), Claude skill payload (skills/baseline/),
-//   and Codex plugin payload (codex-plugin/baseline/). The repo is the source of
+//   and Codex local-marketplace payload (codex-marketplace/plugins/baseline/). The repo is the source of
 //   truth; install always overwrites these from it.
 // - The editable CONFIG folder (config.json + docs/) lives separately, wherever the
 //   operator wants: BASELINE_CFG, else <install root>/cfg. <install root>/cfg is the
@@ -25,9 +25,9 @@
 // - Each agent's config dir (Claude: CLAUDE_CONFIG_DIR or ~/.claude; Codex:
 //   CODEX_HOME or ~/.codex) gets LINKS back into the center:
 //   hooks/baseline-recital.js + hooks/contracts.js → install root; cfg/baseline → <install root>/cfg.
-//   Claude also gets skills/baseline → <install root>/skills/baseline; Codex gets
-//   plugins/cache/baseline/baseline/local → <install root>/codex-plugin/baseline
-//   plus an empty [plugins."baseline@baseline"] table in config.toml.
+//   Claude also gets skills/baseline → <install root>/skills/baseline. Codex's
+//   supported plugin CLI registers the manager-owned local marketplace and installs
+//   baseline@baseline-local; Codex owns its resulting cache + config state.
 //   Editing the config folder changes live behavior for every wired agent
 //   (when the link layer can use a symlink; copy fallback is degraded).
 // - Hook config and .baseline-counters.json stay REAL, per-agent files. Hook
@@ -46,17 +46,17 @@ Object.defineProperty(exports, "__esModule", { value: true });
 const fs = require("fs");
 const path = require("path");
 const os = require("os");
+const crypto = require("crypto");
 const readline = require("readline");
 const child_process_1 = require("child_process");
 const contracts_1 = require("./contracts");
 // --- constants -------------------------------------------------------------
-const KNOWN_ROUTE_KEYS = ['id', 'event', 'freq', 'cwd', 'doc', 'vars'];
+const CONFIG_KEYS = ['version', 'routes'];
 const DEFAULT_PRESET = 'default';
-const CODEX_MARKETPLACE = 'baseline';
+const CODEX_MARKETPLACE = 'baseline-local';
 const CODEX_PLUGIN = 'baseline';
-const CODEX_PLUGIN_VERSION = 'local';
 const CODEX_PLUGIN_KEY = CODEX_PLUGIN + '@' + CODEX_MARKETPLACE;
-const CODEX_PLUGIN_TABLE = '[plugins."' + CODEX_PLUGIN_KEY + '"]';
+const CODEX_MARKETPLACE_MANIFEST = path.join('.agents', 'plugins', 'marketplace.json');
 // --- JSON machine surface (R-012) ------------------------------------------
 // Global --json: every covered command (status, route list/add/remove, dispatch
 // simulate) emits exactly ONE versioned JSON object on stdout and suppresses human
@@ -162,11 +162,13 @@ const central = {
     skillDir: path.join(installRoot, 'skills', 'baseline'),
     skillManifest: path.join(installRoot, 'skills', 'baseline', '.claude-plugin', 'plugin.json'),
     skillMd: path.join(installRoot, 'skills', 'baseline', 'SKILL.md'),
-    // Codex plugin payload copied/linked into CODEX_HOME's plugin cache and
-    // activated through config.toml.
-    codexPluginDir: path.join(installRoot, 'codex-plugin', 'baseline'),
-    codexPluginManifest: path.join(installRoot, 'codex-plugin', 'baseline', '.codex-plugin', 'plugin.json'),
-    codexPluginSkillMd: path.join(installRoot, 'codex-plugin', 'baseline', 'skills', 'baseline', 'SKILL.md'),
+    // Manager-owned local marketplace. Codex's supported CLI registers this root,
+    // then owns the installed cache/config derived from the payload below.
+    codexMarketplaceRoot: path.join(installRoot, 'codex-marketplace'),
+    codexMarketplaceManifest: path.join(installRoot, 'codex-marketplace', CODEX_MARKETPLACE_MANIFEST),
+    codexPluginDir: path.join(installRoot, 'codex-marketplace', 'plugins', 'baseline'),
+    codexPluginManifest: path.join(installRoot, 'codex-marketplace', 'plugins', 'baseline', '.codex-plugin', 'plugin.json'),
+    codexPluginSkillMd: path.join(installRoot, 'codex-marketplace', 'plugins', 'baseline', 'skills', 'baseline', 'SKILL.md'),
 };
 const repo = {
     managerSourceJs: path.join(repoRoot, 'scripts', 'manage.js'),
@@ -198,7 +200,7 @@ function agentRegistry() {
 }
 // Derive every per-agent path. hookJs/hookContractsJs and cfgDir are LINKS to
 // the center; hook config and counters are real per-agent files. Codex plugin
-// activation additionally needs a cache root and config.toml table.
+// lifecycle state is owned by the Codex CLI under that agent's CODEX_HOME.
 function agentPaths(agent) {
     const d = agent.configDir;
     return {
@@ -213,8 +215,7 @@ function agentPaths(agent) {
         hookContractsJs: path.join(d, 'hooks', 'contracts.js'),
         cfgDir: path.join(d, 'cfg', 'baseline'),
         skillDir: agent.skillPlugin ? path.join(d, 'skills', 'baseline') : null,
-        codexPluginDir: agent.codexPlugin ? path.join(d, 'plugins', 'cache', CODEX_MARKETPLACE, CODEX_PLUGIN, CODEX_PLUGIN_VERSION) : null,
-        codexConfigToml: agent.codexPlugin ? path.join(d, 'config.toml') : null,
+        codexPlugin: agent.codexPlugin,
     };
 }
 function allAgentPaths() {
@@ -317,8 +318,18 @@ function fail(message, code, jsonCode) {
     }
     process.exit(code || 1);
 }
-// Quote a single arg for embedding in the hook config command STRING.
-const quoteArg = (s) => '"' + String(s).replace(/"/g, '\\"') + '"';
+// Render hook commands for the shell each agent uses on this platform. PowerShell
+// needs the call operator before a quoted executable; single-quoted literals keep
+// paths literal in both shells (with their respective apostrophe escapes).
+function quoteArg(s) {
+    const value = String(s);
+    return isWin
+        ? "'" + value.replace(/'/g, "''") + "'"
+        : "'" + value.replace(/'/g, "'\"'\"'") + "'";
+}
+function renderHookCommand(args) {
+    return (isWin ? '& ' : '') + args.map(quoteArg).join(' ');
+}
 // --- file helpers ----------------------------------------------------------
 function atomicWrite(file, content) {
     fs.mkdirSync(path.dirname(file), { recursive: true });
@@ -462,9 +473,25 @@ function settingsForRead(ap) {
 function samePath(a, b) {
     if (!a || !b)
         return false;
-    const aa = path.resolve(a);
-    const bb = path.resolve(b);
+    const clean = (value) => isWin && value.indexOf('\\\\?\\') === 0 ? value.slice(4) : value;
+    const aa = path.resolve(clean(a));
+    const bb = path.resolve(clean(b));
     return isWin ? aa.toLowerCase() === bb.toLowerCase() : aa === bb;
+}
+function isRecord(value) {
+    return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+// Ownership is reported by Codex after its own path resolution, which may
+// canonicalize a manager root reached through a symlink or Windows junction.
+// If either path cannot be resolved (for example, a removed payload), retain
+// the lexical comparison so absence never becomes ownership.
+function sameCanonicalPath(a, b) {
+    try {
+        return samePath(fs.realpathSync(a), fs.realpathSync(b));
+    }
+    catch (e) {
+        return samePath(a, b);
+    }
 }
 // --- link layer (cross-platform) -------------------------------------------
 // Remove a symlink or regular file at p. Refuses to remove a real directory.
@@ -617,7 +644,6 @@ function removeOurLink(linkPath, target) {
 // for copy detection.
 const CONFIG_MARKER = 'config.json';
 const SKILL_MARKER = path.join('.claude-plugin', 'plugin.json');
-const CODEX_PLUGIN_MARKER = path.join('.codex-plugin', 'plugin.json');
 // Link a central FOLDER into linkPath: directory symlink, else a recursive copy
 // (degraded — central edits won't propagate). A real directory at linkPath is
 // replaced only when it looks like ours (contains the marker file).
@@ -713,184 +739,288 @@ function removeOurDirLink(linkPath, target, marker) {
     }
     return false;
 }
-function splitTomlLines(content) {
-    const eol = content.indexOf('\r\n') !== -1 ? '\r\n' : '\n';
-    const normalized = content.replace(/\r\n/g, '\n');
-    if (normalized === '')
-        return { lines: [], eol };
-    const body = normalized.endsWith('\n') ? normalized.slice(0, -1) : normalized;
-    return { lines: body === '' ? [] : body.split('\n'), eol };
+// --- Codex plugin lifecycle (supported CLI) --------------------------------
+// `cmd.exe` needs a command string to launch npm's .cmd/.bat shims. Keep its
+// parser from splitting paths or interpreting manager-controlled values as
+// syntax. Native Windows executables are never sent through CMD.
+const CMD_META_CHARS = /([()\][%!^"`<>&|;, *?])/g;
+function escapeCmdArgument(value) {
+    let escaped = String(value)
+        .replace(/(?=(\\+?)?)\1"/g, '$1$1\\"')
+        .replace(/(?=(\\+?)?)\1$/, '$1$1');
+    escaped = ('"' + escaped + '"').replace(CMD_META_CHARS, '^$1');
+    return escaped.replace(CMD_META_CHARS, '^$1');
 }
-function joinTomlLines(lines, eol) {
-    return lines.length ? lines.join(eol) + eol : '';
+function renderCmdPluginCommand(cli, argv) {
+    // A .cmd/.bat shim expands %*, so its arguments need a second layer of CMD
+    // escaping. This renderer is called only after resolution identifies a shim.
+    return '"' + [cli.replace(CMD_META_CHARS, '^$1')]
+        .concat(argv.map(escapeCmdArgument))
+        .join(' ') + '"';
 }
-function tomlLineCommentStart(line) {
-    let quote = null;
-    let escaped = false;
-    for (let i = 0; i < line.length; i++) {
-        const ch = line[i];
-        if (quote === '"') {
-            if (escaped) {
-                escaped = false;
-            }
-            else if (ch === '\\') {
-                escaped = true;
-            }
-            else if (ch === '"') {
-                quote = null;
-            }
-            continue;
-        }
-        if (quote === "'") {
-            if (ch === "'")
-                quote = null;
-            continue;
-        }
-        if (ch === '"' || ch === "'") {
-            quote = ch;
-        }
-        else if (ch === '#') {
-            return i;
-        }
+function executablePath(candidate) {
+    try {
+        if (!fs.statSync(candidate).isFile())
+            return null;
+        if (!isWin)
+            fs.accessSync(candidate, fs.constants.X_OK);
+        return candidate;
     }
-    return -1;
-}
-function tomlTableHeader(line) {
-    const trimmed = line.trim();
-    if (!trimmed.startsWith('['))
+    catch (e) {
         return null;
-    const comment = tomlLineCommentStart(trimmed);
-    const header = (comment === -1 ? trimmed : trimmed.slice(0, comment).trim());
-    const array = header.startsWith('[[');
-    const openLen = array ? 2 : 1;
-    let quote = null;
-    let escaped = false;
-    for (let i = openLen; i < header.length; i++) {
-        const ch = header[i];
-        if (quote === '"') {
-            if (escaped) {
-                escaped = false;
-            }
-            else if (ch === '\\') {
-                escaped = true;
-            }
-            else if (ch === '"') {
-                quote = null;
-            }
-            continue;
-        }
-        if (quote === "'") {
-            if (ch === "'")
-                quote = null;
-            continue;
-        }
-        if (ch === '"' || ch === "'") {
-            quote = ch;
-            continue;
-        }
-        if (array) {
-            if (ch !== ']' || header[i + 1] !== ']')
-                continue;
-            const closeEnd = i + 2;
-            return header.slice(closeEnd).trim() === ''
-                ? { name: header.slice(openLen, i).trim(), array }
-                : null;
-        }
-        if (ch === ']') {
-            const closeEnd = i + 1;
-            return header.slice(closeEnd).trim() === ''
-                ? { name: header.slice(openLen, i).trim(), array }
-                : null;
+    }
+}
+function windowsExecutableCandidates(candidate) {
+    if (!isWin || path.extname(candidate))
+        return [candidate];
+    const configured = process.env.PATHEXT || '.COM;.EXE;.BAT;.CMD';
+    const extensions = configured.split(';').filter(Boolean);
+    return extensions.map(extension => candidate + extension).concat(candidate);
+}
+function executablePathEnvironment() {
+    const key = Object.keys(process.env).find(name => name.toUpperCase() === 'PATH');
+    return key ? process.env[key] || '' : '';
+}
+// Resolve before spawning so absence is independent of cmd.exe diagnostics
+// (which are localized on Windows) and launch semantics use the actual target,
+// not a textual alias such as `codex`.
+function resolveCodexExecutable(configured) {
+    const explicit = path.isAbsolute(configured) || /[\\/]/.test(configured);
+    const pathBases = executablePathEnvironment().split(path.delimiter).map(segment => {
+        const directory = segment.replace(/^"(.*)"$/, '$1');
+        return path.resolve(directory || '.', configured);
+    });
+    // Windows bare-command lookup checks the parent working directory before
+    // PATH. Preserve that behavior while still resolving PATHEXT ourselves.
+    const bases = explicit
+        ? [path.resolve(configured)]
+        : (isWin ? [path.resolve(configured)].concat(pathBases) : pathBases);
+    for (const base of bases) {
+        for (const candidate of windowsExecutableCandidates(base)) {
+            const resolved = executablePath(candidate);
+            if (resolved)
+                return resolved;
         }
     }
     return null;
 }
-function tomlTableName(line) {
-    const table = tomlTableHeader(line);
-    return table ? table.name : null;
-}
-function tomlOrdinaryTableName(line) {
-    const table = tomlTableHeader(line);
-    return table && !table.array ? table.name : null;
-}
-function isCodexPluginActivationName(name) {
-    return name === 'plugins."' + CODEX_PLUGIN_KEY + '"' || name === "plugins.'" + CODEX_PLUGIN_KEY + "'";
-}
-function findCodexPluginActivationSection(lines) {
-    for (let i = 0; i < lines.length; i++) {
-        const name = tomlOrdinaryTableName(lines[i]);
-        if (!name || !isCodexPluginActivationName(name))
-            continue;
-        let end = i + 1;
-        while (end < lines.length && tomlTableName(lines[end]) === null)
-            end++;
-        return { start: i, end };
+function runCodexPluginCli(ap, args) {
+    const argv = ['plugin'].concat(args, ['--json']);
+    const override = process.env.BASELINE_CODEX_CLI;
+    const configuredCli = override || 'codex';
+    const resolvedCli = resolveCodexExecutable(configuredCli);
+    if (!resolvedCli) {
+        return {
+            available: false,
+            ok: false,
+            data: null,
+            detail: override
+                ? 'configured Codex CLI not found at ' + override
+                : '`codex` executable not found on PATH',
+        };
     }
-    return null;
-}
-function codexPluginActivationState(configToml) {
-    let content;
+    const spawnOpts = {
+        encoding: 'utf8',
+        env: Object.assign({}, process.env, { CODEX_HOME: ap.configDir }),
+        windowsHide: true,
+    };
+    const isCmdShim = isWin && /\.(cmd|bat)$/i.test(resolvedCli);
+    const result = isCmdShim
+        ? (0, child_process_1.spawnSync)(process.env.ComSpec || process.env.COMSPEC || 'cmd.exe', ['/d', '/v:off', '/s', '/c', renderCmdPluginCommand(resolvedCli, argv)], Object.assign({}, spawnOpts, { windowsVerbatimArguments: true }))
+        : (0, child_process_1.spawnSync)(resolvedCli, argv, spawnOpts);
+    if (result.error) {
+        const unavailable = 'code' in result.error && result.error.code === 'ENOENT';
+        return {
+            available: !unavailable,
+            ok: false,
+            data: null,
+            detail: unavailable ? '`codex` executable not found on PATH' : result.error.message,
+        };
+    }
+    if (result.status !== 0) {
+        const output = result.stderr || result.stdout;
+        return {
+            available: true,
+            ok: false,
+            data: null,
+            detail: (output || '').trim() || 'codex plugin command exited ' + result.status,
+        };
+    }
     try {
-        content = fs.readFileSync(configToml, 'utf8');
+        return { available: true, ok: true, data: JSON.parse((result.stdout || '').trim()), detail: '' };
     }
     catch (e) {
-        if (e && e.code === 'ENOENT')
-            return { ok: false, mechanism: 'missing' };
-        return { ok: false, mechanism: 'unreadable' };
+        return { available: true, ok: false, data: null, detail: 'invalid JSON from codex plugin CLI: ' + e.message };
     }
-    return findCodexPluginActivationSection(splitTomlLines(content).lines)
-        ? { ok: true, mechanism: 'present' }
-        : { ok: false, mechanism: 'inactive' };
 }
-function ensureCodexPluginActivation(configToml) {
-    let content = '';
-    let existed = true;
-    try {
-        content = fs.readFileSync(configToml, 'utf8');
-    }
-    catch (e) {
-        if (e && e.code === 'ENOENT')
-            existed = false;
-        else
-            throw e;
-    }
-    const parsed = splitTomlLines(content);
-    if (findCodexPluginActivationSection(parsed.lines))
-        return 'present';
-    if (parsed.lines.length && parsed.lines[parsed.lines.length - 1].trim() !== '') {
-        parsed.lines.push('');
-    }
-    parsed.lines.push(CODEX_PLUGIN_TABLE);
-    atomicWrite(configToml, joinTomlLines(parsed.lines, parsed.eol));
-    return existed ? 'added' : 'created';
+function isCodexMarketplaceListEntry(value) {
+    return isRecord(value) && typeof value.name === 'string' && typeof value.root === 'string';
 }
-function removeCodexPluginActivation(configToml) {
-    let content;
-    try {
-        content = fs.readFileSync(configToml, 'utf8');
-    }
-    catch (e) {
-        if (e && e.code === 'ENOENT')
-            return 'absent';
-        throw e;
-    }
-    const parsed = splitTomlLines(content);
-    const section = findCodexPluginActivationSection(parsed.lines);
-    if (!section)
-        return 'absent';
-    const next = parsed.lines.slice(0, section.start).concat(parsed.lines.slice(section.end));
-    atomicWrite(configToml, joinTomlLines(next, parsed.eol));
-    return 'removed';
+function isCodexPluginListEntry(value) {
+    return isRecord(value) &&
+        typeof value.pluginId === 'string' &&
+        (value.enabled === undefined || typeof value.enabled === 'boolean') &&
+        (value.version === undefined || typeof value.version === 'string') &&
+        isRecord(value.source) && typeof value.source.path === 'string';
 }
-// --- command-string parsing ------------------------------------------------
-// Hook config command that runs the agent's Node .js dispatcher.
+function codexMarketplaceEntries(data) {
+    if (!isRecord(data) || !Array.isArray(data.marketplaces))
+        return null;
+    return data.marketplaces.every(isCodexMarketplaceListEntry) ? data.marketplaces : null;
+}
+function codexPluginEntries(data) {
+    if (!isRecord(data) || !Array.isArray(data.installed))
+        return null;
+    return data.installed.every(isCodexPluginListEntry) ? data.installed : null;
+}
+function codexPluginInspection(ap) {
+    const unavailable = { ok: false, mechanism: 'unavailable' };
+    const markets = runCodexPluginCli(ap, ['marketplace', 'list']);
+    if (!markets.available) {
+        return { marketplace: unavailable, plugin: unavailable, version: null, installedPath: null, detail: markets.detail };
+    }
+    if (!markets.ok) {
+        const unreadable = { ok: false, mechanism: 'unreadable' };
+        return { marketplace: unreadable, plugin: unreadable, version: null, installedPath: null, detail: markets.detail };
+    }
+    const entries = codexMarketplaceEntries(markets.data);
+    if (!entries) {
+        const unreadable = { ok: false, mechanism: 'unreadable' };
+        return { marketplace: unreadable, plugin: unreadable, version: null, installedPath: null, detail: 'invalid marketplace list JSON shape' };
+    }
+    const marketplace = entries.find(entry => entry.name === CODEX_MARKETPLACE);
+    if (!marketplace) {
+        return {
+            marketplace: { ok: false, mechanism: 'missing' },
+            plugin: { ok: false, mechanism: 'missing' },
+            version: null, installedPath: null, detail: null,
+        };
+    }
+    const marketplaceRoot = marketplace.root;
+    if (!sameCanonicalPath(marketplaceRoot, central.codexMarketplaceRoot)) {
+        const foreign = { ok: false, mechanism: 'foreign' };
+        return {
+            marketplace: foreign, plugin: foreign, version: null, installedPath: null,
+            detail: CODEX_MARKETPLACE + ' is registered at ' + String(marketplaceRoot) + ', not ' + central.codexMarketplaceRoot,
+        };
+    }
+    const plugins = runCodexPluginCli(ap, ['list']);
+    if (!plugins.ok) {
+        const state = { ok: false, mechanism: plugins.available ? 'unreadable' : 'unavailable' };
+        return { marketplace: { ok: true, mechanism: 'registered' }, plugin: state, version: null, installedPath: null, detail: plugins.detail };
+    }
+    const installed = codexPluginEntries(plugins.data);
+    if (!installed) {
+        return {
+            marketplace: { ok: true, mechanism: 'registered' },
+            plugin: { ok: false, mechanism: 'unreadable' },
+            version: null,
+            installedPath: null,
+            detail: 'invalid plugin list JSON shape',
+        };
+    }
+    const plugin = installed.find(entry => entry.pluginId === CODEX_PLUGIN_KEY);
+    if (!plugin) {
+        return {
+            marketplace: { ok: true, mechanism: 'registered' },
+            plugin: { ok: false, mechanism: 'missing' },
+            version: null, installedPath: null, detail: null,
+        };
+    }
+    const pluginSource = plugin.source.path;
+    if (!pluginSource || !sameCanonicalPath(pluginSource, central.codexPluginDir)) {
+        return {
+            marketplace: { ok: true, mechanism: 'registered' },
+            plugin: { ok: false, mechanism: 'foreign' },
+            version: plugin.version === undefined ? null : plugin.version,
+            installedPath: null,
+            detail: CODEX_PLUGIN_KEY + ' resolves to ' + String(pluginSource) + ', not ' + central.codexPluginDir,
+        };
+    }
+    return {
+        marketplace: { ok: true, mechanism: 'registered' },
+        plugin: { ok: plugin.enabled !== false, mechanism: plugin.enabled === false ? 'disabled' : 'installed' },
+        version: plugin.version === undefined ? null : plugin.version,
+        installedPath: null,
+        detail: null,
+    };
+}
+function ensureCodexPluginForAgent(ap) {
+    if (!ap.codexPlugin)
+        return null;
+    const before = codexPluginInspection(ap);
+    if (before.marketplace.mechanism === 'unavailable') {
+        return { marketplace: 'unavailable', plugin: 'unavailable', version: null };
+    }
+    if (before.marketplace.mechanism === 'foreign') {
+        throw new Error(before.detail || ('refusing to replace foreign Codex marketplace ' + CODEX_MARKETPLACE));
+    }
+    if (before.marketplace.mechanism === 'unreadable') {
+        throw new Error('cannot inspect Codex marketplaces: ' + before.detail);
+    }
+    let marketplace = 'present';
+    if (!before.marketplace.ok) {
+        const added = runCodexPluginCli(ap, ['marketplace', 'add', central.codexMarketplaceRoot]);
+        if (!added.ok)
+            throw new Error('cannot register Codex marketplace: ' + added.detail);
+        marketplace = isRecord(added.data) && added.data.alreadyAdded === true ? 'present' : 'added';
+    }
+    const installed = runCodexPluginCli(ap, ['add', CODEX_PLUGIN_KEY]);
+    if (!installed.ok)
+        throw new Error('cannot install Codex plugin ' + CODEX_PLUGIN_KEY + ': ' + installed.detail);
+    return {
+        marketplace,
+        plugin: 'installed',
+        version: isRecord(installed.data) && typeof installed.data.version === 'string' ? installed.data.version : null,
+    };
+}
+function uninstallCodexPluginForAgent(ap) {
+    if (!ap.codexPlugin)
+        return null;
+    const state = codexPluginInspection(ap);
+    if (state.marketplace.mechanism === 'unavailable')
+        return { marketplace: 'unavailable', plugin: 'left as-is' };
+    if (state.marketplace.mechanism === 'foreign')
+        return { marketplace: 'foreign — left as-is', plugin: 'left as-is' };
+    if (state.marketplace.mechanism === 'missing')
+        return { marketplace: 'absent', plugin: 'absent' };
+    if (!state.marketplace.ok) {
+        return {
+            marketplace: state.marketplace.mechanism + ' — left as-is',
+            plugin: state.plugin.mechanism + ' — left as-is',
+        };
+    }
+    let plugin = 'absent';
+    if (state.plugin.mechanism === 'installed' || state.plugin.mechanism === 'disabled') {
+        const removed = runCodexPluginCli(ap, ['remove', CODEX_PLUGIN_KEY]);
+        if (!removed.ok)
+            throw new Error('cannot remove Codex plugin ' + CODEX_PLUGIN_KEY + ': ' + removed.detail);
+        plugin = 'removed';
+    }
+    else if (state.plugin.mechanism !== 'missing') {
+        return {
+            marketplace: 'owned — kept because plugin is ' + state.plugin.mechanism,
+            plugin: state.plugin.mechanism + ' — left as-is',
+        };
+    }
+    const removedMarketplace = runCodexPluginCli(ap, ['marketplace', 'remove', CODEX_MARKETPLACE]);
+    if (!removedMarketplace.ok)
+        throw new Error('cannot remove Codex marketplace ' + CODEX_MARKETPLACE + ': ' + removedMarketplace.detail);
+    return { marketplace: 'removed', plugin };
+}
+// --- hook command rendering + parsing -------------------------------------
+function hookCommand(ap, argv) {
+    return ap.name === 'claude-code'
+        ? { command: argv[0], args: argv.slice(1) }
+        : { command: renderHookCommand(argv) };
+}
+// Claude supports shell-free command+args entries. Codex command strings are
+// rendered for its platform shell (PowerShell on Windows, sh on POSIX).
 function jsCommand(ap) {
-    return quoteArg(process.execPath) + ' ' + quoteArg(ap.hookJs) + ' --agent-config ' + quoteArg(ap.configDir);
+    return hookCommand(ap, [process.execPath, ap.hookJs, '--agent-config', ap.configDir]);
 }
-// Hook config command that runs the agent's native Zig binary directly (no Node) — the
-// hot path when the native runtime is active.
 function nativeCommand(ap) {
-    return quoteArg(ap.hookBin) + ' --agent-config ' + quoteArg(ap.configDir);
+    return hookCommand(ap, [ap.hookBin, '--agent-config', ap.configDir]);
 }
 function parseCommandLine(command) {
     if (typeof command !== 'string' || !command.trim())
@@ -901,7 +1031,11 @@ function parseCommandLine(command) {
     for (let i = 0; i < command.length; i++) {
         const ch = command[i];
         if (quote) {
-            if (ch === '\\' && i + 1 < command.length && command[i + 1] === quote) {
+            if (isWin && quote === "'" && ch === "'" && command[i + 1] === "'") {
+                cur += "'";
+                i++;
+            }
+            else if (quote === '"' && ch === '\\' && i + 1 < command.length && command[i + 1] === quote) {
                 cur += command[++i];
             }
             else if (ch === quote) {
@@ -928,10 +1062,15 @@ function parseCommandLine(command) {
         return null;
     if (cur)
         args.push(cur);
+    if (isWin && args[0] === '&')
+        args.shift();
     return args.length ? args : null;
 }
-function commandRuntime(command, ap) {
-    const argv = parseCommandLine(command);
+function commandArgv(hook) {
+    return hook.args === undefined ? parseCommandLine(hook.command) : [hook.command].concat(hook.args);
+}
+function commandRuntime(hook, ap) {
+    const argv = commandArgv(hook);
     if (!argv)
         return null;
     if (samePath(argv[0], ap.hookBin))
@@ -940,15 +1079,21 @@ function commandRuntime(command, ap) {
         return 'node';
     return null;
 }
+function isCanonicalCommand(hook, ap, runtime) {
+    const expected = runtime === 'native' ? nativeCommand(ap) : jsCommand(ap);
+    return hook.command === expected.command &&
+        JSON.stringify(hook.args) === JSON.stringify(expected.args);
+}
 // A settings command is ours when it runs this agent's deployed dispatcher — either the
 // native binary directly (argv[0]) or Node running the .js (argv[1]). Recognizing both
 // keeps unwire/update/status runtime-agnostic across a native<->node switch.
-function isOurCommand(command, ap) {
-    return commandRuntime(command, ap) !== null;
+function isOurCommand(hook, ap) {
+    return isCommandHook(hook) && commandRuntime(hook, ap) !== null;
 }
 function isCommandHook(value) {
     return !!value && typeof value === 'object' && !Array.isArray(value) &&
-        'command' in value && typeof value.command === 'string';
+        'command' in value && typeof value.command === 'string' &&
+        (!('args' in value) || (Array.isArray(value.args) && value.args.every((arg) => typeof arg === 'string')));
 }
 function eventHookGroups(settings, event) {
     if (!settings || typeof settings !== 'object' || Array.isArray(settings) || !('hooks' in settings))
@@ -978,7 +1123,7 @@ function commandHooksInGroups(groups) {
 // --- hook config surgery (config-driven, across all events) -----------------
 function findOurHookInGroups(groups, ap) {
     for (const hook of commandHooksInGroups(groups)) {
-        if (isOurCommand(hook.command, ap))
+        if (isOurCommand(hook, ap))
             return hook;
     }
     return null;
@@ -995,7 +1140,7 @@ function wiredHooks(settings, ap) {
     const out = [];
     for (const event of contracts_1.SUPPORTED_EVENTS) {
         for (const hook of commandHooksInGroups(eventHookGroups(settings, event))) {
-            const runtime = commandRuntime(hook.command, ap);
+            const runtime = commandRuntime(hook, ap);
             if (runtime)
                 out.push({ event, hook, runtime });
         }
@@ -1019,6 +1164,14 @@ function wiredEvents(settings, ap) {
     }
     return out;
 }
+function noncanonicalEvents(hooks, ap) {
+    const out = [];
+    for (const h of hooks) {
+        if (!isCanonicalCommand(h.hook, ap, h.runtime) && out.indexOf(h.event) === -1)
+            out.push(h.event);
+    }
+    return out;
+}
 // Wire our one dispatcher command into EXACTLY desiredEvents and unwire it from
 // every other supported event. One settings read + write; preserves co-residents.
 function syncWiring(ap, command, desiredEvents) {
@@ -1032,7 +1185,7 @@ function syncWiring(ap, command, desiredEvents) {
             let removed = false;
             for (const group of groups) {
                 const before = group.hooks.length;
-                group.hooks = group.hooks.filter((h) => !(h && isOurCommand(h.command, ap)));
+                group.hooks = group.hooks.filter((h) => !isOurCommand(h, ap));
                 if (group.hooks.length !== before)
                     removed = true;
             }
@@ -1044,7 +1197,10 @@ function syncWiring(ap, command, desiredEvents) {
         }
         if (want) {
             settings.hooks[event] = Array.isArray(settings.hooks[event]) ? settings.hooks[event] : [];
-            const entry = { type: 'command', command, timeout: 5, statusMessage: 'Baseline check...' };
+            const entry = {
+                type: 'command', command: command.command, args: command.args,
+                timeout: 5, statusMessage: 'Baseline check...'
+            };
             settings.hooks[event].push({ hooks: [entry] });
             result.wired.push(event);
         }
@@ -1062,7 +1218,7 @@ function unwireAll(ap) {
 // Load + validate the central config.json. Mirrors the dispatcher's fail-open
 // selection, but also collects per-route issues so doctor/status can report them.
 function loadCentralConfig() {
-    const report = { present: false, fatal: null, routes: [], vars: {}, issues: [], desiredEvents: [] };
+    const report = { present: false, fatal: null, routes: [], issues: [], desiredEvents: [] };
     let raw;
     try {
         const st = fs.statSync(central.config);
@@ -1094,9 +1250,10 @@ function loadCentralConfig() {
         report.fatal = 'config.json version must be 1 (got ' + JSON.stringify(cfg.version) + ')';
         return report;
     }
-    // Config-level template vars (a route's own vars override these); malformed vars are a
-    // warn, never fatal — the dispatcher drops them and stays fail-open.
-    report.vars = (0, contracts_1.sanitizeVars)(cfg.vars, 'config', msg => report.issues.push({ level: 'warn', msg }));
+    for (const key of Object.keys(cfg)) {
+        if (CONFIG_KEYS.indexOf(key) === -1)
+            report.issues.push({ level: 'warn', msg: 'config.json has unrecognized key "' + key + '"' });
+    }
     const routes = Array.isArray(cfg.routes) ? cfg.routes : [];
     if (!Array.isArray(cfg.routes))
         report.issues.push({ level: 'warn', msg: 'config.json has no "routes" array; treating as empty' });
@@ -1125,9 +1282,7 @@ function loadCentralConfig() {
             report.issues.push({ level: 'fail', msg: 'route ' + label + ' has unsupported event ' + JSON.stringify(r.event) });
             continue;
         }
-        const ev = (0, contracts_1.parseEvent)(r.event);
-        if (contracts_1.SUPPORTED_EVENTS.indexOf(ev.base) === -1 ||
-            (ev.phase !== undefined && (ev.base !== 'SessionStart' || contracts_1.SESSION_PHASES.indexOf(ev.phase) === -1))) {
+        if (!(0, contracts_1.isSupportedRouteEvent)(r.event)) {
             report.issues.push({ level: 'fail', msg: 'route ' + label + ' has unsupported event ' + JSON.stringify(r.event) });
             continue;
         }
@@ -1164,12 +1319,11 @@ function loadCentralConfig() {
             report.issues.push({ level: 'fail', msg: 'route ' + label + ' doc not readable: ' + r.doc });
         }
         for (const key of Object.keys(r)) {
-            if (KNOWN_ROUTE_KEYS.indexOf(key) === -1)
+            if (contracts_1.ROUTE_KEYS.indexOf(key) === -1)
                 report.issues.push({ level: 'warn', msg: 'route ' + label + ' has unrecognized key "' + key + '"' });
         }
-        const vars = (0, contracts_1.sanitizeVars)(r.vars, 'route ' + label, msg => report.issues.push({ level: 'warn', msg }));
         seen[r.id] = true;
-        report.routes.push({ id: r.id, event: r.event, freq, cwd: r.cwd, doc: r.doc, vars });
+        report.routes.push({ id: r.id, event: r.event, freq, cwd: r.cwd, doc: r.doc });
     }
     // Wiring is keyed by NATIVE event, so a phase suffix folds into its base: three
     // SessionStart.<phase> routes wire exactly one native SessionStart hook.
@@ -1337,10 +1491,11 @@ function installedControlSurfaceSkill(host, repoRootPath) {
         '  route event set changes so hook wiring stays exact.',
         '- After hook-config changes, open `/hooks` once in each agent or restart it.',
         '',
-        'Codex plugin activation managed by `install`/`update`:',
+        'Codex plugin lifecycle managed by `install`/`update` through the supported CLI:',
         '',
-        '    cache: $CODEX_HOME/plugins/cache/' + CODEX_MARKETPLACE + '/' + CODEX_PLUGIN + '/' + CODEX_PLUGIN_VERSION,
-        '    config: ' + CODEX_PLUGIN_TABLE,
+        '    marketplace: ' + central.codexMarketplaceRoot,
+        '    selector: ' + CODEX_PLUGIN_KEY,
+        '    Codex owns its cache and config entries; do not edit them by hand.',
         '',
         'Source checkout recorded for provenance/source refresh only:',
         '',
@@ -1363,22 +1518,119 @@ function ensureCentralSkill() {
     atomicWrite(central.skillManifest, fs.readFileSync(repo.claudePluginManifest, 'utf8'));
     atomicWrite(central.skillMd, installedControlSurfaceSkill('Claude', repoRoot));
 }
-// Deploy the central Codex plugin payload. Codex itself loads from
-// CODEX_HOME/plugins/cache/<marketplace>/<plugin>/<version>, so selected agents
-// receive a managed link/copy from this root plus a config.toml activation table.
-function ensureCentralCodexPlugin() {
+function isJsonRecord(value) {
+    return !!value && typeof value === 'object' && !Array.isArray(value);
+}
+function parseCodexPluginManifest(text) {
+    const manifest = JSON.parse(text);
+    if (!isJsonRecord(manifest)) {
+        throw new Error('Codex plugin manifest needs a non-empty version.');
+    }
+    return manifest;
+}
+// The cachebuster version changes whenever cache-relevant manifest or
+// control-surface content changes. Provenance-only source-checkout text is
+// rendered for refresh guidance but normalized out, so it never changes the version.
+function expectedCodexPluginVersion(manifest, sourceText, generatedSkill, sourceCheckoutPath) {
+    const sourceVersion = manifest.version;
+    if (typeof sourceVersion !== 'string' || !sourceVersion) {
+        throw new Error('Codex plugin manifest needs a non-empty version.');
+    }
+    const provenance = '\n    ' + sourceCheckoutPath + '\n\nIf you need to refresh from a different checkout, run that checkout\'s';
+    const canonicalProvenance = '\n    <source-checkout>\n\nIf you need to refresh from a different checkout, run that checkout\'s';
+    if (!generatedSkill.includes(provenance)) {
+        throw new Error('generated Codex skill is missing source-checkout provenance.');
+    }
+    const cachebusterSkill = generatedSkill.replace(provenance, canonicalProvenance);
+    const digest = crypto.createHash('sha256').update(sourceText).update('\0').update(cachebusterSkill).digest('hex').slice(0, 12);
+    return sourceVersion.split('+')[0] + '+codex.local-' + digest;
+}
+// A self-contained installed manager has repoRoot === installRoot, but preserve
+// the source-checkout provenance written by the original source deployment when
+// it later refreshes the payload. Source checkouts always record their own root.
+function codexSkillSourceCheckoutPath() {
+    if (!samePath(repoRoot, installRoot) || fs.existsSync(path.join(repoRoot, 'src', 'manage.ts'))) {
+        return repoRoot;
+    }
+    try {
+        const skill = fs.readFileSync(central.codexPluginSkillMd, 'utf8');
+        const marker = 'Source checkout recorded for provenance/source refresh only:\n\n    ';
+        const start = skill.indexOf(marker);
+        if (start === -1)
+            return repoRoot;
+        const pathStart = start + marker.length;
+        const pathEnd = skill.indexOf('\n', pathStart);
+        const recordedPath = skill.slice(pathStart, pathEnd === -1 ? undefined : pathEnd);
+        if (recordedPath)
+            return recordedPath;
+    }
+    catch (e) { }
+    return repoRoot;
+}
+function readExpectedCodexPluginPayload() {
     if (!fs.existsSync(repo.codexPluginManifest)) {
         throw new Error('Codex plugin manifest missing at ' + repo.codexPluginManifest + ' — cannot deploy the Codex plugin.');
     }
-    atomicWrite(central.codexPluginManifest, fs.readFileSync(repo.codexPluginManifest, 'utf8'));
-    atomicWrite(central.codexPluginSkillMd, installedControlSurfaceSkill('Codex', repoRoot));
+    const sourceText = fs.readFileSync(repo.codexPluginManifest, 'utf8');
+    const manifest = parseCodexPluginManifest(sourceText);
+    const sourceCheckoutPath = codexSkillSourceCheckoutPath();
+    const generatedSkill = installedControlSurfaceSkill('Codex', sourceCheckoutPath);
+    return {
+        manifest,
+        generatedSkill,
+        version: expectedCodexPluginVersion(manifest, sourceText, generatedSkill, sourceCheckoutPath),
+    };
 }
-function ensureCodexPluginForAgent(ap) {
-    if (!ap.codexPluginDir || !ap.codexConfigToml)
-        return null;
-    const cacheMech = linkDirInto(central.codexPluginDir, ap.codexPluginDir, CODEX_PLUGIN_MARKER);
-    const activation = ensureCodexPluginActivation(ap.codexConfigToml);
-    return { cacheMech, activation };
+function centralCodexPluginPayloadStatus() {
+    const present = fs.existsSync(central.codexMarketplaceManifest) &&
+        fs.existsSync(central.codexPluginManifest) && fs.existsSync(central.codexPluginSkillMd);
+    let expectedVersion = null;
+    try {
+        expectedVersion = readExpectedCodexPluginPayload().version;
+    }
+    catch (e) { }
+    let version = null;
+    try {
+        const manifest = parseCodexPluginManifest(fs.readFileSync(central.codexPluginManifest, 'utf8'));
+        version = typeof manifest.version === 'string' ? manifest.version : null;
+    }
+    catch (e) { }
+    return {
+        present,
+        version,
+        expectedVersion,
+        stale: present && expectedVersion !== null && version !== expectedVersion,
+    };
+}
+function codexPluginVersionIsStale(plugin, expectedVersion) {
+    return plugin.plugin.ok && expectedVersion !== null && plugin.version !== expectedVersion;
+}
+// Deploy the central Codex local marketplace + plugin payload. The deployed
+// manifest gets a deterministic content-derived cachebuster, while the source
+// manifest remains byte-for-byte untouched. Identical payloads therefore keep the
+// same version; cache-relevant manifest/control-surface content changes force a new
+// cache version through the supported CLI, while provenance-only source-checkout text
+// is normalized out and does not.
+function ensureCentralCodexPlugin() {
+    const payload = readExpectedCodexPluginPayload();
+    const manifest = payload.manifest;
+    manifest.version = payload.version;
+    const interfaceMetadata = manifest.interface;
+    const category = isJsonRecord(interfaceMetadata) && typeof interfaceMetadata.category === 'string'
+        ? interfaceMetadata.category
+        : 'Productivity';
+    atomicWrite(central.codexPluginManifest, JSON.stringify(manifest, null, 2) + '\n');
+    atomicWrite(central.codexPluginSkillMd, payload.generatedSkill);
+    atomicWrite(central.codexMarketplaceManifest, JSON.stringify({
+        name: CODEX_MARKETPLACE,
+        interface: { displayName: 'baseline local' },
+        plugins: [{
+                name: CODEX_PLUGIN,
+                source: { source: 'local', path: './plugins/' + CODEX_PLUGIN },
+                policy: { installation: 'AVAILABLE', authentication: 'ON_INSTALL' },
+                category,
+            }],
+    }, null, 2) + '\n');
 }
 // --- commands --------------------------------------------------------------
 async function cmdInstall(opts) {
@@ -1489,7 +1741,7 @@ async function cmdInstall(opts) {
     if (selected.length)
         writeRecordedAgents(selected);
     // 8. For each agent: link the center in, then wire hook config for the config's
-    // events. Codex also gets its plugin cache materialized and config.toml activated.
+    // events. Codex is registered and installed through its supported plugin CLI.
     const perAgent = [];
     for (const ap of agentsP) {
         const jsMech = linkInto(central.hookJs, ap.hookJs);
@@ -1513,14 +1765,17 @@ async function cmdInstall(opts) {
     console.log('  config folder : ' + central.cfgDir + ' (' + configState + ', preset: ' + opts.preset + ')' +
         (configIsExternal ? ' [external; ' + central.cfgLink + ' (' + cfgLocMech + ') links to it]' : ''));
     console.log('  claude skill  : ' + central.skillDir + ' (baseline@skills-dir; no hooks)');
-    console.log('  codex plugin  : ' + central.codexPluginDir + ' (' + CODEX_PLUGIN_KEY + ', version ' + CODEX_PLUGIN_VERSION + ')');
+    console.log('  codex plugin  : ' + central.codexPluginDir + ' (' + CODEX_PLUGIN_KEY + ' via ' + central.codexMarketplaceRoot + ')');
     console.log('  routes        : ' + cfg.routes.length + (cfg.desiredEvents.length ? ' over [' + cfg.desiredEvents.join(', ') + ']' : ' (no events wired)'));
     if (cfg.fatal)
         console.log('  config WARNING: ' + cfg.fatal + ' — run doctor');
     for (const a of perAgent) {
         console.log('  agent ' + a.name + ' @ ' + a.configDir);
         console.log('    links       : dispatcher=' + a.jsMech + ', contracts=' + a.contractsMech + (a.binMech && a.binMech !== 'removed' ? ', native=' + a.binMech : '') + ', cfg=' + a.cfgMech + (a.skillMech ? ', skill=' + a.skillMech : '') +
-            (a.codexPlugin ? ', codex-cache=' + a.codexPlugin.cacheMech + ', codex-config=' + a.codexPlugin.activation : ''));
+            (a.codexPlugin ? ', codex-marketplace=' + a.codexPlugin.marketplace + ', codex-plugin=' + a.codexPlugin.plugin + (a.codexPlugin.version ? '@' + a.codexPlugin.version : '') : ''));
+        if (a.codexPlugin && a.codexPlugin.plugin === 'unavailable') {
+            console.log('    codex NOTICE: `codex` CLI unavailable; hooks are wired but the Codex control surface was not installed');
+        }
         console.log('    wired       : ' + (a.sync.wired.length ? a.sync.wired.join(', ') : '(none)') +
             (a.sync.unwired.length ? '; unwired ' + a.sync.unwired.join(', ') : ''));
     }
@@ -1544,8 +1799,13 @@ function cmdUninstall() {
         const contractsGone = removeOurLink(ap.hookContractsJs, central.hookContractsJs);
         const cfgGone = removeOurDirLink(ap.cfgDir, central.cfgLink, CONFIG_MARKER);
         const skillGone = ap.skillDir ? removeOurDirLink(ap.skillDir, central.skillDir, SKILL_MARKER) : false;
-        const codexCacheGone = ap.codexPluginDir ? removeOurDirLink(ap.codexPluginDir, central.codexPluginDir, CODEX_PLUGIN_MARKER) : false;
-        const codexActivation = ap.codexConfigToml ? removeCodexPluginActivation(ap.codexConfigToml) : 'absent';
+        let codexLifecycle = null;
+        try {
+            codexLifecycle = uninstallCodexPluginForAgent(ap);
+        }
+        catch (e) {
+            fail('uninstall: ' + e.message, 1);
+        }
         console.log('  agent ' + ap.name + ' @ ' + ap.configDir);
         console.log('    ' + ap.settingsLabel.padEnd(12) + ': ' + (unwired.length ? 'unwired ' + unwired.join(', ') : 'nothing wired'));
         console.log('    dispatcher  : ' + (jsGone ? 'unlinked' : 'absent'));
@@ -1555,10 +1815,10 @@ function cmdUninstall() {
         console.log('    cfg folder  : ' + (cfgGone ? 'unlinked (central kept)' : 'left as-is'));
         if (ap.skillDir)
             console.log('    skill plugin: ' + (skillGone ? 'unlinked (central kept)' : 'left as-is'));
-        if (ap.codexPluginDir)
-            console.log('    codex cache : ' + (codexCacheGone ? 'removed (central kept)' : 'left as-is'));
-        if (ap.codexConfigToml)
-            console.log('    codex config: ' + (codexActivation === 'removed' ? 'removed ' + CODEX_PLUGIN_TABLE : 'no managed entry'));
+        if (codexLifecycle) {
+            console.log('    codex plugin: ' + codexLifecycle.plugin);
+            console.log('    marketplace : ' + codexLifecycle.marketplace);
+        }
     }
     console.log('  central config : KEPT at ' + central.cfgDir + ' (delete by hand if you want it gone)');
     console.log('  central payloads: KEPT under ' + central.root + ' (delete by hand if you want them gone)');
@@ -1573,12 +1833,14 @@ function collectStatusData() {
     const cfg = loadCentralConfig();
     const managerPresent = fs.existsSync(central.managerJs) && fs.existsSync(central.managerHookSourceJs) && fs.existsSync(central.managerContractsJs);
     const skillPresent = fs.existsSync(central.skillManifest) && fs.existsSync(central.skillMd);
-    const codexPluginPresent = fs.existsSync(central.codexPluginManifest) && fs.existsSync(central.codexPluginSkillMd);
+    const codexPlugin = centralCodexPluginPayloadStatus();
+    const expectedCodexVersion = codexPlugin.expectedVersion;
     const agents = allAgentPaths().map(ap => {
         const { settings, error } = settingsForRead(ap);
         const hooks = error ? [] : wiredHooks(settings, ap);
         const nativeEvents = eventsForRuntime(hooks, 'native');
         const nodeEvents = eventsForRuntime(hooks, 'node');
+        const invocationDrift = noncanonicalEvents(hooks, ap);
         const links = {
             dispatcher: linkState(ap.hookJs, central.hookJs),
             contracts: linkState(ap.hookContractsJs, central.hookContractsJs),
@@ -1588,9 +1850,10 @@ function collectStatusData() {
             links.native = linkState(ap.hookBin, central.hookBin);
         if (ap.skillDir)
             links.skill = dirLinkState(ap.skillDir, central.skillDir, SKILL_MARKER);
-        if (ap.codexPluginDir && ap.codexConfigToml) {
-            links.codexCache = dirLinkState(ap.codexPluginDir, central.codexPluginDir, CODEX_PLUGIN_MARKER);
-            links.codexActivation = codexPluginActivationState(ap.codexConfigToml);
+        const codex = ap.codexPlugin ? codexPluginInspection(ap) : null;
+        if (codex) {
+            links.codexMarketplace = codex.marketplace;
+            links.codexPlugin = codex.plugin;
         }
         return {
             name: ap.name,
@@ -1599,8 +1862,16 @@ function collectStatusData() {
             settingsError: error ? error.message : null,
             wiredEvents: hooks.map(h => h.event),
             runtime: { nativeEvents, nodeEvents },
+            invocation: { canonical: invocationDrift.length === 0, noncanonicalEvents: invocationDrift },
             nativeBinary: nativeEvents.length ? nativeBinaryState(ap.hookBin) : null,
-            links
+            links,
+            codex: codex ? {
+                version: codex.version,
+                expectedVersion: expectedCodexVersion,
+                stale: codexPluginVersionIsStale(codex, expectedCodexVersion),
+                installedPath: codex.installedPath,
+                detail: codex.detail,
+            } : null,
         };
     });
     const nativeConfigured = agents.some(a => a.runtime.nativeEvents.length > 0);
@@ -1610,9 +1881,9 @@ function collectStatusData() {
         configFolder: { present: cfg.present, path: central.cfgDir, external: configIsExternal },
         manager: { present: managerPresent },
         claudeSkill: { present: skillPresent },
-        codexPlugin: { present: codexPluginPresent },
+        codexPlugin,
         nativeDispatcher: { active: nativeConfigured, state: nativeConfigured ? nativeBinaryState(central.hookBin) : null },
-        config: { fatal: cfg.fatal, vars: cfg.vars, routes: cfg.routes, issues: cfg.issues, desiredEvents: cfg.desiredEvents },
+        config: { fatal: cfg.fatal, routes: cfg.routes, issues: cfg.issues, desiredEvents: cfg.desiredEvents },
         agents
     };
 }
@@ -1638,8 +1909,13 @@ function cmdStatus() {
     console.log('  manager        : ' + (managerPresent ? 'present at ' + central.managerJs : 'not deployed (install will deploy it)'));
     const skillPresent = fs.existsSync(central.skillManifest) && fs.existsSync(central.skillMd);
     console.log('  claude skill   : ' + (skillPresent ? 'present at ' + central.skillDir : 'not deployed (install will deploy it)'));
-    const codexPluginPresent = fs.existsSync(central.codexPluginManifest) && fs.existsSync(central.codexPluginSkillMd);
-    console.log('  codex plugin   : ' + (codexPluginPresent ? 'present at ' + central.codexPluginDir : 'not deployed (install will deploy it)'));
+    const codexPlugin = centralCodexPluginPayloadStatus();
+    const codexPluginDetail = !codexPlugin.present
+        ? 'not deployed (install will deploy it)'
+        : codexPlugin.stale
+            ? 'STALE — deployed @ ' + (codexPlugin.version || 'missing version') + '; expected @ ' + codexPlugin.expectedVersion + ' (update will refresh)'
+            : 'present at ' + central.codexPluginDir + ' via ' + central.codexMarketplaceRoot + (codexPlugin.version ? ' @ ' + codexPlugin.version : '');
+    console.log('  codex plugin   : ' + codexPluginDetail);
     if (cfg.fatal)
         console.log('  config         : INVALID — ' + cfg.fatal);
     console.log('  routes         : ' + cfg.routes.length);
@@ -1666,6 +1942,7 @@ function cmdStatus() {
         const hooks = error ? [] : wiredHooks(settings, ap);
         const nativeEvents = eventsForRuntime(hooks, 'native');
         const nodeEvents = eventsForRuntime(hooks, 'node');
+        const invocationDrift = noncanonicalEvents(hooks, ap);
         console.log('  agent ' + ap.name + ' @ ' + ap.configDir);
         if (error) {
             console.log('    ' + ap.settingsLabel.padEnd(13) + ': INVALID (' + error.message + ')');
@@ -1678,6 +1955,9 @@ function cmdStatus() {
             if (nodeEvents.length)
                 runtimeBits.push('node [' + nodeEvents.join(', ') + ']');
             console.log('    ' + ap.settingsLabel.padEnd(13) + ': ' + (wired.length ? 'wired [' + wired.join(', ') + '] via ' + runtimeBits.join('; ') : 'not wired'));
+            if (invocationDrift.length) {
+                console.log('    invocation   : UNHEALTHY — legacy/noncanonical for [' + invocationDrift.join(', ') + ']; run update');
+            }
         }
         console.log('    dispatcher   : ' + describeLink(linkState(ap.hookJs, central.hookJs)));
         if (nativeEvents.length)
@@ -1686,11 +1966,15 @@ function cmdStatus() {
         console.log('    cfg folder   : ' + describeLink(dirLinkState(ap.cfgDir, central.cfgLink, CONFIG_MARKER)));
         if (ap.skillDir)
             console.log('    skill plugin : ' + describeLink(dirLinkState(ap.skillDir, central.skillDir, SKILL_MARKER)));
-        if (ap.codexPluginDir && ap.codexConfigToml) {
-            const cache = dirLinkState(ap.codexPluginDir, central.codexPluginDir, CODEX_PLUGIN_MARKER);
-            const activation = codexPluginActivationState(ap.codexConfigToml);
-            console.log('    codex cache  : ' + describeLink(cache));
-            console.log('    codex config : ' + (activation.ok ? 'OK (' + CODEX_PLUGIN_TABLE + ' in config.toml)' : activation.mechanism.toUpperCase() + ' (' + CODEX_PLUGIN_TABLE + ' absent)'));
+        if (ap.codexPlugin) {
+            const codex = codexPluginInspection(ap);
+            console.log('    marketplace  : ' + describeLink(codex.marketplace));
+            const stale = codexPluginVersionIsStale(codex, codexPlugin.expectedVersion);
+            console.log('    codex plugin : ' + (stale
+                ? 'STALE — installed @ ' + (codex.version || 'missing version') + '; expected @ ' + codexPlugin.expectedVersion + ' (run update)'
+                : describeLink(codex.plugin) + (codex.version ? ' @ ' + codex.version : '')));
+            if (codex.detail)
+                console.log('    codex detail : ' + codex.detail);
         }
     }
 }
@@ -1705,16 +1989,17 @@ function synthInput(route, sessionId, cwd) {
         data.tool_name = 'Bash';
     return JSON.stringify(data);
 }
-// Functional check — drive the ACTUALLY-WIRED dispatcher (of the first agent) with
-// synthetic stdin for `freq` invocations of one route's event, and confirm it stays
-// silent until the freq-th, then fires with additionalContext.
-function cmdVerify() {
-    const ap = allAgentPaths()[0];
-    const sr = settingsForRead(ap);
-    if (sr.error) {
-        console.log('[baseline] verify: FAIL — invalid ' + ap.settingsLabel + ': ' + sr.error.message);
-        process.exit(1);
+function spawnHookCommand(hook, input) {
+    if (hook.args !== undefined) {
+        return (0, child_process_1.spawnSync)(hook.command, hook.args, { input, encoding: 'utf8' });
     }
+    return isWin
+        ? (0, child_process_1.spawnSync)('powershell', ['-NoProfile', '-NonInteractive', '-Command', hook.command], { input, encoding: 'utf8' })
+        : (0, child_process_1.spawnSync)('sh', ['-c', hook.command], { input, encoding: 'utf8' });
+}
+// Functional check — drive an ACTUALLY-WIRED dispatcher, preferring Codex so its
+// shell-rendered command path is exercised when both agents are installed.
+function cmdVerify() {
     const cfg = loadCentralConfig();
     if (!cfg.routes.length) {
         console.log('[baseline] verify: FAIL — config has no valid routes' + (cfg.fatal ? ' (' + cfg.fatal + ')' : '') + '.');
@@ -1723,14 +2008,36 @@ function cmdVerify() {
     // Prefer a UserPromptSubmit route (no phase, fires every turn — deterministic); else the first.
     const route = cfg.routes.filter(r => r.event === 'UserPromptSubmit')[0] || cfg.routes[0];
     const routeEvent = (0, contracts_1.parseEvent)(route.event).base;
-    const ourHook = findOurHookInGroups(eventHookGroups(sr.settings, routeEvent), ap);
-    if (!ourHook) {
+    const scoped = new Set(scopedAgentNames());
+    const candidates = allAgentPaths()
+        .filter(ap => scoped.has(ap.name))
+        .sort((a, b) => Number(b.name === 'codex') - Number(a.name === 'codex'));
+    let selected = null;
+    let invalid = null;
+    for (const candidate of candidates) {
+        const sr = settingsForRead(candidate);
+        if (sr.error) {
+            if (!invalid)
+                invalid = { ap: candidate, error: sr.error };
+            continue;
+        }
+        const hook = findOurHookInGroups(eventHookGroups(sr.settings, routeEvent), candidate);
+        if (hook) {
+            selected = { ap: candidate, hook };
+            break;
+        }
+    }
+    if (!selected) {
+        if (invalid) {
+            console.log('[baseline] verify: FAIL — invalid ' + invalid.ap.settingsLabel + ': ' + invalid.error.message);
+            process.exit(1);
+        }
         console.log('[baseline] verify: FAIL — no baseline hook wired for ' + routeEvent + '. Run install.');
         process.exit(1);
     }
-    const runtime = commandRuntime(ourHook.command, ap);
-    const argv = parseCommandLine(ourHook.command);
-    if (!argv || !runtime) {
+    const { ap, hook: ourHook } = selected;
+    const runtime = commandRuntime(ourHook, ap);
+    if (!runtime) {
         console.log('[baseline] verify: FAIL — cannot parse wired command.');
         process.exit(1);
     }
@@ -1749,9 +2056,15 @@ function cmdVerify() {
     let firedText = '';
     let spawnErr = null;
     for (let i = 1; i <= route.freq; i++) {
-        const r = (0, child_process_1.spawnSync)(argv[0], argv.slice(1), { input: synthInput(route, sid, cwd), encoding: 'utf8' });
+        const r = spawnHookCommand(ourHook, synthInput(route, sid, cwd));
         if (r.error) {
             spawnErr = r.error;
+            break;
+        }
+        if (r.status !== 0) {
+            const detail = (r.stderr || '').trim();
+            const runner = ourHook.args === undefined ? 'shell' : 'command';
+            spawnErr = new Error('configured ' + runner + ' exited ' + r.status + (detail ? ': ' + detail : ''));
             break;
         }
         const out = (r.stdout || '').trim();
@@ -1771,6 +2084,7 @@ function cmdVerify() {
     catch (e) { }
     const ok = !spawnErr && firedAt === route.freq && firedText.includes('additionalContext');
     console.log('[baseline] verify: ' + (ok ? 'PASS' : 'FAIL'));
+    console.log('  agent tested  : ' + ap.name);
     console.log('  route tested  : ' + route.id + ' (' + route.event + ', freq ' + route.freq + ')');
     console.log('  fired on turn : ' + (firedAt || 'never'));
     if (spawnErr)
@@ -1889,27 +2203,37 @@ function doctorChecks() {
     else {
         checks.push({ name: 'claude skill plugin', level: 'ok', detail: 'central payload deployed' });
     }
+    let expectedCodexPayload = null;
+    try {
+        expectedCodexPayload = readExpectedCodexPluginPayload();
+    }
+    catch (e) { }
     // Central Codex plugin payload.
-    if (!fs.existsSync(central.codexPluginManifest) || !fs.existsSync(central.codexPluginSkillMd)) {
+    if (!fs.existsSync(central.codexMarketplaceManifest) || !fs.existsSync(central.codexPluginManifest) || !fs.existsSync(central.codexPluginSkillMd)) {
         checks.push({ name: 'codex plugin payload', level: 'warn', detail: 'central payload not deployed at ' + central.codexPluginDir + ' (install will deploy it)', fixable: true });
     }
     else if (fs.existsSync(repo.codexPluginManifest)) {
         let manifestSync = false;
-        try {
-            manifestSync = fs.readFileSync(central.codexPluginManifest, 'utf8') === fs.readFileSync(repo.codexPluginManifest, 'utf8');
-        }
-        catch (e) { }
         let pathFresh = false;
         try {
+            const deployedManifest = parseCodexPluginManifest(fs.readFileSync(central.codexPluginManifest, 'utf8'));
+            const sourceName = expectedCodexPayload ? expectedCodexPayload.manifest.name : null;
+            manifestSync = expectedCodexPayload !== null &&
+                typeof sourceName === 'string' &&
+                deployedManifest.name === sourceName &&
+                deployedManifest.version === expectedCodexPayload.version;
             const skill = fs.readFileSync(central.codexPluginSkillMd, 'utf8');
-            pathFresh = skill.includes(central.managerJs) && skill.includes(CODEX_PLUGIN_TABLE);
+            const marketplace = JSON.parse(fs.readFileSync(central.codexMarketplaceManifest, 'utf8'));
+            pathFresh = skill.includes(central.managerJs) && skill.includes(CODEX_PLUGIN_KEY) &&
+                marketplace.name === CODEX_MARKETPLACE && Array.isArray(marketplace.plugins) &&
+                marketplace.plugins.some((entry) => entry && entry.name === CODEX_PLUGIN && entry.source && entry.source.path === './plugins/' + CODEX_PLUGIN);
         }
         catch (e) { }
         if (manifestSync && pathFresh) {
             checks.push({ name: 'codex plugin payload', level: 'ok', detail: 'central payload deployed; points at installed manager' });
         }
         else {
-            checks.push({ name: 'codex plugin payload', level: 'warn', detail: (!manifestSync ? 'manifest differs from source' : 'installed manager/plugin activation path missing/stale') + ' (update will refresh)', fixable: true });
+            checks.push({ name: 'codex plugin payload', level: 'warn', detail: (!manifestSync ? 'deployed manifest/cachebuster differs from source' : 'installed manager/marketplace metadata missing or stale') + ' (update will refresh)', fixable: true });
         }
     }
     else {
@@ -1940,6 +2264,13 @@ function doctorChecks() {
             if (stale.length)
                 parts.push('stale [' + stale.join(', ') + ']');
             checks.push({ name: 'hook wiring', level: 'fail', detail: 'wiring drift: ' + parts.join('; '), fixable: true });
+        }
+        const invocationDrift = noncanonicalEvents(hooks, ap);
+        if (invocationDrift.length) {
+            checks.push({
+                name: 'hook invocation', level: 'fail', fixable: true,
+                detail: ap.name + ' uses a legacy/noncanonical invocation for [' + invocationDrift.join(', ') + ']; update will rewrite it'
+            });
         }
         if (nativeEvents.length) {
             const scope = ap.name + ' wired native [' + nativeEvents.join(', ') + ']';
@@ -2003,21 +2334,40 @@ function doctorChecks() {
             else
                 checks.push({ name: 'skill link', level: 'fail', detail: ap.name + ' ' + sl.mechanism + ' — not linked to ' + central.skillDir, fixable: true });
         }
-        if (ap.codexPluginDir && ap.codexConfigToml) {
-            const pl = dirLinkState(ap.codexPluginDir, central.codexPluginDir, CODEX_PLUGIN_MARKER);
-            if (pl.ok && pl.mechanism !== 'copy')
-                checks.push({ name: 'codex plugin cache', level: 'ok', detail: ap.name + ' cache linked to center (' + pl.mechanism + ')' });
-            else if (pl.ok)
-                checks.push({ name: 'codex plugin cache', level: 'warn', detail: ap.name + ' degraded cache copy (install will relink)', fixable: true });
-            else if (!fs.existsSync(central.codexPluginManifest))
-                checks.push({ name: 'codex plugin cache', level: 'warn', detail: ap.name + ' central Codex plugin missing — install will deploy + cache it', fixable: true });
-            else
-                checks.push({ name: 'codex plugin cache', level: 'fail', detail: ap.name + ' ' + pl.mechanism + ' — not materialized at ' + ap.codexPluginDir, fixable: true });
-            const act = codexPluginActivationState(ap.codexConfigToml);
-            if (act.ok)
-                checks.push({ name: 'codex plugin activation', level: 'ok', detail: ap.name + ' config.toml contains ' + CODEX_PLUGIN_TABLE });
-            else
-                checks.push({ name: 'codex plugin activation', level: 'fail', detail: ap.name + ' ' + act.mechanism + ' — config.toml must contain ' + CODEX_PLUGIN_TABLE, fixable: act.mechanism !== 'unreadable' });
+        if (ap.codexPlugin) {
+            const codex = codexPluginInspection(ap);
+            if (codex.marketplace.ok) {
+                checks.push({ name: 'codex marketplace', level: 'ok', detail: ap.name + ' registered from manager-owned root' });
+            }
+            else {
+                const unavailable = codex.marketplace.mechanism === 'unavailable';
+                checks.push({
+                    name: 'codex marketplace', level: unavailable ? 'warn' : 'fail',
+                    detail: ap.name + ' ' + codex.marketplace.mechanism + (codex.detail ? ' — ' + codex.detail : ''),
+                    fixable: !unavailable && codex.marketplace.mechanism !== 'foreign' && codex.marketplace.mechanism !== 'unreadable',
+                });
+            }
+            if (codex.plugin.ok) {
+                const expectedVersion = expectedCodexPayload ? expectedCodexPayload.version : null;
+                const stale = codexPluginVersionIsStale(codex, expectedVersion);
+                checks.push(stale
+                    ? {
+                        name: 'codex plugin install',
+                        level: 'fail',
+                        detail: ap.name + ' ' + CODEX_PLUGIN_KEY + ' stale @ ' + (codex.version || 'missing version') +
+                            '; expected @ ' + expectedVersion + ' (update will refresh)',
+                        fixable: true,
+                    }
+                    : { name: 'codex plugin install', level: 'ok', detail: ap.name + ' ' + CODEX_PLUGIN_KEY + ' installed' + (codex.version ? ' @ ' + codex.version : '') });
+            }
+            else if (codex.marketplace.mechanism !== 'unavailable') {
+                checks.push({
+                    name: 'codex plugin install',
+                    level: 'fail',
+                    detail: ap.name + ' ' + codex.plugin.mechanism + (codex.detail ? ' — ' + codex.detail : ''),
+                    fixable: codex.plugin.mechanism !== 'foreign' && codex.plugin.mechanism !== 'unreadable',
+                });
+            }
         }
     }
     return checks;
@@ -2081,8 +2431,8 @@ async function cmdDoctor(fix) {
     console.log('[baseline] doctor: installation repaired.');
 }
 // --- route + dispatch-simulate commands (R-012) -----------------------------
-// Read config.json as a plain object for mutation, preserving unknown keys (version,
-// vars, ...). A missing file yields a fresh { version: 1, routes: [] }. A fatal shape
+// Read config.json as a plain object for mutation, preserving unknown keys. A missing
+// file yields a fresh { version: 1, routes: [] }. A fatal shape
 // error fails (json-aware).
 function readConfigObject() {
     const r = readJson(central.config);
@@ -2124,7 +2474,7 @@ function readDocBodyForSimulate(doc) {
 function cmdRouteList() {
     const cfg = loadCentralConfig();
     if (jsonMode) {
-        emitJson('route.list', { routes: cfg.routes, configVars: cfg.vars, fatal: cfg.fatal, issues: cfg.issues });
+        emitJson('route.list', { routes: cfg.routes, fatal: cfg.fatal, issues: cfg.issues });
         return;
     }
     console.log('[baseline] routes (' + cfg.routes.length + ')');
@@ -2148,9 +2498,7 @@ function cmdRouteAdd(argv) {
         fail('route add: --id must be a slug matching ' + contracts_1.SLUG.source, 2, 'invalid_args');
     if (!event)
         fail('route add: --event is required', 2, 'invalid_args');
-    const ev = (0, contracts_1.parseEvent)(event);
-    if (contracts_1.SUPPORTED_EVENTS.indexOf(ev.base) === -1 ||
-        (ev.phase !== undefined && (ev.base !== 'SessionStart' || contracts_1.SESSION_PHASES.indexOf(ev.phase) === -1))) {
+    if (!(0, contracts_1.isSupportedRouteEvent)(event)) {
         fail('route add: unsupported event "' + event + '"', 2, 'invalid_args');
     }
     if (!doc || !(0, contracts_1.safeDocPath)(doc, central.cfgDir))
@@ -2194,8 +2542,8 @@ function cmdRouteRemove(argv) {
     console.log('[baseline] route removed: ' + id);
     console.log('  rerun install/update if this drops an event so hook wiring re-syncs.');
 }
-// Dry-run: which routes a (event, cwd, source) invocation SELECTS, and the templated
-// additionalContext that WOULD be injected if they were due. Side-effect-free — it never
+// Dry-run: which routes a (event, cwd, source) invocation selects, and the exact static
+// additionalContext that would be injected if they were due. Side-effect-free — it never
 // touches counters (freq gating is stateful, so simulate reports selection assuming due).
 function cmdDispatchSimulate(argv) {
     const event = flagValue(argv, '--event');
@@ -2203,18 +2551,17 @@ function cmdDispatchSimulate(argv) {
     const source = flagValue(argv, '--source');
     if (!event)
         fail('dispatch simulate: --event is required', 2, 'invalid_args');
-    const ev = (0, contracts_1.parseEvent)(event);
-    if (contracts_1.SUPPORTED_EVENTS.indexOf(ev.base) === -1)
+    if (!(0, contracts_1.isSupportedRouteEvent)(event))
         fail('dispatch simulate: unsupported event "' + event + '"', 2, 'invalid_args');
+    const ev = (0, contracts_1.parseEvent)(event);
+    const effectiveSource = source !== undefined ? source : ev.phase;
     const cfg = loadCentralConfig();
-    const selected = cfg.routes.filter(r => (0, contracts_1.eventMatches)(r.event, ev.base, source) && (0, contracts_1.cwdMatches)(r.cwd, cwd, isWin));
-    const now = new Date();
+    const selected = cfg.routes.filter(r => (0, contracts_1.eventMatches)(r.event, ev.base, effectiveSource) && (0, contracts_1.cwdMatches)(r.cwd, cwd, isWin));
     const bodies = [];
     for (const r of selected) {
-        const raw = readDocBodyForSimulate(r.doc);
-        if (raw === null)
+        const body = readDocBodyForSimulate(r.doc);
+        if (body === null)
             continue;
-        const body = (0, contracts_1.applyTemplate)(raw, { event: ev.base, cwd, home: homeDir, now, env: process.env, vars: (0, contracts_1.mergeVars)(cfg.vars, r.vars) });
         const joined = bodies.length ? bodies.join('\n\n') + '\n\n' + body : body;
         if (joined.length <= contracts_1.MAX_DOC_CHARS)
             bodies.push(body);
@@ -2225,7 +2572,7 @@ function cmdDispatchSimulate(argv) {
             event: ev.base,
             phase: ev.phase !== undefined ? ev.phase : null,
             cwd,
-            source: source !== undefined ? source : null,
+            source: effectiveSource !== undefined ? effectiveSource : null,
             selected: selected.map(r => ({ id: r.id, event: r.event, freq: r.freq, cwd: r.cwd !== undefined ? r.cwd : null, doc: r.doc })),
             additionalContext
         });
@@ -2240,7 +2587,7 @@ function printHelp() {
     console.log('baseline — manage the injection-routes dispatcher (cross-platform: Windows + Linux)');
     console.log('');
     console.log('Usage:');
-    console.log('  node scripts/manage.js status                  Report what is installed vs the repo source + config.');
+    console.log('  node scripts/manage.js status                  Report installed artifacts, config, and agent health.');
     console.log('  node scripts/manage.js route list|add|remove   Inspect or edit routes in config.json (see route options).');
     console.log('  node scripts/manage.js dispatch simulate --event <e> [--cwd <d>] [--source <phase>]  Dry-run: show what would be injected.');
     console.log('  node scripts/manage.js install [--preset <n>] [--agents <a,b>]  Deploy the dispatcher, seed the config preset, link agents, wire hook config.');
@@ -2268,7 +2615,7 @@ function printHelp() {
     console.log('Native runtime: plain install/update wires the shipped Zig prebuilt as the hook hot path when available; --runtime node forces Node; a missing or undeployable prebuilt falls back to the Node dispatcher.');
     console.log('Installed manager artifacts are deployed under <install root>/scripts so generated control surfaces do not depend on the source checkout.');
     console.log('A Claude skills-dir plugin (baseline@skills-dir) is deployed + linked so Claude recognizes baseline; it carries no hooks.');
-    console.log('A Codex plugin (' + CODEX_PLUGIN_KEY + ') is deployed under <install root>/codex-plugin/baseline, materialized at $CODEX_HOME/plugins/cache/' + CODEX_MARKETPLACE + '/' + CODEX_PLUGIN + '/' + CODEX_PLUGIN_VERSION + ', and activated by ' + CODEX_PLUGIN_TABLE + ' in config.toml.');
+    console.log('A manager-owned Codex marketplace is deployed under <install root>/codex-marketplace; install/update register it with `codex plugin marketplace add` and install ' + CODEX_PLUGIN_KEY + ' through the supported plugin CLI. Codex owns its cache and config state.');
     console.log('Config folder (routes + docs): BASELINE_CFG if set, otherwise <install root>/cfg.');
     console.log('Claude config dir: CLAUDE_CONFIG_DIR if set, otherwise ~/.claude.');
     console.log('Codex config dir: CODEX_HOME if set, otherwise ~/.codex.');

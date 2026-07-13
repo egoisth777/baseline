@@ -31,10 +31,10 @@ Content and routing are kept separate: **docs** (`docs/*.md`) hold the verbatim 
 | Agent dispatcher link | `~/.claude/hooks/`, `~/.codex/hooks/` | Installed command path wired in hook config; links to the install root. Native runtime wiring executes the native binary directly; Node wiring runs `baseline-recital.js`. |
 | Config folder | `BASELINE_CFG`, else `<install root>/cfg` (`config.json` + `docs/` + `README.md`) | **Everything tunable**: routes in `config.json`, injected text in `docs/`. Pure config — no artifacts. `<install root>/cfg` symlinks here when `BASELINE_CFG` is set. |
 | Agent config link | `~/.claude/cfg/baseline/`, `~/.codex/cfg/baseline/` | Links to `<install root>/cfg` (your config folder). Read live via symlink; a copy fallback needs install/update after edits. |
-| Control-surface plugins | `.claude-plugin/plugin.json`, `.codex-plugin/plugin.json`, `skills/baseline/SKILL.md`, installed `~/.baseline/skills/baseline/` | Plugin manifests and skill payloads make baseline discoverable. The installed control surface should be self-contained; Claude+Codex parity is an in-scope implementation goal. Control surfaces carry no hooks. |
+| Control-surface plugins | `.claude-plugin/plugin.json`, `.codex-plugin/plugin.json`, `skills/baseline/SKILL.md`, installed control-surface payloads | Plugin manifests and skill payloads make baseline discoverable. Installed payloads use the self-contained manager under the install root. Control surfaces carry no hooks. |
 | Counter state | `<agent-config>/.baseline-counters.json` | Per-session, per-route firing state keyed `"<session>:<routeId>"`. Auto-pruned. Never edit by hand. |
 | Wiring | `~/.claude/settings.json`, `~/.codex/hooks.json` | Our dispatcher command wired into exactly the events the config uses. `install`/`uninstall` manage it. |
-| Manager | `src/manage.ts` → `scripts/manage.js` | install / update / doctor / verify / status / uninstall. Run from the baseline plugin/repo root. |
+| Manager | `src/manage.ts` → `scripts/manage.js` | install / update / doctor / verify / status / uninstall. Source runs deploy a self-contained copy under the install root. |
 | Presets | `presets/default/`, `presets/minimal/` | Repo-shipped config payloads `install` seeds from. Plain `install` seeds `default`; `minimal` is the neutral opt-in floor. |
 | Route templates | `assets/route-templates/*.md` | Doc+route authoring references. Never deployed or injected. |
 
@@ -72,19 +72,27 @@ The config folder is `BASELINE_CFG` (else `<install root>/cfg`):
 
 ### Manage the hook itself
 
-First resolve the baseline repo root, then run the manager from there. When this skill loaded as the Claude skills-dir plugin (`baseline@skills-dir`), its wrapper `SKILL.md` records the repo root explicitly and points here — use that recorded path (note `$CLAUDE_SKILL_DIR` points at the deployed wrapper, not the repo). In Codex, use the plugin root that contains this `SKILL.md`, `.codex-plugin/`, and `scripts/`.
+Use the manager path named by the active control surface. Installed Claude and
+Codex payloads point at `<install root>/scripts/manage.js`, so normal management
+does not require the source checkout to remain present. When developing from a
+source checkout, use that checkout's `scripts/manage.js` so install/update can
+refresh the installed artifacts.
 
 ```bash
-cd "$BASELINE_REPO"
-node scripts/manage.js status      # install root, config folder, dispatcher sync, routes, wiring
-node scripts/manage.js install     # deploy dispatcher + seed preset + link agent + wire settings
-node scripts/manage.js verify      # functional: confirm a route fires
-node scripts/manage.js update      # redeploy + re-sync wiring from current config
-node scripts/manage.js doctor      # validate config + wiring; --fix to repair
-node scripts/manage.js uninstall   # unwire all events + remove agent links (keeps config folder)
+node "$BASELINE_MANAGER" status      # install root, config folder, dispatcher sync, routes, wiring
+node "$BASELINE_MANAGER" install     # deploy dispatcher + seed preset + link agent + wire settings
+node "$BASELINE_MANAGER" verify      # functional: confirm a route fires
+node "$BASELINE_MANAGER" update      # redeploy + re-sync wiring from current config
+node "$BASELINE_MANAGER" doctor      # validate config + wiring; --fix to repair
+node "$BASELINE_MANAGER" uninstall   # unwire all events + remove agent links (keeps config folder)
 ```
 
-Plain `install` seeds the curated `default` preset; `--preset minimal` selects the neutral floor; `--force` replaces an existing config folder (destructive). Or use the platform installers (`./install.sh`, `.\install.ps1`) from the same baseline root. Commands are idempotent and preserve co-resident hooks — hook-config edits are surgical.
+Here `$BASELINE_MANAGER` means the exact installed or source path resolved above;
+it is descriptive notation, not a required environment variable. Plain `install`
+seeds the curated `default` preset; `--preset minimal` selects the neutral floor;
+`--force` replaces an existing config folder (destructive). Source checkouts can
+also use the platform installers (`./install.sh`, `.\install.ps1`). Commands are
+idempotent and preserve co-resident hooks — hook-config edits are surgical.
 
 For scripting, add `--json` to `status`, `route list`/`add`/`remove`, and `dispatch simulate` for versioned machine output (`{ "apiVersion": 1, "command", "data" }`; errors as `{ "apiVersion": 1, "error": { "code", "message" } }` with a nonzero exit). `dispatch simulate` is a side-effect-free dry run of what a `(event, cwd, source)` would inject. The CLI plus `--json` is the whole programmatic surface — no Node library export, no daemon.
 

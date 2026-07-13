@@ -8,13 +8,12 @@ const path = require("path");
 const crypto = require("crypto");
 const module_1 = require("module");
 const child_process_1 = require("child_process");
-const contracts_1 = require("./contracts");
 const root = path.resolve(__dirname, '..');
 const manage = path.join(root, 'scripts', 'manage.js');
 const dispatcher = path.join(root, 'scripts', 'baseline-recital.js');
 const contracts = path.join(root, 'scripts', 'contracts.js');
-function tempConfig() {
-    const cfg = fs.mkdtempSync(path.join(os.tmpdir(), 'baseline-test-'));
+function tempConfig(prefix = 'baseline-test-') {
+    const cfg = fs.mkdtempSync(path.join(os.tmpdir(), prefix));
     // Detection is by config-dir existence (CLAUDE_CONFIG_DIR / CODEX_HOME). mkdtemp
     // already created the claude config dir; create the codex one too so BOTH agents are
     // detected by default and the both-agent tests keep wiring both. Detection tests that
@@ -32,10 +31,10 @@ function codexFor(cfg) {
 }
 // Run the manager with isolated install root + agent config dirs. extraEnv can set
 // BASELINE_CFG to exercise an external (symlinked) config folder.
-function run(args, cfg, home, extraEnv) {
+function run(args, cfg, home, extraEnv, workingDirectory = root) {
     const baseHome = home || homeFor(cfg);
     return (0, child_process_1.spawnSync)(process.execPath, [manage].concat(args), {
-        cwd: root,
+        cwd: workingDirectory,
         env: Object.assign({}, process.env, {
             CLAUDE_CONFIG_DIR: cfg,
             CODEX_HOME: codexFor(cfg),
@@ -45,7 +44,8 @@ function run(args, cfg, home, extraEnv) {
             // override equal to <installRoot>/cfg is treated as "no override" (a real seeded
             // folder), preserving the internal-config semantics the tests assume. Tests that
             // exercise external config pass their own BASELINE_CFG via extraEnv, which wins.
-            BASELINE_CFG: path.join(baseHome, 'cfg')
+            BASELINE_CFG: path.join(baseHome, 'cfg'),
+            BASELINE_CODEX_CLI: fakeCodexCli,
         }, extraEnv || {}),
         encoding: 'utf8'
     });
@@ -58,7 +58,8 @@ function runInstalled(args, cfg, home, extraEnv) {
             CLAUDE_CONFIG_DIR: cfg,
             CODEX_HOME: codexFor(cfg),
             BASELINE_HOME: baseHome,
-            BASELINE_CFG: path.join(baseHome, 'cfg')
+            BASELINE_CFG: path.join(baseHome, 'cfg'),
+            BASELINE_CODEX_CLI: fakeCodexCli
         }, extraEnv || {}),
         encoding: 'utf8'
     });
@@ -66,7 +67,8 @@ function runInstalled(args, cfg, home, extraEnv) {
 function runInstalledWithoutBaselineEnv(args, cfg, home, extraEnv) {
     const env = Object.assign({}, process.env, {
         CLAUDE_CONFIG_DIR: cfg,
-        CODEX_HOME: codexFor(cfg)
+        CODEX_HOME: codexFor(cfg),
+        BASELINE_CODEX_CLI: fakeCodexCli,
     }, extraEnv || {});
     delete env.BASELINE_HOME;
     delete env.BASELINE_CFG;
@@ -100,9 +102,224 @@ function setCentralConfig(home, routes, docs) {
 function readThrough(p) {
     return fs.readFileSync(p, 'utf8');
 }
-const CODEX_ACTIVATION_TABLE = '[plugins."baseline@baseline"]';
-const CODEX_QUOTED_PROJECT_TABLE = '[projects."C:/work#prod"] # trusted project';
-const CODEX_QUOTED_PROJECT_TRUST = CODEX_QUOTED_PROJECT_TABLE + '\ntrust_level = "trusted"';
+const FAKE_CODEX_STATE_FILE = '.baseline-test-codex-cli-state.json';
+function isRecord(value) {
+    return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+function isFakeCodexMarketplace(value) {
+    return isRecord(value) && typeof value.name === 'string' && typeof value.root === 'string';
+}
+function isFakeCodexPlugin(value) {
+    return isRecord(value) &&
+        typeof value.pluginId === 'string' &&
+        typeof value.enabled === 'boolean' &&
+        typeof value.version === 'string' &&
+        isRecord(value.source) &&
+        typeof value.source.path === 'string';
+}
+function isFakeCodexState(value) {
+    return isRecord(value) &&
+        Array.isArray(value.marketplaces) &&
+        value.marketplaces.every(isFakeCodexMarketplace) &&
+        Array.isArray(value.installed) &&
+        value.installed.every(isFakeCodexPlugin) &&
+        Array.isArray(value.commands) &&
+        value.commands.every(command => Array.isArray(command) && command.every(arg => typeof arg === 'string'));
+}
+function fakeCodexStatePath(codex) {
+    return path.join(codex, FAKE_CODEX_STATE_FILE);
+}
+function readFakeCodexState(codex) {
+    const parsed = JSON.parse(readThrough(fakeCodexStatePath(codex)));
+    assert.ok(isFakeCodexState(parsed), 'fake Codex state has an invalid shape');
+    return parsed;
+}
+function writeFakeCodexState(codex, state) {
+    write(fakeCodexStatePath(codex), JSON.stringify(state, null, 2) + '\n');
+}
+function resetFakeCodexCommands(codex) {
+    const state = readFakeCodexState(codex);
+    state.commands = [];
+    writeFakeCodexState(codex, state);
+}
+function createFakeCodexCli(prefix = 'baseline-test-codex-cli-') {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), prefix));
+    const script = path.join(dir, 'codex.js');
+    write(script, String.raw `#!/usr/bin/env node
+const fs = require('fs');
+const path = require('path');
+const home = process.env.CODEX_HOME;
+const statePath = path.join(home, '${FAKE_CODEX_STATE_FILE}');
+const args = process.argv.slice(2);
+
+function fail(message) {
+  process.stderr.write(message + '\n');
+  process.exit(2);
+}
+
+function emptyState() {
+  return { marketplaces: [], installed: [], commands: [] };
+}
+
+function loadState() {
+  try {
+    const state = JSON.parse(fs.readFileSync(statePath, 'utf8'));
+    if (state && Array.isArray(state.marketplaces) && Array.isArray(state.installed) && Array.isArray(state.commands)) return state;
+  } catch {}
+  return emptyState();
+}
+
+function saveState(state) {
+  fs.mkdirSync(home, { recursive: true });
+  fs.writeFileSync(statePath, JSON.stringify(state, null, 2) + '\n');
+}
+
+function output(data) {
+  process.stdout.write(JSON.stringify(data) + '\n');
+}
+
+function reportedPath(value) {
+  if (process.env.BASELINE_TEST_FAKE_CODEX_CANONICAL_PATHS !== '1') return value;
+  try {
+    return fs.realpathSync(value);
+  } catch {
+    return value;
+  }
+}
+
+if (!home) fail('CODEX_HOME is required');
+if (args[0] !== 'plugin' || args[args.length - 1] !== '--json') fail('expected codex plugin ... --json');
+const command = args.slice(1, -1);
+const state = loadState();
+state.commands.push(args);
+
+if (command.length === 2 && command[0] === 'marketplace' && command[1] === 'list') {
+  saveState(state);
+  if (process.env.BASELINE_TEST_FAKE_CODEX_MARKETPLACE_LIST_WRONG_SHAPE === '1') {
+    output({ marketplaces: {} });
+    process.exit(0);
+  }
+  if (process.env.BASELINE_TEST_FAKE_CODEX_MARKETPLACE_LIST_MALFORMED_ENTRY === '1') {
+    output({ marketplaces: [null] });
+    process.exit(0);
+  }
+  output({ marketplaces: state.marketplaces.map(entry => ({ name: entry.name, root: reportedPath(entry.root) })) });
+  process.exit(0);
+}
+
+if (command.length === 3 && command[0] === 'marketplace' && command[1] === 'add') {
+  const root = path.resolve(command[2]);
+  const manifestPath = path.join(root, '.agents', 'plugins', 'marketplace.json');
+  let manifest;
+  try {
+    manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf8'));
+  } catch {
+    fail('cannot read marketplace manifest at ' + manifestPath);
+  }
+  if (!manifest || typeof manifest.name !== 'string') fail('marketplace manifest needs a name');
+  const existing = state.marketplaces.find(entry => entry.name === manifest.name);
+  if (existing) {
+    saveState(state);
+    output({ alreadyAdded: true });
+    process.exit(0);
+  }
+  state.marketplaces.push({ name: manifest.name, root });
+  saveState(state);
+  output({ alreadyAdded: false });
+  process.exit(0);
+}
+
+if (command.length === 3 && command[0] === 'marketplace' && command[1] === 'remove') {
+  state.marketplaces = state.marketplaces.filter(entry => entry.name !== command[2]);
+  saveState(state);
+  output({ removed: true });
+  process.exit(0);
+}
+
+if (command.length === 1 && command[0] === 'list') {
+  saveState(state);
+  if (process.env.BASELINE_TEST_FAKE_CODEX_PLUGIN_LIST_UNREADABLE === '1') {
+    fail('fake Codex plugin list is unreadable');
+  }
+  if (process.env.BASELINE_TEST_FAKE_CODEX_PLUGIN_LIST_WRONG_SHAPE === '1') {
+    output({ installed: {} });
+    process.exit(0);
+  }
+  if (process.env.BASELINE_TEST_FAKE_CODEX_PLUGIN_LIST_MALFORMED_ENTRY === '1') {
+    output({ installed: [null] });
+    process.exit(0);
+  }
+  output({ installed: state.installed.map(entry => Object.assign({}, entry, { source: { path: reportedPath(entry.source.path) } })) });
+  process.exit(0);
+}
+
+if (command.length === 2 && command[0] === 'add') {
+  const selector = command[1];
+  const at = selector.lastIndexOf('@');
+  if (at <= 0) fail('invalid plugin selector ' + selector);
+  const pluginName = selector.slice(0, at);
+  const marketplaceName = selector.slice(at + 1);
+  const marketplace = state.marketplaces.find(entry => entry.name === marketplaceName);
+  if (!marketplace) fail('marketplace not registered: ' + marketplaceName);
+  const pluginPath = path.join(marketplace.root, 'plugins', pluginName);
+  let manifest;
+  try {
+    manifest = JSON.parse(fs.readFileSync(path.join(pluginPath, '.codex-plugin', 'plugin.json'), 'utf8'));
+  } catch {
+    fail('cannot read plugin manifest at ' + pluginPath);
+  }
+  if (!manifest || typeof manifest.version !== 'string') fail('plugin manifest needs a version');
+  state.installed = state.installed.filter(entry => entry.pluginId !== selector);
+  state.installed.push({ pluginId: selector, enabled: true, version: manifest.version, source: { path: pluginPath } });
+  saveState(state);
+  output({ version: manifest.version });
+  process.exit(0);
+}
+
+if (command.length === 2 && command[0] === 'remove') {
+  state.installed = state.installed.filter(entry => entry.pluginId !== command[1]);
+  saveState(state);
+  output({ removed: true });
+  process.exit(0);
+}
+
+fail('unsupported fake Codex command: ' + command.join(' '));
+`);
+    if (process.platform === 'win32') {
+        const shim = path.join(dir, 'codex.cmd');
+        write(shim, '@echo off\r\n"' + process.execPath + '" "%~dp0codex.js" %*\r\n');
+        return shim;
+    }
+    fs.chmodSync(script, 0o755);
+    return script;
+}
+const fakeCodexCli = createFakeCodexCli();
+// A copied Node executable is a real native launcher on Windows (.exe) and a
+// direct executable everywhere else. Its temporary `plugin` entrypoint hands
+// the received argv to the same stateful fake CLI used by lifecycle tests.
+function createFakeCodexNativeCli() {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'baseline test native & codex-'));
+    const cli = path.join(dir, process.platform === 'win32' ? 'codex.exe' : 'codex');
+    fs.copyFileSync(process.execPath, cli);
+    if (process.platform !== 'win32')
+        fs.chmodSync(cli, 0o755);
+    const cwd = fs.mkdtempSync(path.join(os.tmpdir(), 'baseline-test-native-codex-cwd-'));
+    const fakeScript = path.join(path.dirname(fakeCodexCli), 'codex.js');
+    write(path.join(cwd, 'plugin'), String.raw `const fakeScript = process.env.BASELINE_TEST_FAKE_CODEX_NATIVE_SCRIPT;
+if (!fakeScript) throw new Error('missing native fake Codex script');
+process.argv.splice(1, 1, fakeScript, 'plugin');
+require(fakeScript);
+`);
+    return {
+        cli,
+        cwd,
+        env: {
+            BASELINE_CODEX_CLI: 'codex',
+            BASELINE_TEST_FAKE_CODEX_NATIVE_SCRIPT: fakeScript,
+            PATH: dir + path.delimiter + (process.env.PATH || ''),
+        },
+    };
+}
 function installedManager(home) {
     return path.join(home, 'scripts', 'manage.js');
 }
@@ -128,6 +345,26 @@ function runAgentHook(agentConfig, home, input) {
         encoding: 'utf8'
     });
 }
+function runConfiguredHook(hook, input) {
+    const options = { input: JSON.stringify(input), encoding: 'utf8' };
+    if (Array.isArray(hook.args))
+        return (0, child_process_1.spawnSync)(hook.command, hook.args, options);
+    return process.platform === 'win32'
+        ? (0, child_process_1.spawnSync)('powershell', ['-NoProfile', '-NonInteractive', '-Command', hook.command], options)
+        : (0, child_process_1.spawnSync)('sh', ['-c', hook.command], options);
+}
+function assertPlatformHookCommand(command, label) {
+    if (process.platform === 'win32') {
+        assert.ok(command.startsWith("& '"), label + ' must invoke its quoted executable with PowerShell &: ' + command);
+    }
+    else {
+        assert.ok(command.startsWith("'"), label + ' must start with a POSIX-quoted executable: ' + command);
+        assert.ok(!command.startsWith('& '), label + ' must not use the PowerShell call operator: ' + command);
+    }
+}
+function hookCommandText(hook) {
+    return [hook.command].concat(Array.isArray(hook.args) ? hook.args : []).join(' ');
+}
 function statusAgentSection(output, agentName) {
     const text = output.replace(/\r\n/g, '\n');
     const marker = '  agent ' + agentName + ' @ ';
@@ -136,11 +373,44 @@ function statusAgentSection(output, agentName) {
     const next = text.indexOf('\n  agent ', start + marker.length);
     return text.slice(start, next === -1 ? undefined : next);
 }
-function centralCodexPlugin(home) {
-    return path.join(home, 'codex-plugin', 'baseline');
+const CODEX_MARKETPLACE = 'baseline-local';
+const CODEX_PLUGIN_KEY = 'baseline@baseline-local';
+function centralCodexMarketplace(home) {
+    return path.join(home, 'codex-marketplace');
 }
-function codexPluginCache(codex) {
-    return path.join(codex, 'plugins', 'cache', 'baseline', 'baseline', 'local');
+function codexCommand(...args) {
+    return ['plugin'].concat(args, ['--json']);
+}
+function assertCodexPluginInstalled(codex, home, label) {
+    const state = readFakeCodexState(codex);
+    assert.deepStrictEqual(state.marketplaces, [{
+            name: CODEX_MARKETPLACE,
+            root: centralCodexMarketplace(home),
+        }], label + ' marketplace registration');
+    const plugin = state.installed.find(entry => entry.pluginId === CODEX_PLUGIN_KEY);
+    if (!plugin)
+        assert.fail(label + ' plugin was not installed');
+    assert.strictEqual(plugin.enabled, true, label + ' plugin should be enabled');
+    assert.strictEqual(plugin.source.path, centralCodexPlugin(home), label + ' plugin should resolve to the central payload');
+    assert.strictEqual(plugin.version, expectedCodexPluginVersion(home, label), label + ' plugin should use the current deterministic Codex payload version');
+}
+function centralCodexPlugin(home) {
+    return path.join(home, 'codex-marketplace', 'plugins', 'baseline');
+}
+function expectedCodexPluginVersion(home, label) {
+    const sourceText = readThrough(path.join(root, '.codex-plugin', 'plugin.json'));
+    const sourceManifest = JSON.parse(sourceText);
+    if (!isRecord(sourceManifest) || typeof sourceManifest.version !== 'string' || !sourceManifest.version) {
+        throw new Error(label + ' source Codex manifest needs a version');
+    }
+    const generatedSkill = readThrough(path.join(centralCodexPlugin(home), 'skills', 'baseline', 'SKILL.md'));
+    const provenance = '\n    ' + root + '\n\nIf you need to refresh from a different checkout, run that checkout\'s';
+    const canonicalProvenance = '\n    <source-checkout>\n\nIf you need to refresh from a different checkout, run that checkout\'s';
+    if (!generatedSkill.includes(provenance))
+        throw new Error(label + ' generated Codex skill needs source-checkout provenance');
+    const cachebusterSkill = generatedSkill.replace(provenance, canonicalProvenance);
+    const digest = crypto.createHash('sha256').update(sourceText).update('\0').update(cachebusterSkill).digest('hex').slice(0, 12);
+    return sourceManifest.version.split('+')[0] + '+codex.local-' + digest;
 }
 function assertCodexPayload(pluginDir, label) {
     const manifest = path.join(pluginDir, '.codex-plugin', 'plugin.json');
@@ -154,22 +424,6 @@ function assertControlSurfaceCommandsUseInstalledManager(skillBody, home, label)
         assert.ok(skillBody.includes('node "' + manager + '" ' + cmd), label + ' should invoke installed manager for `' + cmd + '`');
     }
     assert.ok(!skillBody.includes('node "' + path.join(root, 'scripts', 'manage.js') + '" status'), label + ' must not use source-checkout manager commands for normal status');
-}
-function assertEmptyCodexActivationTable(tomlPath) {
-    const lines = readThrough(tomlPath).replace(/\r\n/g, '\n').split('\n');
-    const start = lines.findIndex(line => line.trim() === CODEX_ACTIVATION_TABLE);
-    assert.notStrictEqual(start, -1, 'Codex activation table missing from config.toml');
-    for (let i = start + 1; i < lines.length; i++) {
-        const trimmed = lines[i].trim();
-        if (!trimmed)
-            continue;
-        assert.ok(trimmed.startsWith('['), 'Codex activation table should be empty, found: ' + lines[i]);
-        return;
-    }
-}
-function assertNoClaudePayloadInCodex(codex) {
-    assert.ok(!fs.existsSync(path.join(codexPluginCache(codex), '.claude-plugin', 'plugin.json')), 'Codex cache must not contain a Claude .claude-plugin manifest');
-    assert.ok(!fs.existsSync(path.join(codex, 'skills', 'baseline', '.claude-plugin', 'plugin.json')), 'Codex must not receive the Claude skills-dir payload');
 }
 // --- install / link / settings ---------------------------------------------
 function testDefaultInstallAndVerify() {
@@ -197,7 +451,7 @@ function testDefaultInstallAndVerify() {
     assert.strictEqual(installedStatus.status, 0, installedStatus.stderr || installedStatus.stdout);
     assert.match(installedStatus.stdout, /manager\s+: present at /, 'installed manager should run independently from the install root');
     const settings = JSON.parse(fs.readFileSync(path.join(cfg, 'settings.json'), 'utf8'));
-    const command = settings.hooks.UserPromptSubmit[0].hooks[0].command;
+    const command = hookCommandText(settings.hooks.UserPromptSubmit[0].hooks[0]);
     // On POSIX nativeBinName ("baseline-recital") is a substring of the Node .js path, so the
     // native branch pairs the positive include with a negative /baseline-recital\.js/ check.
     if (havePrebuilt) {
@@ -214,6 +468,71 @@ function testDefaultInstallAndVerify() {
     const verify = run(['verify'], cfg);
     assert.strictEqual(verify.status, 0, verify.stderr || verify.stdout);
     assert.match(verify.stdout, /verify: PASS/);
+}
+// A source checkout deploys a payload containing its truthful provenance. The
+// installed manager recovers that provenance while its cachebuster normalizes
+// only the provenance field, so fresh payloads remain healthy after handoff.
+function testInstalledManagerKeepsFreshCodexPayloadHealthy() {
+    const cfg = tempConfig();
+    const home = homeFor(cfg);
+    const install = run(['install'], cfg);
+    assert.strictEqual(install.status, 0, install.stderr || install.stdout);
+    const status = runInstalled(['status'], cfg, home);
+    assert.strictEqual(status.status, 0, status.stderr || status.stdout);
+    assert.ok(!status.stdout.includes('STALE'), 'installed manager status must not report a fresh Codex payload stale:\n' + status.stdout);
+    const jsonStatusResult = runInstalled(['status', '--json'], cfg, home);
+    assert.strictEqual(jsonStatusResult.status, 0, jsonStatusResult.stderr || jsonStatusResult.stdout);
+    const jsonStatus = JSON.parse(jsonStatusResult.stdout);
+    if (!isRecord(jsonStatus) || !isRecord(jsonStatus.data) || !isRecord(jsonStatus.data.codexPlugin)) {
+        throw new Error('installed manager status --json needs Codex payload state');
+    }
+    assert.strictEqual(jsonStatus.data.codexPlugin.stale, false, 'installed manager JSON status must mark a fresh Codex payload healthy');
+    assert.strictEqual(jsonStatus.data.codexPlugin.version, expectedCodexPluginVersion(home, 'installed manager status'), 'installed manager JSON status must report the exact deployed Codex version');
+    const doctor = runInstalled(['doctor'], cfg, home);
+    assert.strictEqual(doctor.status, 0, doctor.stderr || doctor.stdout);
+    assert.match(doctor.stdout, /codex plugin payload: central payload deployed; points at installed manager/);
+    assert.match(doctor.stdout, /codex plugin install: codex baseline@baseline-local installed @/);
+    assert.match(doctor.stdout, /doctor: healthy/);
+    const codexSkillPath = path.join(centralCodexPlugin(home), 'skills', 'baseline', 'SKILL.md');
+    const sourceProvenance = '\n    ' + root + '\n\nIf you need to refresh from a different checkout, run that checkout\'s';
+    assert.ok(readThrough(codexSkillPath).includes(sourceProvenance), 'source install should record truthful Codex source-checkout provenance');
+    const update = runInstalled(['update'], cfg, home);
+    assert.strictEqual(update.status, 0, update.stderr || update.stdout);
+    assert.ok(readThrough(codexSkillPath).includes(sourceProvenance), 'installed update should preserve truthful Codex source-checkout provenance');
+    const postUpdateDoctor = runInstalled(['doctor'], cfg, home);
+    assert.strictEqual(postUpdateDoctor.status, 0, postUpdateDoctor.stderr || postUpdateDoctor.stdout);
+    assert.match(postUpdateDoctor.stdout, /doctor: healthy/);
+}
+// Source-checkout provenance is intentionally displayed for refresh guidance, but
+// changing only that field must not invalidate the deterministic Codex version.
+function testCodexCachebusterIgnoresSourceCheckoutProvenance() {
+    const cfg = tempConfig();
+    const home = homeFor(cfg);
+    assert.strictEqual(run(['install'], cfg).status, 0);
+    const manifestPath = path.join(centralCodexPlugin(home), '.codex-plugin', 'plugin.json');
+    const manifest = JSON.parse(readThrough(manifestPath));
+    if (!isRecord(manifest) || typeof manifest.version !== 'string') {
+        throw new Error('installed central Codex manifest needs a version');
+    }
+    const installedVersion = manifest.version;
+    const skillPath = path.join(centralCodexPlugin(home), 'skills', 'baseline', 'SKILL.md');
+    const sourceProvenance = '\n    ' + root + '\n\nIf you need to refresh from a different checkout, run that checkout\'s';
+    const movedProvenance = '\n    ' + path.join(cfg, 'moved-source-checkout') + '\n\nIf you need to refresh from a different checkout, run that checkout\'s';
+    const skill = readThrough(skillPath);
+    if (!skill.includes(sourceProvenance))
+        throw new Error('source-installed Codex skill needs source-checkout provenance');
+    write(skillPath, skill.replace(sourceProvenance, movedProvenance));
+    const status = runInstalled(['status', '--json'], cfg, home);
+    assert.strictEqual(status.status, 0, status.stderr || status.stdout);
+    const jsonStatus = JSON.parse(status.stdout);
+    if (!isRecord(jsonStatus) || !isRecord(jsonStatus.data) || !isRecord(jsonStatus.data.codexPlugin)) {
+        throw new Error('installed manager status --json needs Codex payload state');
+    }
+    assert.strictEqual(jsonStatus.data.codexPlugin.version, installedVersion, 'provenance-only change must leave the deployed Codex version untouched');
+    assert.strictEqual(jsonStatus.data.codexPlugin.stale, false, 'installed manager status must not treat provenance-only change as digest drift');
+    const doctor = runInstalled(['doctor'], cfg, home);
+    assert.strictEqual(doctor.status, 0, doctor.stderr || doctor.stdout);
+    assert.match(doctor.stdout, /doctor: healthy/);
 }
 function testInstalledManagerInfersInstallRootWithoutBaselineHome() {
     const cfg = tempConfig();
@@ -339,7 +658,7 @@ function testDefaultPresetWiresBaseEventsBothAgents() {
             assert.strictEqual(s.hooks[ev].length, 1, label + ' ' + ev + ' should have exactly one group');
             assert.strictEqual(s.hooks[ev][0].hooks.length, 1, label + ' ' + ev + ' should have exactly one hook entry');
             assert.strictEqual(s.hooks[ev][0].matcher, undefined, label + ' ' + ev + ' group must carry no matcher');
-            assert.ok(s.hooks[ev][0].hooks[0].command.includes('baseline-recital'), label + ' ' + ev + ' hook should be the baseline dispatcher (native binary or Node .js)');
+            assert.ok(hookCommandText(s.hooks[ev][0].hooks[0]).includes('baseline-recital'), label + ' ' + ev + ' hook should be the baseline dispatcher (native binary or Node .js)');
         }
     }
     // The seeded default config validates and passes doctor.
@@ -385,6 +704,254 @@ function testCodexInstallAndAgentLinks() {
     assert.strictEqual(readThrough(agentContracts), readThrough(centralHookContracts(home)), 'codex contracts do not resolve to central content');
     const agentConfig = path.join(codex, 'cfg', 'baseline', 'config.json');
     assert.strictEqual(readThrough(agentConfig), readThrough(path.join(homeFor(cfg), 'cfg', 'config.json')), 'codex config.json does not resolve to central content');
+    assertCodexPluginInstalled(codex, home, 'install');
+    assert.deepStrictEqual(readFakeCodexState(codex).commands, [
+        codexCommand('marketplace', 'list'),
+        codexCommand('marketplace', 'add', centralCodexMarketplace(home)),
+        codexCommand('add', CODEX_PLUGIN_KEY),
+    ], 'install should register the central marketplace and install its selector through Codex CLI');
+}
+// Codex must receive each CLI token intact when every lifecycle path contains
+// spaces and CMD metacharacters, including the npm-style .cmd shim used by Windows.
+function testCodexLifecyclePreservesSpacedPaths() {
+    const cfg = tempConfig('baseline test spaced & lifecycle-');
+    const home = homeFor(cfg);
+    const codex = codexFor(cfg);
+    const cli = createFakeCodexCli('baseline test fake & codex cli-');
+    const env = { BASELINE_CODEX_CLI: cli };
+    const marketplaceRoot = centralCodexMarketplace(home);
+    assert.ok(/\s/.test(home), 'precondition: BASELINE_HOME must contain spaces');
+    assert.ok(/\s/.test(codex), 'precondition: CODEX_HOME must contain spaces');
+    assert.ok(/\s/.test(cli), 'precondition: BASELINE_CODEX_CLI must contain spaces');
+    assert.ok(/\s/.test(marketplaceRoot), 'precondition: marketplace root must contain spaces');
+    assert.ok(home.includes('&') && cli.includes('&') && marketplaceRoot.includes('&'), 'precondition: command values must contain a CMD metacharacter');
+    const install = run(['install'], cfg, undefined, env);
+    assert.strictEqual(install.status, 0, install.stderr || install.stdout);
+    assert.deepStrictEqual(readFakeCodexState(codex).commands, [
+        codexCommand('marketplace', 'list'),
+        codexCommand('marketplace', 'add', marketplaceRoot),
+        codexCommand('add', CODEX_PLUGIN_KEY),
+    ], 'install must pass the spaced marketplace root as one Codex CLI argument');
+    assertCodexPayload(centralCodexPlugin(home), 'spaced-path central Codex plugin');
+    assertCodexPluginInstalled(codex, home, 'spaced-path install');
+    const hooks = JSON.parse(readThrough(path.join(codex, 'hooks.json')));
+    assert.ok(hooks.hooks.UserPromptSubmit && hooks.hooks.UserPromptSubmit.length, 'spaced-path install must establish the Codex hook control surface');
+    resetFakeCodexCommands(codex);
+    const update = run(['update'], cfg, undefined, env);
+    assert.strictEqual(update.status, 0, update.stderr || update.stdout);
+    assert.deepStrictEqual(readFakeCodexState(codex).commands, [
+        codexCommand('marketplace', 'list'),
+        codexCommand('list'),
+        codexCommand('add', CODEX_PLUGIN_KEY),
+    ], 'update must preserve spaced Codex CLI arguments and refresh the plugin');
+    assertCodexPluginInstalled(codex, home, 'spaced-path update');
+}
+// Resolution must use the actual target: a bare PATH alias that resolves to a
+// native executable takes the direct argv branch, including paths with CMD
+// metacharacters. The stateful child verifies the argv it actually received.
+function testCodexResolvesBareNativeExecutableAlias() {
+    const cfg = tempConfig('baseline test native & lifecycle-');
+    const home = homeFor(cfg);
+    const codex = codexFor(cfg);
+    const native = createFakeCodexNativeCli();
+    const install = run(['install'], cfg, undefined, native.env, native.cwd);
+    assert.strictEqual(install.status, 0, install.stderr || install.stdout);
+    assert.deepStrictEqual(readFakeCodexState(codex).commands, [
+        codexCommand('marketplace', 'list'),
+        codexCommand('marketplace', 'add', centralCodexMarketplace(home)),
+        codexCommand('add', CODEX_PLUGIN_KEY),
+    ], 'resolved native Codex executable must receive every lifecycle argv token intact');
+    assertCodexPluginInstalled(codex, home, 'resolved native executable install');
+}
+// Windows resolves bare commands from the parent working directory before
+// PATH. The native target lives only in that CWD; PATHEXT proves the resolver
+// finds its .exe target without a shell fallback.
+function testWindowsCodexResolvesBareCwdExecutableBeforePath() {
+    if (process.platform !== 'win32')
+        return;
+    const cfg = tempConfig('baseline test cwd & native-');
+    const home = homeFor(cfg);
+    const codex = codexFor(cfg);
+    const native = createFakeCodexNativeCli();
+    fs.copyFileSync(native.cli, path.join(native.cwd, 'codex.exe'));
+    const emptyPath = fs.mkdtempSync(path.join(os.tmpdir(), 'baseline-test-empty-codex-path-'));
+    const install = run(['install'], cfg, undefined, Object.assign({}, native.env, {
+        PATH: emptyPath,
+        PATHEXT: '.EXE;.CMD;.BAT;.COM',
+    }), native.cwd);
+    assert.strictEqual(install.status, 0, install.stderr || install.stdout);
+    assert.deepStrictEqual(readFakeCodexState(codex).commands, [
+        codexCommand('marketplace', 'list'),
+        codexCommand('marketplace', 'add', centralCodexMarketplace(home)),
+        codexCommand('add', CODEX_PLUGIN_KEY),
+    ], 'bare CWD Codex executable must receive every lifecycle argv token intact');
+}
+// npm publishes Codex through a .cmd shim on Windows. This must work from the
+// normal bare `codex` name, rather than only through an explicit shim path.
+function testCodexResolvesBareBatchShimAlias() {
+    if (process.platform !== 'win32')
+        return;
+    const cfg = tempConfig('baseline test bare & batch-');
+    const home = homeFor(cfg);
+    const codex = codexFor(cfg);
+    const shim = createFakeCodexCli('baseline test bare & batch cli-');
+    write(path.join(path.dirname(shim), 'codex'), 'non-native npm shim decoy\n');
+    const install = run(['install'], cfg, undefined, {
+        BASELINE_CODEX_CLI: 'codex',
+        PATH: path.dirname(shim) + path.delimiter + (process.env.PATH || ''),
+        PATHEXT: '.COM;.EXE;.BAT;.CMD',
+    });
+    assert.strictEqual(install.status, 0, install.stderr || install.stdout);
+    assert.deepStrictEqual(readFakeCodexState(codex).commands, [
+        codexCommand('marketplace', 'list'),
+        codexCommand('marketplace', 'add', centralCodexMarketplace(home)),
+        codexCommand('add', CODEX_PLUGIN_KEY),
+    ], 'resolved .cmd Codex alias must receive every CMD-metacharacter argv token intact');
+}
+// Missing bare `codex` is detected by resolution before spawn, so no localized
+// cmd.exe diagnostic can determine whether lifecycle work is nonfatal.
+function testMissingBareCodexCliLeavesControlSurfaceUninstalled() {
+    const cfg = tempConfig();
+    const home = homeFor(cfg);
+    const codex = codexFor(cfg);
+    const emptyPath = fs.mkdtempSync(path.join(os.tmpdir(), 'baseline-test-empty-codex-path-'));
+    const emptyCwd = fs.mkdtempSync(path.join(os.tmpdir(), 'baseline-test-empty-codex-cwd-'));
+    const install = run(['install'], cfg, undefined, {
+        BASELINE_CODEX_CLI: '',
+        PATH: emptyPath,
+    }, emptyCwd);
+    assert.strictEqual(install.status, 0, install.stderr || install.stdout);
+    assert.match(install.stdout, /codex NOTICE: `codex` CLI unavailable/);
+    assert.ok(fs.existsSync(centralCodexPlugin(home)), 'missing bare Codex must still deploy the central payload');
+    assert.ok(!fs.existsSync(fakeCodexStatePath(codex)), 'missing bare Codex must not spawn a fake lifecycle command');
+}
+// Codex reports canonical source paths after resolving a manager root through a
+// symlink/junction. The manager must still own that registration, not reject it
+// as a foreign marketplace/plugin.
+function testCodexOwnershipAcceptsCanonicalSymlinkedHome() {
+    const cfg = tempConfig();
+    const linkedHome = homeFor(cfg);
+    const realHome = linkedHome + '-real';
+    fs.mkdirSync(realHome, { recursive: true });
+    try {
+        fs.symlinkSync(realHome, linkedHome, process.platform === 'win32' ? 'junction' : 'dir');
+    }
+    catch {
+        return; // Windows policy can prohibit both symlink and junction creation.
+    }
+    const env = { BASELINE_TEST_FAKE_CODEX_CANONICAL_PATHS: '1' };
+    const install = run(['install'], cfg, linkedHome, env);
+    assert.strictEqual(install.status, 0, install.stderr || install.stdout);
+    const update = run(['update'], cfg, linkedHome, env);
+    assert.strictEqual(update.status, 0, update.stderr || update.stdout);
+    const doctor = run(['doctor'], cfg, linkedHome, env);
+    assert.strictEqual(doctor.status, 0, doctor.stderr || doctor.stdout);
+    assert.match(doctor.stdout, /doctor: healthy/);
+    assertCodexPluginInstalled(codexFor(cfg), linkedHome, 'canonical symlinked-home lifecycle');
+}
+function testShellSafeHookCommandsBothAgents() {
+    const cfg = tempConfig("'baseline-test-O'Brien-");
+    const home = homeFor(cfg);
+    const codex = codexFor(cfg);
+    setCentralConfig(home, [
+        { id: 'shell-safe', event: 'UserPromptSubmit', freq: 1, doc: 'docs/shell-safe.md' }
+    ], { 'docs/shell-safe.md': 'SHELL SAFE OK\n' });
+    const install = run(['install', '--runtime', 'node'], cfg);
+    assert.strictEqual(install.status, 0, install.stderr || install.stdout);
+    const agents = [
+        ['claude-code', path.join(cfg, 'settings.json'), cfg],
+        ['codex', path.join(codex, 'hooks.json'), codex]
+    ];
+    for (const [label, file, agentConfig] of agents) {
+        const settings = JSON.parse(fs.readFileSync(file, 'utf8'));
+        const hook = settings.hooks.UserPromptSubmit[0].hooks[0];
+        if (label === 'claude-code') {
+            assert.strictEqual(hook.command, process.execPath, 'Claude must use its shell-free executable field');
+            assert.deepStrictEqual(hook.args, [agentHookDispatcher(agentConfig), '--agent-config', agentConfig], 'Claude must keep arguments as literal argv entries');
+        }
+        else {
+            assertPlatformHookCommand(hook.command, label);
+            assert.ok(hook.command.includes(process.platform === 'win32' ? "O''Brien" : "O'\"'\"'Brien"), label + ' command must shell-escape an apostrophe literally: ' + hook.command);
+        }
+        const fired = runConfiguredHook(hook, {
+            session_id: 'shell-safe-' + label,
+            hook_event_name: 'UserPromptSubmit',
+            cwd: root
+        });
+        assert.strictEqual(fired.status, 0, label + ' configured command failed in its platform shell: ' + (fired.stderr || fired.stdout));
+        assert.match(fired.stdout, /SHELL SAFE OK/, label + ' configured command did not run the dispatcher');
+    }
+    const verify = run(['verify'], cfg);
+    assert.strictEqual(verify.status, 0, verify.stderr || verify.stdout);
+    assert.match(verify.stdout, /verify: PASS/);
+    assert.match(verify.stdout, /agent tested\s+: codex/);
+}
+function testVerifyRunsConfiguredCommandThroughShell() {
+    const cfg = tempConfig();
+    const install = run(['install', '--runtime', 'node'], cfg);
+    assert.strictEqual(install.status, 0, install.stderr || install.stdout);
+    const settingsFile = path.join(codexFor(cfg), 'hooks.json');
+    const settings = JSON.parse(fs.readFileSync(settingsFile, 'utf8'));
+    settings.hooks.UserPromptSubmit[0].hooks[0].command += '; exit 7';
+    write(settingsFile, JSON.stringify(settings, null, 2) + '\n');
+    const verify = run(['verify'], cfg);
+    assert.notStrictEqual(verify.status, 0, 'verify must honor shell syntax in the configured command');
+    assert.match(verify.stdout, /configured shell exited 7/);
+}
+function testUpdateReplacesLegacyWindowsHookCommand() {
+    if (process.platform !== 'win32') {
+        console.log('  (skip) testUpdateReplacesLegacyWindowsHookCommand: PowerShell-only migration.');
+        return;
+    }
+    const cfg = tempConfig();
+    const codex = codexFor(cfg);
+    const install = run(['install', '--runtime', 'node'], cfg);
+    assert.strictEqual(install.status, 0, install.stderr || install.stdout);
+    const files = [
+        ['claude-code', path.join(cfg, 'settings.json')],
+        ['codex', path.join(codex, 'hooks.json')]
+    ];
+    for (const [label, file] of files) {
+        const settings = JSON.parse(fs.readFileSync(file, 'utf8'));
+        const hook = settings.hooks.UserPromptSubmit[0].hooks[0];
+        if (label === 'claude-code') {
+            const argv = [hook.command].concat(hook.args);
+            hook.command = argv.map((arg) => '"' + arg.replace(/"/g, '\\"') + '"').join(' ');
+            delete hook.args;
+        }
+        else {
+            assert.ok(hook.command.startsWith('& '), 'precondition: Codex command must use PowerShell &');
+            hook.command = hook.command.slice(2);
+        }
+        write(file, JSON.stringify(settings, null, 2) + '\n');
+    }
+    const doctor = run(['doctor'], cfg);
+    assert.notStrictEqual(doctor.status, 0, 'doctor must flag recognized legacy hook invocations');
+    assert.match(doctor.stdout, /\[FAIL\] hook invocation: claude-code uses a legacy\/noncanonical invocation/);
+    assert.match(doctor.stdout, /\[FAIL\] hook invocation: codex uses a legacy\/noncanonical invocation/);
+    const status = run(['status'], cfg);
+    assert.match(statusAgentSection(status.stdout, 'claude-code'), /invocation\s+: UNHEALTHY/);
+    assert.match(statusAgentSection(status.stdout, 'codex'), /invocation\s+: UNHEALTHY/);
+    const jsonStatus = run(['status', '--json'], cfg);
+    assert.strictEqual(jsonStatus.status, 0, jsonStatus.stderr || jsonStatus.stdout);
+    const jsonAgents = JSON.parse(jsonStatus.stdout).data.agents;
+    assert.ok(jsonAgents.every((agent) => agent.invocation.canonical === false), 'JSON status must expose noncanonical invocation drift for both agents');
+    const update = run(['update', '--runtime', 'node'], cfg);
+    assert.strictEqual(update.status, 0, update.stderr || update.stdout);
+    for (const [label, file] of files) {
+        const settings = JSON.parse(fs.readFileSync(file, 'utf8'));
+        const groups = settings.hooks.UserPromptSubmit;
+        assert.strictEqual(groups.length, 1, file + ' must not retain a duplicate legacy hook group');
+        assert.strictEqual(groups[0].hooks.length, 1, file + ' must contain exactly one baseline hook');
+        const hook = groups[0].hooks[0];
+        if (label === 'claude-code') {
+            assert.strictEqual(hook.command, process.execPath);
+            assert.ok(Array.isArray(hook.args), 'Claude update must restore shell-free args');
+        }
+        else {
+            assertPlatformHookCommand(hook.command, file);
+        }
+    }
 }
 function testInstalledHooksResolveBundledContracts() {
     const cfg = tempConfig();
@@ -468,7 +1035,7 @@ function agentHookBin(agentConfig) {
 }
 function wiredCommandFor(cfg, event) {
     const settings = JSON.parse(fs.readFileSync(path.join(cfg, 'settings.json'), 'utf8'));
-    return settings.hooks[event][0].hooks[0].command;
+    return hookCommandText(settings.hooks[event][0].hooks[0]);
 }
 // install --runtime prebuilt lifts the former pause: it deploys the native binary to the
 // center, links it into the agent, and wires the binary DIRECTLY (no node) as the hot path.
@@ -489,7 +1056,9 @@ function testNativeRuntimeInstallsAndWires() {
     const cmd = wiredCommandFor(cfg, 'UserPromptSubmit');
     assert.ok(cmd.includes(nativeBinName), 'wired command should run the native binary: ' + cmd);
     assert.ok(!/baseline-recital\.js/.test(cmd), 'wired command must not run the Node .js when native: ' + cmd);
-    // verify parses the wired command and spawns it (the native binary) for real.
+    const codexSettings = JSON.parse(fs.readFileSync(path.join(codexFor(cfg), 'hooks.json'), 'utf8'));
+    assertPlatformHookCommand(codexSettings.hooks.UserPromptSubmit[0].hooks[0].command, 'Codex native hook');
+    // verify parses the wired command and runs it through the platform shell for real.
     const verify = run(['verify'], cfg);
     assert.strictEqual(verify.status, 0, 'verify should pass against the wired native binary: ' + (verify.stderr || verify.stdout));
 }
@@ -524,8 +1093,8 @@ function testNativeFallbackToNodeWhenBinaryAbsent() {
     assert.ok(!fs.existsSync(agentHookBin(cfg)), 'native binary must be unlinked from the agent after falling back to Node');
     const cmd = wiredCommandFor(cfg, 'UserPromptSubmit');
     assert.ok(/baseline-recital\.js/.test(cmd), 'fallback -> the Node .js must be wired: ' + cmd);
-    // verify parses the WIRED command and spawns it, so this exercises the actually-wired Node
-    // command end-to-end (not just the source dispatcher driven directly by hook()).
+    // verify runs the WIRED command through the platform shell, so this exercises the
+    // actually-wired Node command end-to-end (not just the source dispatcher driven directly).
     const verify = run(['verify'], cfg);
     assert.strictEqual(verify.status, 0, 'the wired Node command should fire after fallback: ' + (verify.stderr || verify.stdout));
     assert.match(verify.stdout, /verify: PASS/);
@@ -585,8 +1154,8 @@ function testUpdateRuntimeNodeForcesNode() {
     assert.strictEqual(verify.status, 0, 'the wired Node command should fire after --runtime node: ' + (verify.stderr || verify.stdout));
 }
 // End-to-end byte-parity: identical stdin fixtures to the native binary and the Node
-// dispatcher must produce byte-identical stdout across multi-route templating, freq
-// rollover, and a no-match event. Skips cleanly where no prebuilt exists for the platform.
+// dispatcher must produce byte-identical stdout across static docs, freq rollover, and
+// a no-match event. Skips cleanly where no prebuilt exists for the platform.
 function testNativeDispatchParity() {
     const target = nativePrebuiltForPlatform();
     if (!target || !fs.existsSync(path.join(root, 'bin', target))) {
@@ -594,27 +1163,26 @@ function testNativeDispatchParity() {
         return;
     }
     const nativeBin = path.join(root, 'bin', target);
+    const firstDoc = 'FIRST literal={{event}}/{{cwd}}/{{env.FOO}}\n';
+    const secondDoc = 'SECOND\n';
+    const everyTwoDoc = 'EVERY-TWO\n';
     function fixture() {
         const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'baseline-parity-'));
         const cb = path.join(dir, 'cfg', 'baseline');
         fs.mkdirSync(path.join(cb, 'docs'), { recursive: true });
         fs.writeFileSync(path.join(cb, 'config.json'), JSON.stringify({
             version: 1,
-            vars: { greeting: 'hello', who: 'config' },
             routes: [
-                { id: 'first', event: 'UserPromptSubmit', freq: 1, doc: 'docs/first.md', vars: { who: 'route' } },
+                { id: 'first', event: 'UserPromptSubmit', freq: 1, doc: 'docs/first.md' },
                 { id: 'second', event: 'UserPromptSubmit', freq: 1, doc: 'docs/second.md' },
                 { id: 'every2', event: 'UserPromptSubmit', freq: 2, doc: 'docs/every2.md' }
             ]
         }, null, 2));
-        fs.writeFileSync(path.join(cb, 'docs', 'first.md'), 'FIRST e={{event}} g={{greeting}} w={{who}} u={{unknown}} d={{date}}\n');
-        fs.writeFileSync(path.join(cb, 'docs', 'second.md'), 'SECOND\n');
-        fs.writeFileSync(path.join(cb, 'docs', 'every2.md'), 'EVERY-TWO\n');
+        fs.writeFileSync(path.join(cb, 'docs', 'first.md'), firstDoc);
+        fs.writeFileSync(path.join(cb, 'docs', 'second.md'), secondDoc);
+        fs.writeFileSync(path.join(cb, 'docs', 'every2.md'), everyTwoDoc);
         return dir;
     }
-    // No TZ crutch: {{date}} resolves in UTC on BOTH runtimes, so parity must hold at this
-    // machine's real local offset. first.md carries {{date}} to exercise that (a Node resolver
-    // that reverted to local time would diverge from the native UTC date for much of the day).
     const env = process.env;
     const nDir = fixture();
     const jDir = fixture();
@@ -636,8 +1204,9 @@ function testNativeDispatchParity() {
                 '\n  native: ' + JSON.stringify(rn.stdout) + '\n  node:   ' + JSON.stringify(rj.stdout));
             nativeOut.push(rn.stdout || '');
         }
-        // Guard against a vacuous pass (two empties): assert the expected non-empty semantics.
-        assert.ok(/FIRST e=UserPromptSubmit g=hello w=route u=\{\{unknown\}\} d=\d{4}-\d{2}-\d{2}/.test(nativeOut[0]), 't1 must template built-ins/vars (incl. a UTC {{date}}) and leave unknown verbatim: ' + nativeOut[0]);
+        // Assert the dispatched context exactly, rather than merely checking a substring:
+        // {{event}} is static doc content, not an interpolation token.
+        assert.strictEqual(fireBodies({ stdout: nativeOut[0] }), firstDoc + '\n\n' + secondDoc, 't1 must inject static docs byte-for-byte without interpolating {{event}}: ' + nativeOut[0]);
         assert.ok(nativeOut[0].includes('SECOND') && !nativeOut[0].includes('EVERY-TWO'), 't1: freq-2 route not yet due');
         const iF = nativeOut[1].indexOf('FIRST'), iS = nativeOut[1].indexOf('SECOND'), iE = nativeOut[1].indexOf('EVERY-TWO');
         assert.ok(iF !== -1 && iS !== -1 && iE !== -1 && iF < iS && iS < iE, 't2: all three due, emitted in config order: ' + nativeOut[1]);
@@ -883,9 +1452,9 @@ function testCoResidentHookPreserved() {
     }, null, 2) + '\n');
     assert.strictEqual(run(['install'], cfg).status, 0);
     const settings = JSON.parse(fs.readFileSync(path.join(cfg, 'settings.json'), 'utf8'));
-    const cmds = settings.hooks.UserPromptSubmit.flatMap((g) => g.hooks.map((h) => h.command));
-    assert.ok(cmds.some((c) => c === 'echo theirs'), 'co-resident hook was dropped');
-    assert.ok(cmds.some((c) => c.includes('baseline-recital')), 'baseline hook not added');
+    const entries = settings.hooks.UserPromptSubmit.flatMap((g) => g.hooks);
+    assert.ok(entries.some((h) => h.command === 'echo theirs'), 'co-resident hook was dropped');
+    assert.ok(entries.some((h) => hookCommandText(h).includes('baseline-recital')), 'baseline hook not added');
     // Uninstall removes only ours.
     assert.strictEqual(run(['uninstall'], cfg).status, 0);
     const after = JSON.parse(fs.readFileSync(path.join(cfg, 'settings.json'), 'utf8'));
@@ -906,7 +1475,7 @@ function testBaselineHookDoesNotInheritMatcher() {
     const settings = JSON.parse(fs.readFileSync(path.join(cfg, 'settings.json'), 'utf8'));
     const groups = settings.hooks.PreToolUse;
     assert.ok(groups.some((g) => g.matcher === 'Read' && g.hooks.some((h) => h.command === 'echo theirs')), 'co-resident matched group was not preserved');
-    assert.ok(groups.some((g) => g.matcher === undefined && g.hooks.some((h) => h.command.includes('baseline-recital'))), 'baseline hook should be installed in its own matcher-free group');
+    assert.ok(groups.some((g) => g.matcher === undefined && g.hooks.some((h) => hookCommandText(h).includes('baseline-recital'))), 'baseline hook should be installed in its own matcher-free group');
     const verify = run(['verify'], cfg);
     assert.strictEqual(verify.status, 0, verify.stderr || verify.stdout);
 }
@@ -977,61 +1546,6 @@ function testEventNameSemantics() {
     // cwd scope: only under the path.
     assert.ok(fireBodies(hook({ session_id: 's4', hook_event_name: 'UserPromptSubmit', cwd: path.join(scoped, 'sub') }, cfg))?.includes('SCOPED'), 'scoped route should fire under its cwd');
     assert.ok(!fireBodies(hook({ session_id: 's5', hook_event_name: 'UserPromptSubmit', cwd: path.join(cfg, 'elsewhere') }, cfg))?.includes('SCOPED'), 'scoped route should not fire outside its cwd');
-}
-// --- {{name}} templating (R-010) -------------------------------------------
-// Fixed-clock context helper so date/time assertions are deterministic. Built from a UTC
-// timestamp because {{date}}/{{time}} resolve in UTC — the assertions below are then
-// independent of the machine's local timezone.
-function tmplCtx(over) {
-    return Object.assign({ event: 'UserPromptSubmit', cwd: '/work/proj', home: '/home/dev', now: new Date(Date.UTC(2026, 0, 9, 4, 7)), env: {}, vars: {} }, over);
-}
-function testTemplateResolvesBuiltinsAndVars() {
-    const ctx = tmplCtx({ env: { FOO: 'bar' }, vars: { greeting: 'hello', name: 'Ada' } });
-    const body = 'ev={{event}} cwd={{cwd}} home={{home}} date={{date}} time={{time}} env={{env.FOO}} g={{greeting}} n={{name}}';
-    assert.strictEqual((0, contracts_1.applyTemplate)(body, ctx), 'ev=UserPromptSubmit cwd=/work/proj home=/home/dev date=2026-01-09 time=04:07 env=bar g=hello n=Ada');
-    // Surrounding whitespace inside the braces is trimmed.
-    assert.strictEqual((0, contracts_1.applyTemplate)('{{ event }}', ctx), 'UserPromptSubmit');
-    // env.* miss resolves to empty string (it is a built-in family), not verbatim.
-    assert.strictEqual((0, contracts_1.applyTemplate)('x={{env.NOPE}}y', ctx), 'x=y');
-}
-function testTemplatePerRouteOverrideOrder() {
-    // route vars > config vars.
-    assert.deepStrictEqual((0, contracts_1.mergeVars)({ scope: 'global', keep: 'cfg' }, { scope: 'route' }), { scope: 'route', keep: 'cfg' }, 'route vars must override config vars');
-    // user vars > built-ins: a var named 'event' shadows the hook-event built-in, and a
-    // route-level 'event' wins over a config-level 'event'.
-    const merged = (0, contracts_1.mergeVars)({ event: 'CFG' }, { event: 'ROUTE' });
-    assert.strictEqual((0, contracts_1.applyTemplate)('{{event}}', tmplCtx({ vars: merged })), 'ROUTE', 'route var must win over config var and the built-in');
-    // with no override the built-in resolves.
-    assert.strictEqual((0, contracts_1.applyTemplate)('{{event}}', tmplCtx({ vars: {} })), 'UserPromptSubmit');
-}
-function testTemplateUnknownPlaceholderVerbatim() {
-    const ctx = tmplCtx({ vars: { known: 'K' } });
-    assert.strictEqual((0, contracts_1.applyTemplate)('a {{unknown}} b', ctx), 'a {{unknown}} b');
-    assert.strictEqual((0, contracts_1.applyTemplate)('{{known}}/{{missing}}', ctx), 'K/{{missing}}');
-    // Non-env dotted unknown stays verbatim; only the env.* family blanks on miss.
-    assert.strictEqual((0, contracts_1.applyTemplate)('{{foo.bar}}', ctx), '{{foo.bar}}');
-    // Stray/empty braces are not valid tokens and are left untouched (no escaping syntax).
-    assert.strictEqual((0, contracts_1.applyTemplate)('{{}} {{ }} {{no token here}}', ctx), '{{}} {{ }} {{no token here}}');
-}
-// e2e: drive the real deployed dispatcher with a placeholder doc, config-level vars, and
-// a per-route var override; assert built-ins resolve, route vars beat config vars, and an
-// unknown placeholder is injected verbatim.
-function testTemplateDispatchEndToEnd() {
-    const cfg = tempConfig();
-    const home = homeFor(cfg);
-    assert.strictEqual(run(['install'], cfg).status, 0);
-    write(path.join(home, 'cfg', 'config.json'), JSON.stringify({
-        version: 1,
-        vars: { greeting: 'hello', who: 'config' },
-        routes: [{ id: 'tmpl', event: 'UserPromptSubmit', freq: 1, doc: 'docs/tmpl.md', vars: { who: 'route' } }]
-    }, null, 2));
-    write(path.join(home, 'cfg', 'docs', 'tmpl.md'), 'E={{event}} G={{greeting}} W={{who}} U={{unknown}}\n');
-    const body = fireBodies(hook({ session_id: 'tmpl-sess', hook_event_name: 'UserPromptSubmit', cwd: cfg }, cfg));
-    assert.ok(body, 'templated route should fire');
-    assert.ok(body.includes('E=UserPromptSubmit'), 'built-in {{event}} should resolve: ' + body);
-    assert.ok(body.includes('G=hello'), 'config var {{greeting}} should resolve: ' + body);
-    assert.ok(body.includes('W=route'), 'route var must override config var: ' + body);
-    assert.ok(body.includes('U={{unknown}}'), 'unknown placeholder must stay verbatim: ' + body);
 }
 // R-011 (goal decision #18): due docs are read concurrently but assembled strictly in
 // config routes[] order. Four routes with very different doc sizes (so read-completion
@@ -1226,10 +1740,12 @@ function testVerifyRequiresSelectedRouteEvent() {
         { id: 'read', event: 'PreToolUse', freq: 1, doc: 'docs/read.md' }
     ], { 'docs/read.md': 'READ\n' });
     assert.strictEqual(run(['install'], cfg).status, 0);
-    let settings = JSON.parse(fs.readFileSync(path.join(cfg, 'settings.json'), 'utf8'));
-    const command = settings.hooks.PreToolUse[0].hooks[0].command;
-    settings = { hooks: { UserPromptSubmit: [{ hooks: [{ type: 'command', command, timeout: 5 }] }] } };
-    write(path.join(cfg, 'settings.json'), JSON.stringify(settings, null, 2) + '\n');
+    for (const file of [path.join(cfg, 'settings.json'), path.join(codexFor(cfg), 'hooks.json')]) {
+        const settings = JSON.parse(fs.readFileSync(file, 'utf8'));
+        const hook = settings.hooks.PreToolUse[0].hooks[0];
+        const moved = { hooks: { UserPromptSubmit: [{ hooks: [hook] }] } };
+        write(file, JSON.stringify(moved, null, 2) + '\n');
+    }
     const verify = run(['verify'], cfg);
     assert.notStrictEqual(verify.status, 0, 'verify should fail when selected route event is not wired');
     assert.match(verify.stdout, /no baseline hook wired for PreToolUse/);
@@ -1300,144 +1816,159 @@ function testUninstallPreservesDivergentPerAgentContracts() {
     assert.strictEqual(readThrough(agentHookContracts(codex)), unmanaged, 'uninstall should preserve divergent/unmanaged Codex contracts');
     assert.ok(fs.existsSync(centralHookContracts(home)), 'uninstall should keep central contracts');
 }
-function testUninstallRemovesOnlyManagedCodexPluginActivation() {
+function testUninstallRemovesOnlyManagedCodexMarketplacePlugin() {
     const cfg = tempConfig();
     const home = homeFor(cfg);
     const codex = codexFor(cfg);
-    const toml = path.join(codex, 'config.toml');
-    const otherCache = path.join(codex, 'plugins', 'cache', 'other-market', 'other-plugin', 'local', 'keep.txt');
-    const unrelatedToml = '[profiles.default]\n' +
-        'model = "gpt-5.1"\n' +
-        '\n' +
-        '[plugins."other@market"]\n' +
-        'enabled = true\n';
-    write(toml, unrelatedToml);
-    write(otherCache, 'KEEP\n');
-    assert.strictEqual(run(['install'], cfg).status, 0);
-    assertCodexPayload(codexPluginCache(codex), 'installed Codex cache plugin');
-    assertEmptyCodexActivationTable(toml);
+    const configToml = path.join(codex, 'config.toml');
+    const unrelatedConfig = '# operator config stays untouched\n[profiles.default]\nmodel = "gpt-5.1"\n';
+    const otherMarketplace = {
+        name: 'other-market',
+        root: path.join(codex, 'operator-marketplace'),
+    };
+    const otherPlugin = {
+        pluginId: 'other@other-market',
+        enabled: true,
+        version: '2.0.0',
+        source: { path: path.join(otherMarketplace.root, 'plugins', 'other') },
+    };
+    write(configToml, unrelatedConfig);
+    writeFakeCodexState(codex, {
+        marketplaces: [otherMarketplace],
+        installed: [otherPlugin],
+        commands: [],
+    });
+    const install = run(['install'], cfg);
+    assert.strictEqual(install.status, 0, install.stderr || install.stdout);
+    assert.strictEqual(readThrough(configToml), unrelatedConfig, 'install must not modify unrelated Codex config.toml');
+    const codexState = readFakeCodexState(codex);
+    const managedPlugin = codexState.installed.find(entry => entry.pluginId === CODEX_PLUGIN_KEY);
+    if (!managedPlugin)
+        throw new Error('install did not create the managed Codex plugin fixture');
+    const currentVersion = expectedCodexPluginVersion(home, 'uninstall stale fixture');
+    managedPlugin.version = currentVersion.slice(0, -12) + '000000000000';
+    assert.notStrictEqual(managedPlugin.version, currentVersion, 'stale fixture must differ from the expected version');
+    writeFakeCodexState(codex, codexState);
+    resetFakeCodexCommands(codex);
     const uninstall = run(['uninstall'], cfg);
     assert.strictEqual(uninstall.status, 0, uninstall.stderr || uninstall.stdout);
-    assert.ok(!fs.existsSync(codexPluginCache(codex)), 'uninstall should remove only the managed Codex cache/local activation');
-    assert.strictEqual(readThrough(otherCache), 'KEEP\n', 'uninstall should preserve unrelated Codex plugin caches');
-    const after = readThrough(toml);
-    assert.ok(!after.includes(CODEX_ACTIVATION_TABLE), 'uninstall should remove only the managed Codex activation table');
-    assert.ok(after.includes('[profiles.default]\nmodel = "gpt-5.1"'), 'uninstall should preserve unrelated profile TOML');
-    assert.ok(after.includes('[plugins."other@market"]\nenabled = true'), 'uninstall should preserve unrelated plugin TOML');
+    assert.deepStrictEqual(readFakeCodexState(codex), {
+        marketplaces: [otherMarketplace],
+        installed: [otherPlugin],
+        commands: [
+            codexCommand('marketplace', 'list'),
+            codexCommand('list'),
+            codexCommand('remove', CODEX_PLUGIN_KEY),
+            codexCommand('marketplace', 'remove', CODEX_MARKETPLACE),
+        ],
+    }, 'uninstall should remove only baseline@baseline-local and baseline-local through Codex CLI');
+    assert.strictEqual(readThrough(configToml), unrelatedConfig, 'uninstall must leave unrelated Codex config.toml byte-for-byte unchanged');
+    assert.ok(!fs.existsSync(path.join(cfg, 'skills', 'baseline')), 'uninstall should remove the Claude agent skill link');
     assert.ok(fs.existsSync(path.join(home, 'cfg', 'config.json')), 'uninstall should keep central config');
     assert.ok(fs.existsSync(path.join(home, 'skills', 'baseline')), 'uninstall should keep the central Claude skill payload');
-    assert.ok(fs.existsSync(centralCodexPlugin(home)), 'uninstall should keep the central Codex plugin payload');
+    assertCodexPayload(centralCodexPlugin(home), 'central Codex plugin');
 }
-function testUninstallPreservesCodexArrayTablesAfterManagedActivation() {
+// An unreadable plugin list is unknown state, not proof that baseline is absent.
+// Preserve the manager-owned marketplace until the plugin is known missing or removed.
+function testUninstallKeepsCodexMarketplaceWhenPluginStateUnreadable() {
     const cfg = tempConfig();
+    const home = homeFor(cfg);
     const codex = codexFor(cfg);
-    const toml = path.join(codex, 'config.toml');
-    assert.strictEqual(run(['install'], cfg).status, 0);
-    const beforeUninstall = '[profiles.default]\n' +
-        'model = "gpt-5.1"\n' +
-        '\n' +
-        CODEX_ACTIVATION_TABLE + '\n' +
-        '[[plugins.something]]\n' +
-        'name = "keep-plugin"\n' +
-        'enabled = true\n' +
-        '\n' +
-        '[[tool.foo]]\n' +
-        'name = "keep-tool"\n' +
-        'path = "survives"\n';
-    write(toml, beforeUninstall);
+    const configToml = path.join(codex, 'config.toml');
+    const unrelatedConfig = '# operator config stays untouched\n[profiles.default]\nmodel = "gpt-5.1"\n';
+    write(configToml, unrelatedConfig);
+    const install = run(['install'], cfg);
+    assert.strictEqual(install.status, 0, install.stderr || install.stdout);
+    const before = readFakeCodexState(codex);
+    resetFakeCodexCommands(codex);
+    const uninstall = run(['uninstall'], cfg, undefined, {
+        BASELINE_TEST_FAKE_CODEX_PLUGIN_LIST_UNREADABLE: '1',
+    });
+    assert.strictEqual(uninstall.status, 0, uninstall.stderr || uninstall.stdout);
+    const after = readFakeCodexState(codex);
+    assert.deepStrictEqual(after.marketplaces, before.marketplaces, 'unreadable plugin state must preserve the manager-owned marketplace');
+    assert.deepStrictEqual(after.installed, before.installed, 'unreadable plugin state must preserve the installed manager-owned plugin');
+    assert.deepStrictEqual(after.commands, [
+        codexCommand('marketplace', 'list'),
+        codexCommand('list'),
+    ], 'uninstall must not invoke Codex marketplace remove after an unreadable plugin list');
+    assert.match(uninstall.stdout, /codex plugin: unreadable — left as-is/, 'uninstall must report unreadable plugin state rather than falsely reporting absence');
+    assert.match(uninstall.stdout, /marketplace : owned — kept because plugin is unreadable/, 'uninstall must report why it preserved the manager-owned marketplace');
+    assert.strictEqual(readThrough(configToml), unrelatedConfig, 'uninstall must leave unrelated Codex config.toml byte-for-byte unchanged');
+    assert.ok(fs.existsSync(centralCodexPlugin(home)), 'uninstall must keep the central Codex payload');
+}
+// Canonical ownership must remain strict: a same-named marketplace rooted
+// elsewhere is operator-owned and uninstall must not touch it.
+function testUninstallPreservesForeignCodexMarketplace() {
+    const cfg = tempConfig();
+    const home = homeFor(cfg);
+    const codex = codexFor(cfg);
+    const install = run(['install'], cfg);
+    assert.strictEqual(install.status, 0, install.stderr || install.stdout);
+    const foreignRoot = path.join(cfg, 'operator-baseline-marketplace');
+    const foreign = readFakeCodexState(codex);
+    foreign.marketplaces = [{ name: CODEX_MARKETPLACE, root: foreignRoot }];
+    const plugin = foreign.installed.find(entry => entry.pluginId === CODEX_PLUGIN_KEY);
+    if (!plugin)
+        throw new Error('install did not create the managed Codex plugin fixture');
+    plugin.source.path = path.join(foreignRoot, 'plugins', 'baseline');
+    foreign.commands = [];
+    writeFakeCodexState(codex, foreign);
     const uninstall = run(['uninstall'], cfg);
     assert.strictEqual(uninstall.status, 0, uninstall.stderr || uninstall.stdout);
-    const after = readThrough(toml);
-    assert.ok(!after.includes(CODEX_ACTIVATION_TABLE), 'uninstall should remove the managed Codex activation table');
-    assert.ok(after.includes('[[plugins.something]]\nname = "keep-plugin"\nenabled = true'), 'uninstall should preserve unrelated plugin array-table entries after the managed activation table');
-    assert.ok(after.includes('[[tool.foo]]\nname = "keep-tool"\npath = "survives"'), 'uninstall should preserve unrelated tool array-table entries after the managed activation table');
+    const after = readFakeCodexState(codex);
+    assert.deepStrictEqual(after.marketplaces, foreign.marketplaces, 'foreign same-named marketplace must remain registered');
+    assert.deepStrictEqual(after.installed, foreign.installed, 'foreign plugin state must remain untouched');
+    assert.deepStrictEqual(after.commands, [codexCommand('marketplace', 'list')], 'foreign marketplace detection must stop before plugin or marketplace removal');
+    assert.match(uninstall.stdout, /marketplace : foreign — left as-is/);
 }
-function testUninstallPreservesCodexQuotedProjectTableAfterManagedActivation() {
-    const cases = [
+// A syntactically valid but schema-invalid list response is unknown state, not
+// proof that baseline is absent. Both marketplace and plugin faults must keep
+// all managed CLI state intact and issue no destructive remove command.
+function testUninstallKeepsCodexStateWhenListJsonHasWrongShape() {
+    const faults = [
         {
-            name: 'ordinary double-quoted table key containing #',
-            section: CODEX_QUOTED_PROJECT_TRUST + '\n'
+            name: 'marketplace',
+            env: { BASELINE_TEST_FAKE_CODEX_MARKETPLACE_LIST_WRONG_SHAPE: '1' },
+            commands: [codexCommand('marketplace', 'list')],
+            marketplaceReport: /marketplace : unreadable — left as-is/,
         },
         {
-            name: 'ordinary single-quoted table key containing #',
-            section: "[projects.'C:/work#prod']\ntrust_level = \"trusted\"\n"
+            name: 'marketplace malformed entry',
+            env: { BASELINE_TEST_FAKE_CODEX_MARKETPLACE_LIST_MALFORMED_ENTRY: '1' },
+            commands: [codexCommand('marketplace', 'list')],
+            marketplaceReport: /marketplace : unreadable — left as-is/,
         },
         {
-            name: 'array-table key containing #',
-            section: '[[projects."C:/work#prod"]]\ntrust_level = "trusted"\n'
-        }
+            name: 'plugin',
+            env: { BASELINE_TEST_FAKE_CODEX_PLUGIN_LIST_WRONG_SHAPE: '1' },
+            commands: [codexCommand('marketplace', 'list'), codexCommand('list')],
+            marketplaceReport: /marketplace : owned — kept because plugin is unreadable/,
+        },
+        {
+            name: 'plugin malformed entry',
+            env: { BASELINE_TEST_FAKE_CODEX_PLUGIN_LIST_MALFORMED_ENTRY: '1' },
+            commands: [codexCommand('marketplace', 'list'), codexCommand('list')],
+            marketplaceReport: /marketplace : owned — kept because plugin is unreadable/,
+        },
     ];
-    for (const c of cases) {
+    for (const fault of faults) {
         const cfg = tempConfig();
+        const home = homeFor(cfg);
         const codex = codexFor(cfg);
-        const toml = path.join(codex, 'config.toml');
-        assert.strictEqual(run(['install'], cfg).status, 0);
-        const beforeUninstall = CODEX_ACTIVATION_TABLE + '\n' +
-            c.section;
-        write(toml, beforeUninstall);
-        const uninstall = run(['uninstall'], cfg);
-        assert.strictEqual(uninstall.status, 0, uninstall.stderr || uninstall.stdout);
-        const after = readThrough(toml);
-        assert.ok(!after.includes(CODEX_ACTIVATION_TABLE), c.name + ': uninstall should remove the managed Codex activation table');
-        assert.ok(after.includes(c.section.trim()), c.name + ': uninstall should preserve the quoted # table immediately after the managed activation table');
+        const install = run(['install'], cfg);
+        assert.strictEqual(install.status, 0, fault.name + ': ' + (install.stderr || install.stdout));
+        const before = readFakeCodexState(codex);
+        resetFakeCodexCommands(codex);
+        const uninstall = run(['uninstall'], cfg, undefined, fault.env);
+        assert.strictEqual(uninstall.status, 0, fault.name + ': ' + (uninstall.stderr || uninstall.stdout));
+        const after = readFakeCodexState(codex);
+        assert.deepStrictEqual(after.marketplaces, before.marketplaces, fault.name + ': wrong-shaped list must preserve the manager-owned marketplace');
+        assert.deepStrictEqual(after.installed, before.installed, fault.name + ': wrong-shaped list must preserve the manager-owned plugin');
+        assert.deepStrictEqual(after.commands, fault.commands, fault.name + ': uninstall must stop before any Codex remove command');
+        assert.match(uninstall.stdout, /codex plugin: unreadable — left as-is/, fault.name + ': wrong-shaped JSON must report plugin state as unreadable');
+        assert.match(uninstall.stdout, fault.marketplaceReport, fault.name + ': wrong-shaped JSON must report why marketplace state was preserved');
     }
-}
-function testUninstallPreservesCodexQuotedBracketTomlSectionsAfterManagedActivation() {
-    const cases = [
-        {
-            name: 'ordinary double-quoted table key containing ]',
-            section: '[projects."team]prod"]\ntrust_level = "trusted"\n'
-        },
-        {
-            name: 'ordinary single-quoted table key containing ]',
-            section: "[projects.'team]prod']\ntrust_level = \"trusted\"\n"
-        },
-        {
-            name: 'array-table key containing ]',
-            section: '[[projects."team]prod"]]\ntrust_level = "trusted"\n'
-        }
-    ];
-    for (const c of cases) {
-        const cfg = tempConfig();
-        const codex = codexFor(cfg);
-        const toml = path.join(codex, 'config.toml');
-        assert.strictEqual(run(['install'], cfg).status, 0);
-        const beforeUninstall = CODEX_ACTIVATION_TABLE + '\n' +
-            c.section;
-        write(toml, beforeUninstall);
-        const uninstall = run(['uninstall'], cfg);
-        assert.strictEqual(uninstall.status, 0, uninstall.stderr || uninstall.stdout);
-        const after = readThrough(toml);
-        assert.ok(!after.includes(CODEX_ACTIVATION_TABLE), c.name + ': uninstall should remove the managed Codex activation table');
-        assert.ok(after.includes(c.section.trim()), c.name + ': uninstall should preserve the quoted ] table immediately after the managed activation table');
-    }
-}
-function testUninstallRemovesSingleQuotedManagedCodexPluginActivation() {
-    const cfg = tempConfig();
-    const codex = codexFor(cfg);
-    const toml = path.join(codex, 'config.toml');
-    assert.strictEqual(run(['install'], cfg).status, 0);
-    const beforeUninstall = "[plugins.'baseline@baseline']\n" +
-        'enabled = true\n' +
-        '[profiles.default]\n' +
-        'model = "gpt-5.1"\n';
-    write(toml, beforeUninstall);
-    const uninstall = run(['uninstall'], cfg);
-    assert.strictEqual(uninstall.status, 0, uninstall.stderr || uninstall.stdout);
-    const after = readThrough(toml);
-    assert.strictEqual(after, '[profiles.default]\nmodel = "gpt-5.1"\n', 'uninstall should remove single-quoted managed activation and preserve the following ordinary table');
-}
-function testUninstallPreservesBaselineCodexPluginArrayTable() {
-    const cfg = tempConfig();
-    const codex = codexFor(cfg);
-    const toml = path.join(codex, 'config.toml');
-    assert.strictEqual(run(['install'], cfg).status, 0);
-    const arrayActivation = '[[plugins."baseline@baseline"]]\n' +
-        'enabled = true\n';
-    write(toml, arrayActivation);
-    const uninstall = run(['uninstall'], cfg);
-    assert.strictEqual(uninstall.status, 0, uninstall.stderr || uninstall.stdout);
-    assert.strictEqual(readThrough(toml), arrayActivation, 'uninstall should not treat a Codex plugin array-table as the managed ordinary activation table');
 }
 // --- repo invariants --------------------------------------------------------
 function assertGitVisible(file) {
@@ -1645,8 +2176,8 @@ function testClaudePluginManifest() {
     assert.ok(Array.isArray(manifest.skills) && manifest.skills.indexOf('./') !== -1, 'Claude plugin manifest should expose the top-level skill via "skills": ["./"]');
 }
 // install deploys self-contained control surfaces: Claude gets the skills-dir
-// .claude-plugin payload, Codex gets a .codex-plugin cache/activation, and both
-// generated skill payloads point normal commands at the installed manager.
+// .claude-plugin payload, while Codex gets a manager-owned marketplace payload.
+// Both generated skill payloads point normal commands at the installed manager.
 function testControlSurfacePluginsDeployed() {
     const cfg = tempConfig();
     const home = homeFor(cfg);
@@ -1660,97 +2191,188 @@ function testControlSurfacePluginsDeployed() {
     const agentSkill = path.join(cfg, 'skills', 'baseline', 'SKILL.md');
     assert.ok(fs.existsSync(agentManifest), 'Claude skill plugin not linked into the agent skills dir');
     assert.strictEqual(JSON.parse(readThrough(agentManifest)).name, 'baseline');
-    const skillBody = readThrough(agentSkill);
-    assert.match(skillBody, /name:\s*baseline/, 'deployed Claude skill missing name frontmatter');
-    assertControlSurfaceCommandsUseInstalledManager(skillBody, home, 'deployed Claude skill');
-    // Codex parity is a marketplace/cache payload, not the Claude skills-dir payload.
+    const claudeSkill = readThrough(agentSkill);
+    assert.match(claudeSkill, /name:\s*baseline/, 'deployed Claude skill missing name frontmatter');
+    assertControlSurfaceCommandsUseInstalledManager(claudeSkill, home, 'deployed Claude skill');
+    // Codex receives the central marketplace payload through its supported CLI.
     assertCodexPayload(centralCodexPlugin(home), 'central Codex plugin');
-    assertCodexPayload(codexPluginCache(codex), 'Codex cache plugin');
-    assertControlSurfaceCommandsUseInstalledManager(readThrough(path.join(codexPluginCache(codex), 'skills', 'baseline', 'SKILL.md')), home, 'deployed Codex skill');
-    assertNoClaudePayloadInCodex(codex);
-    // status + doctor report both central payloads and the per-agent links healthy.
+    assertControlSurfaceCommandsUseInstalledManager(readThrough(path.join(centralCodexPlugin(home), 'skills', 'baseline', 'SKILL.md')), home, 'deployed Codex skill');
+    assertCodexPluginInstalled(codex, home, 'control surface');
+    resetFakeCodexCommands(codex);
     const status = run(['status'], cfg);
+    assert.strictEqual(status.status, 0, status.stderr || status.stdout);
     assert.match(status.stdout, /skill plugin : OK/, 'status should report the Claude agent skill link');
     assert.match(status.stdout, /codex plugin\s+: present at /, 'status should report the central Codex plugin payload');
-    assert.match(status.stdout, /codex cache\s+: OK/, 'status should report the Codex cache materialized');
-    assert.match(status.stdout, /codex config\s+: OK/, 'status should report the Codex plugin activation table');
+    assert.match(statusAgentSection(status.stdout, 'codex'), /marketplace\s+: OK \(registered\)/, 'status should inspect the registered marketplace through Codex CLI');
+    assert.match(statusAgentSection(status.stdout, 'codex'), /codex plugin\s+: OK \(installed\) @/, 'status should inspect the installed plugin through Codex CLI');
+    assert.deepStrictEqual(readFakeCodexState(codex).commands, [
+        codexCommand('marketplace', 'list'),
+        codexCommand('list'),
+    ], 'status should query marketplace and plugin state through Codex CLI');
+    resetFakeCodexCommands(codex);
     const doctor = run(['doctor'], cfg);
     assert.strictEqual(doctor.status, 0, doctor.stdout);
     assert.match(doctor.stdout, /claude skill plugin: central payload deployed; points at installed manager/);
     assert.match(doctor.stdout, /skill link: claude-code linked to center/);
     assert.match(doctor.stdout, /codex plugin payload: central payload deployed; points at installed manager/);
-    assert.match(doctor.stdout, /codex plugin cache: codex cache linked to center/);
-    assert.match(doctor.stdout, /codex plugin activation: codex config\.toml contains \[plugins\."baseline@baseline"\]/);
-    // uninstall removes per-agent links/cache but keeps central payloads.
-    assert.strictEqual(run(['uninstall'], cfg).status, 0);
-    assert.ok(!fs.existsSync(path.join(cfg, 'skills', 'baseline')), 'uninstall should remove the Claude agent skill link');
-    assert.ok(!fs.existsSync(codexPluginCache(codex)), 'uninstall should remove the Codex agent cache');
-    assert.ok(fs.existsSync(path.join(home, 'skills', 'baseline')), 'uninstall should keep the central Claude skill payload');
-    assert.ok(fs.existsSync(centralCodexPlugin(home)), 'uninstall should keep the central Codex plugin payload');
+    assert.match(doctor.stdout, /codex marketplace: codex registered from manager-owned root/);
+    assert.match(doctor.stdout, /codex plugin install: codex baseline@baseline-local installed @/);
+    assert.deepStrictEqual(readFakeCodexState(codex).commands, [
+        codexCommand('marketplace', 'list'),
+        codexCommand('list'),
+    ], 'doctor should query marketplace and plugin state through Codex CLI');
 }
-function testCodexPluginPayloadDeployedAndActivated() {
+function testUpdateRestoresCodexMarketplacePlugin() {
     const cfg = tempConfig();
     const home = homeFor(cfg);
     const codex = codexFor(cfg);
-    const toml = path.join(codex, 'config.toml');
-    const unrelatedToml = '# operator config stays\n' +
-        '[profiles.default]\n' +
-        'model = "gpt-5.1"\n' +
-        '\n' +
-        CODEX_QUOTED_PROJECT_TRUST + '\n';
-    write(toml, unrelatedToml);
-    const install = run(['install'], cfg);
-    assert.strictEqual(install.status, 0, install.stderr || install.stdout);
-    assertCodexPayload(centralCodexPlugin(home), 'central Codex plugin');
-    assertCodexPayload(codexPluginCache(codex), 'Codex cache plugin');
-    assert.strictEqual(readThrough(path.join(codexPluginCache(codex), '.codex-plugin', 'plugin.json')), readThrough(path.join(centralCodexPlugin(home), '.codex-plugin', 'plugin.json')), 'Codex cache plugin manifest should resolve to the central payload');
-    assertControlSurfaceCommandsUseInstalledManager(readThrough(path.join(codexPluginCache(codex), 'skills', 'baseline', 'SKILL.md')), home, 'Codex cache skill');
-    assertNoClaudePayloadInCodex(codex);
-    const after = readThrough(toml);
-    assert.ok(after.includes('# operator config stays'), 'install should preserve unrelated TOML comments');
-    assert.ok(after.includes('[profiles.default]\nmodel = "gpt-5.1"'), 'install should preserve unrelated TOML tables');
-    assert.ok(after.includes(CODEX_QUOTED_PROJECT_TRUST), 'install should preserve quoted project trust TOML with # in table key');
-    assertEmptyCodexActivationTable(toml);
-}
-function testUpdateRepairsCodexPluginCacheAndActivation() {
-    const cfg = tempConfig();
-    const codex = codexFor(cfg);
-    const toml = path.join(codex, 'config.toml');
-    const unrelatedToml = '[profiles.default]\n' +
-        'model = "gpt-5.1"\n' +
-        '\n' +
-        CODEX_QUOTED_PROJECT_TRUST + '\n';
-    write(toml, unrelatedToml);
     assert.strictEqual(run(['install'], cfg).status, 0);
-    fs.rmSync(codexPluginCache(codex), { recursive: true, force: true });
-    write(toml, unrelatedToml);
+    writeFakeCodexState(codex, { marketplaces: [], installed: [], commands: [] });
     const update = run(['update'], cfg);
     assert.strictEqual(update.status, 0, update.stderr || update.stdout);
-    assertCodexPayload(codexPluginCache(codex), 'repaired Codex cache plugin');
-    const after = readThrough(toml);
-    assert.ok(after.includes('[profiles.default]\nmodel = "gpt-5.1"'), 'update should preserve unrelated profile TOML while repairing activation');
-    assert.ok(after.includes(CODEX_QUOTED_PROJECT_TRUST), 'update should preserve quoted project trust TOML while repairing activation');
-    assertEmptyCodexActivationTable(toml);
+    assertCodexPluginInstalled(codex, home, 'update');
+    assert.deepStrictEqual(readFakeCodexState(codex).commands, [
+        codexCommand('marketplace', 'list'),
+        codexCommand('marketplace', 'add', centralCodexMarketplace(home)),
+        codexCommand('add', CODEX_PLUGIN_KEY),
+    ], 'update should recreate the registered marketplace and installed plugin through Codex CLI');
 }
-function testDoctorFixRepairsCodexPluginCacheAndActivation() {
+function testDoctorFixRestoresCodexMarketplacePlugin() {
     const cfg = tempConfig();
+    const home = homeFor(cfg);
     const codex = codexFor(cfg);
-    const toml = path.join(codex, 'config.toml');
-    const unrelatedToml = '[profiles.default]\nmodel = "gpt-5.1"\n';
-    write(toml, unrelatedToml);
     assert.strictEqual(run(['install'], cfg).status, 0);
-    fs.rmSync(codexPluginCache(codex), { recursive: true, force: true });
-    write(toml, unrelatedToml);
+    writeFakeCodexState(codex, { marketplaces: [], installed: [], commands: [] });
     const broken = run(['doctor'], cfg);
     assert.strictEqual(broken.status, 1, broken.stdout);
-    assert.match(broken.stdout, /\[FAIL\] codex plugin cache/);
-    assert.match(broken.stdout, /\[FAIL\] codex plugin activation/);
+    assert.match(broken.stdout, /\[FAIL\] codex marketplace: codex missing/);
+    assert.match(broken.stdout, /\[FAIL\] codex plugin install: codex missing/);
+    resetFakeCodexCommands(codex);
     const fixed = run(['doctor', '--fix'], cfg);
     assert.strictEqual(fixed.status, 0, fixed.stderr || fixed.stdout);
     assert.match(fixed.stdout, /doctor: installation repaired/);
-    assertCodexPayload(codexPluginCache(codex), 'doctor-repaired Codex cache plugin');
-    assert.ok(readThrough(toml).includes(unrelatedToml.trim()), 'doctor --fix should preserve unrelated TOML while repairing activation');
-    assertEmptyCodexActivationTable(toml);
+    assertCodexPluginInstalled(codex, home, 'doctor --fix');
+    assert.deepStrictEqual(readFakeCodexState(codex).commands, [
+        codexCommand('marketplace', 'list'),
+        codexCommand('marketplace', 'list'),
+        codexCommand('marketplace', 'add', centralCodexMarketplace(home)),
+        codexCommand('add', CODEX_PLUGIN_KEY),
+        codexCommand('marketplace', 'list'),
+        codexCommand('list'),
+    ], 'doctor --fix should repair and recheck Codex marketplace/plugin state through the CLI');
+}
+// A valid-looking old cachebuster is drift, even when the marketplace and source
+// path remain manager-owned. The fix must redeploy the central payload and re-add
+// the CLI-installed plugin through the supported lifecycle.
+function testCodexDigestDriftIsDetectedAndRepaired() {
+    const cfg = tempConfig();
+    const home = homeFor(cfg);
+    const codex = codexFor(cfg);
+    assert.strictEqual(run(['install'], cfg).status, 0);
+    const expectedVersion = expectedCodexPluginVersion(home, 'digest drift');
+    const manifestPath = path.join(centralCodexPlugin(home), '.codex-plugin', 'plugin.json');
+    const deployedManifest = JSON.parse(readThrough(manifestPath));
+    if (!isRecord(deployedManifest) || typeof deployedManifest.version !== 'string') {
+        throw new Error('installed central Codex manifest needs a version');
+    }
+    assert.strictEqual(deployedManifest.version, expectedVersion, 'install should deploy the exact expected Codex version');
+    const staleVersion = expectedVersion.slice(0, -12) + '000000000000';
+    assert.notStrictEqual(staleVersion, expectedVersion, 'stale fixture must differ from the expected version');
+    deployedManifest.version = staleVersion;
+    write(manifestPath, JSON.stringify(deployedManifest, null, 2) + '\n');
+    const staleState = readFakeCodexState(codex);
+    const stalePlugin = staleState.installed.find(entry => entry.pluginId === CODEX_PLUGIN_KEY);
+    if (!stalePlugin)
+        throw new Error('install did not create the managed Codex plugin fixture');
+    assert.strictEqual(stalePlugin.source.path, centralCodexPlugin(home), 'stale fixture must keep the manager-owned source path');
+    stalePlugin.version = staleVersion;
+    writeFakeCodexState(codex, staleState);
+    const status = run(['status'], cfg);
+    assert.strictEqual(status.status, 0, status.stderr || status.stdout);
+    assert.ok(status.stdout.includes('codex plugin   : STALE — deployed @ ' + staleVersion + '; expected @ ' + expectedVersion), 'human status should surface a stale central Codex payload');
+    assert.ok(statusAgentSection(status.stdout, 'codex').includes('codex plugin : STALE — installed @ ' + staleVersion + '; expected @ ' + expectedVersion), 'human status should surface a stale CLI-installed Codex plugin');
+    const jsonStatusResult = run(['status', '--json'], cfg);
+    assert.strictEqual(jsonStatusResult.status, 0, jsonStatusResult.stderr || jsonStatusResult.stdout);
+    const jsonStatus = JSON.parse(jsonStatusResult.stdout);
+    if (!isRecord(jsonStatus) || !isRecord(jsonStatus.data))
+        throw new Error('status --json needs a data object');
+    const centralStatus = jsonStatus.data.codexPlugin;
+    if (!isRecord(centralStatus))
+        throw new Error('status --json needs Codex payload state');
+    assert.strictEqual(centralStatus.stale, true, 'JSON status should mark the central payload stale');
+    assert.strictEqual(centralStatus.version, staleVersion, 'JSON status should expose the stale central version');
+    assert.strictEqual(centralStatus.expectedVersion, expectedVersion, 'JSON status should expose the expected central version');
+    const agents = jsonStatus.data.agents;
+    if (!Array.isArray(agents))
+        throw new Error('status --json needs agents');
+    const codexAgent = agents.find((agent) => isRecord(agent) && agent.name === 'codex');
+    if (!isRecord(codexAgent) || !isRecord(codexAgent.codex))
+        throw new Error('status --json needs Codex agent state');
+    assert.strictEqual(codexAgent.codex.stale, true, 'JSON status should mark the installed plugin stale');
+    assert.strictEqual(codexAgent.codex.version, staleVersion, 'JSON status should expose the stale installed version');
+    assert.strictEqual(codexAgent.codex.expectedVersion, expectedVersion, 'JSON status should expose the expected installed version');
+    resetFakeCodexCommands(codex);
+    const broken = run(['doctor'], cfg);
+    assert.strictEqual(broken.status, 1, broken.stdout);
+    assert.match(broken.stdout, /\[WARN\] codex plugin payload: deployed manifest\/cachebuster differs from source \(update will refresh\)/, 'doctor should retain the fixable central payload drift message');
+    assert.ok(broken.stdout.includes('[FAIL] codex plugin install: codex ' + CODEX_PLUGIN_KEY + ' stale @ ' + staleVersion + '; expected @ ' + expectedVersion), 'doctor should fail a stale CLI-installed version');
+    assert.deepStrictEqual(readFakeCodexState(codex).commands, [
+        codexCommand('marketplace', 'list'),
+        codexCommand('list'),
+    ], 'doctor should inspect stale plugin ownership and version through the CLI');
+    resetFakeCodexCommands(codex);
+    const fixed = run(['doctor', '--fix'], cfg);
+    assert.strictEqual(fixed.status, 0, fixed.stderr || fixed.stdout);
+    assert.match(fixed.stdout, /doctor: installation repaired/);
+    const repairedManifest = JSON.parse(readThrough(manifestPath));
+    if (!isRecord(repairedManifest) || typeof repairedManifest.version !== 'string') {
+        throw new Error('repaired central Codex manifest needs a version');
+    }
+    assert.strictEqual(repairedManifest.version, expectedVersion, 'doctor --fix should restore the central manifest to the exact expected version');
+    assertCodexPluginInstalled(codex, home, 'doctor --fix stale digest');
+    assert.deepStrictEqual(readFakeCodexState(codex).commands, [
+        codexCommand('marketplace', 'list'),
+        codexCommand('list'),
+        codexCommand('marketplace', 'list'),
+        codexCommand('list'),
+        codexCommand('add', CODEX_PLUGIN_KEY),
+        codexCommand('marketplace', 'list'),
+        codexCommand('list'),
+    ], 'doctor --fix should re-add the stale CLI-installed plugin then verify it through the CLI');
+}
+function testUnavailableCodexCliLeavesControlSurfaceUninstalled() {
+    const cfg = tempConfig();
+    const home = homeFor(cfg);
+    const codex = codexFor(cfg);
+    const unavailable = path.join(cfg, 'missing-codex-cli');
+    const env = { BASELINE_CODEX_CLI: unavailable };
+    const install = run(['install'], cfg, undefined, env);
+    assert.strictEqual(install.status, 0, install.stderr || install.stdout);
+    assert.match(install.stdout, /codex NOTICE: `codex` CLI unavailable/, 'install should stay nonfatal when the configured Codex CLI is unavailable');
+    assert.ok(fs.existsSync(centralCodexPlugin(home)), 'install should still deploy the central Codex marketplace payload');
+    assert.ok(!fs.existsSync(fakeCodexStatePath(codex)), 'unavailable Codex CLI must not create plugin lifecycle state');
+    const status = run(['status'], cfg, undefined, env);
+    assert.strictEqual(status.status, 0, status.stderr || status.stdout);
+    assert.match(statusAgentSection(status.stdout, 'codex'), /marketplace\s+: UNAVAILABLE/);
+    assert.match(statusAgentSection(status.stdout, 'codex'), /codex plugin\s+: UNAVAILABLE/);
+    const jsonStatusResult = run(['status', '--json'], cfg, undefined, env);
+    assert.strictEqual(jsonStatusResult.status, 0, jsonStatusResult.stderr || jsonStatusResult.stdout);
+    const jsonStatus = JSON.parse(jsonStatusResult.stdout);
+    if (!isRecord(jsonStatus) || !isRecord(jsonStatus.data) || !Array.isArray(jsonStatus.data.agents)) {
+        throw new Error('unavailable Codex status --json needs agent state');
+    }
+    const codexAgent = jsonStatus.data.agents.find((agent) => isRecord(agent) && agent.name === 'codex');
+    if (!isRecord(codexAgent) || !isRecord(codexAgent.links) || !isRecord(codexAgent.codex)) {
+        throw new Error('unavailable Codex status --json needs Codex fields');
+    }
+    const pluginLink = codexAgent.links.codexPlugin;
+    if (!isRecord(pluginLink))
+        throw new Error('unavailable Codex status --json needs a plugin link state');
+    assert.strictEqual(pluginLink.mechanism, 'unavailable', 'JSON status should retain the unavailable CLI lifecycle state');
+    assert.strictEqual(codexAgent.codex.stale, false, 'JSON status must not misclassify an unavailable Codex CLI as stale');
+    const doctor = run(['doctor'], cfg, undefined, env);
+    assert.strictEqual(doctor.status, 1, doctor.stdout);
+    assert.match(doctor.stdout, /\[WARN\] codex marketplace: codex unavailable/);
 }
 // install with BASELINE_CFG set: config lives FLAT in the external folder, the install
 // root holds only artifacts, <installRoot>/cfg symlinks to the external folder, agents
@@ -1802,6 +2424,9 @@ function testAgentsFlagSelectsSubset() {
     assert.ok(!fs.existsSync(path.join(codex, 'hooks.json')), 'codex must not be wired when not selected');
     const state = JSON.parse(fs.readFileSync(path.join(home, 'state.json'), 'utf8'));
     assert.deepStrictEqual(state, { agents: ['claude-code'] }, 'state.json should record exactly the selected set');
+    const verify = run(['verify'], cfg);
+    assert.strictEqual(verify.status, 0, verify.stderr || verify.stdout);
+    assert.match(verify.stdout, /agent tested\s+: claude-code/, 'verify must stay within the recorded agent scope and execute Claude directly');
 }
 // --agents with the full comma list wires both agents and records both.
 function testAgentsFlagBothExplicit() {
@@ -2011,7 +2636,7 @@ function testJsonDispatchSimulate() {
     assert.strictEqual(obj.command, 'dispatch.simulate');
     assert.strictEqual(obj.data.event, 'UserPromptSubmit');
     assert.ok(obj.data.selected.some((r) => r.id === 'sim'), 'sim route selected');
-    assert.ok(obj.data.additionalContext && obj.data.additionalContext.includes('SIM UserPromptSubmit'), 'templated body previewed: ' + obj.data.additionalContext);
+    assert.strictEqual(obj.data.additionalContext, 'SIM {{event}}\n', 'static body must be previewed verbatim: ' + obj.data.additionalContext);
     // Side-effect-free: simulate must never write the counter file.
     assert.ok(!fs.existsSync(path.join(cfg, '.baseline-counters.json')), 'simulate must not write counters');
 }
@@ -2086,6 +2711,15 @@ function testDispatchRssWithinCeiling() {
 const TESTS = [
     ['testCentralInstallAndAgentLinks', testCentralInstallAndAgentLinks],
     ['testCodexInstallAndAgentLinks', testCodexInstallAndAgentLinks],
+    ['testCodexLifecyclePreservesSpacedPaths', testCodexLifecyclePreservesSpacedPaths],
+    ['testCodexResolvesBareNativeExecutableAlias', testCodexResolvesBareNativeExecutableAlias],
+    ['testWindowsCodexResolvesBareCwdExecutableBeforePath', testWindowsCodexResolvesBareCwdExecutableBeforePath],
+    ['testCodexResolvesBareBatchShimAlias', testCodexResolvesBareBatchShimAlias],
+    ['testMissingBareCodexCliLeavesControlSurfaceUninstalled', testMissingBareCodexCliLeavesControlSurfaceUninstalled],
+    ['testCodexOwnershipAcceptsCanonicalSymlinkedHome', testCodexOwnershipAcceptsCanonicalSymlinkedHome],
+    ['testShellSafeHookCommandsBothAgents', testShellSafeHookCommandsBothAgents],
+    ['testVerifyRunsConfiguredCommandThroughShell', testVerifyRunsConfiguredCommandThroughShell],
+    ['testUpdateReplacesLegacyWindowsHookCommand', testUpdateReplacesLegacyWindowsHookCommand],
     ['testInstalledHooksResolveBundledContracts', testInstalledHooksResolveBundledContracts],
     ['testCentralEditPropagatesToAgent', testCentralEditPropagatesToAgent],
     ['testIdempotentReinstall', testIdempotentReinstall],
@@ -2100,6 +2734,8 @@ const TESTS = [
     ['testNativeHealthCentralBinaryMissing', testNativeHealthCentralBinaryMissing],
     ['testNativeHealthAgentBinaryMissing', testNativeHealthAgentBinaryMissing],
     ['testDefaultInstallAndVerify', testDefaultInstallAndVerify],
+    ['testInstalledManagerKeepsFreshCodexPayloadHealthy', testInstalledManagerKeepsFreshCodexPayloadHealthy],
+    ['testCodexCachebusterIgnoresSourceCheckoutProvenance', testCodexCachebusterIgnoresSourceCheckoutProvenance],
     ['testInstalledManagerInfersInstallRootWithoutBaselineHome', testInstalledManagerInfersInstallRootWithoutBaselineHome],
     ['testBaselineHomeOverridesInstalledManagerLocation', testBaselineHomeOverridesInstalledManagerLocation],
     ['testSourceLikeInstalledManagerDoesNotInferInstallRoot', testSourceLikeInstalledManagerDoesNotInferInstallRoot],
@@ -2115,10 +2751,6 @@ const TESTS = [
     ['testPerRouteCountersIndependent', testPerRouteCountersIndependent],
     ['testMalformedCounterArrayDoesNotBreakFrequency', testMalformedCounterArrayDoesNotBreakFrequency],
     ['testEventNameSemantics', testEventNameSemantics],
-    ['testTemplateResolvesBuiltinsAndVars', testTemplateResolvesBuiltinsAndVars],
-    ['testTemplatePerRouteOverrideOrder', testTemplatePerRouteOverrideOrder],
-    ['testTemplateUnknownPlaceholderVerbatim', testTemplateUnknownPlaceholderVerbatim],
-    ['testTemplateDispatchEndToEnd', testTemplateDispatchEndToEnd],
     ['testConcurrentDispatchDeterministicOrder', testConcurrentDispatchDeterministicOrder],
     ['testFailOpenMissingConfig', testFailOpenMissingConfig],
     ['testMalformedConfigInjectsNothing', testMalformedConfigInjectsNothing],
@@ -2138,15 +2770,14 @@ const TESTS = [
     ['testUninstallCleansHalfDeadInstall', testUninstallCleansHalfDeadInstall],
     ['testUninstallPreservesDivergentPerAgentContracts', testUninstallPreservesDivergentPerAgentContracts],
     ['testControlSurfacePluginsDeployed', testControlSurfacePluginsDeployed],
-    ['testCodexPluginPayloadDeployedAndActivated', testCodexPluginPayloadDeployedAndActivated],
-    ['testUpdateRepairsCodexPluginCacheAndActivation', testUpdateRepairsCodexPluginCacheAndActivation],
-    ['testDoctorFixRepairsCodexPluginCacheAndActivation', testDoctorFixRepairsCodexPluginCacheAndActivation],
-    ['testUninstallRemovesOnlyManagedCodexPluginActivation', testUninstallRemovesOnlyManagedCodexPluginActivation],
-    ['testUninstallPreservesCodexArrayTablesAfterManagedActivation', testUninstallPreservesCodexArrayTablesAfterManagedActivation],
-    ['testUninstallPreservesCodexQuotedProjectTableAfterManagedActivation', testUninstallPreservesCodexQuotedProjectTableAfterManagedActivation],
-    ['testUninstallPreservesCodexQuotedBracketTomlSectionsAfterManagedActivation', testUninstallPreservesCodexQuotedBracketTomlSectionsAfterManagedActivation],
-    ['testUninstallRemovesSingleQuotedManagedCodexPluginActivation', testUninstallRemovesSingleQuotedManagedCodexPluginActivation],
-    ['testUninstallPreservesBaselineCodexPluginArrayTable', testUninstallPreservesBaselineCodexPluginArrayTable],
+    ['testUpdateRestoresCodexMarketplacePlugin', testUpdateRestoresCodexMarketplacePlugin],
+    ['testDoctorFixRestoresCodexMarketplacePlugin', testDoctorFixRestoresCodexMarketplacePlugin],
+    ['testCodexDigestDriftIsDetectedAndRepaired', testCodexDigestDriftIsDetectedAndRepaired],
+    ['testUninstallRemovesOnlyManagedCodexMarketplacePlugin', testUninstallRemovesOnlyManagedCodexMarketplacePlugin],
+    ['testUninstallKeepsCodexMarketplaceWhenPluginStateUnreadable', testUninstallKeepsCodexMarketplaceWhenPluginStateUnreadable],
+    ['testUninstallPreservesForeignCodexMarketplace', testUninstallPreservesForeignCodexMarketplace],
+    ['testUninstallKeepsCodexStateWhenListJsonHasWrongShape', testUninstallKeepsCodexStateWhenListJsonHasWrongShape],
+    ['testUnavailableCodexCliLeavesControlSurfaceUninstalled', testUnavailableCodexCliLeavesControlSurfaceUninstalled],
     ['testClaudePluginManifest', testClaudePluginManifest],
     ['testExternalConfigLocation', testExternalConfigLocation],
     ['testChecksumsMatchBinaries', testChecksumsMatchBinaries],

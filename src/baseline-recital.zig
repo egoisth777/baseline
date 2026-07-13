@@ -9,21 +9,18 @@
 //  - read all stdin, JSON.parse; require a truthy session_id and a supported
 //    hook_event_name, else inject nothing;
 //  - load + validate <agentDir>/cfg/baseline/config.json (version, route caps, per-route
-//    id/event/phase/doc/freq/cwd/vars validation, dedup first-wins);
+//    id/event/phase/doc/freq/cwd validation, dedup first-wins);
 //  - select routes matching (event, cwd); bump each one's "<session>:<routeId>" counter in
 //    <agentDir>/.baseline-counters.json (read/prune/increment/write, symlink-guarded);
-//  - for each DUE route (count % freq == 0) read its doc (path-safe, byte/char capped),
-//    apply {{name}} templating, and emit hookSpecificOutput.additionalContext with the due
-//    docs joined in config routes[] order — byte-identical to the Node path;
+//  - for each DUE route (count % freq == 0) read its doc (path-safe, byte/char capped)
+//    and emit it verbatim in hookSpecificOutput.additionalContext, with due docs joined
+//    in config routes[] order — byte-identical to the Node path;
 //  - fail-open: every error path is a silent no-op that exits 0 and injects nothing.
 //
 // Parity notes (kept in sync with src/contracts.ts / src/baseline-recital.ts):
-//  - {{name}} resolution order is user vars (route over config) then the deterministic
-//    built-ins {{event}}/{{cwd}}/{{home}}/{{date}}/{{time}}/{{env.NAME}}; unknown tokens are
-//    left byte-for-byte verbatim; the env.* family blanks (empty string) on a miss.
+//  - docs are static trusted text and are emitted byte-for-byte, including any `{{...}}`
+//    sequences they contain;
 //  - JSON output escaping matches JSON.stringify for the additionalContext value.
-//  - {{date}}/{{time}} resolve in UTC on BOTH runtimes (contract — the Node resolver was
-//    switched to UTC to match this), so output is byte-identical regardless of local timezone.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -87,7 +84,7 @@ fn run(io: Io, env: *std.process.Environ.Map) !void {
     const config_path = try joinPath(cfg_dir, "config.json");
     const counter_path = try joinPath(agent_dir, ".baseline-counters.json");
 
-    // ---- load + validate config.json into the routes to act on (+ config vars) ----
+    // ---- load + validate config.json into the routes to act on ----
     const cfg = loadValidConfig(io, config_path, cfg_dir);
 
     // ---- select the routes this invocation activates (event name + cwd) ----
@@ -127,22 +124,16 @@ fn run(io: Io, env: *std.process.Environ.Map) !void {
 
     if (due.items.len == 0) return;
 
-    // ---- read due docs CONCURRENTLY, then template + apply the combined-context cap and emit
-    // in config routes[] order ---- The reads run on the Io's worker threads (R-011, mirroring
-    // the Node Promise.all); templating stays on this thread after they join, so the output
-    // order is deterministic regardless of which read finishes first.
-    // Fresh clock snapshot for templating (the oracle also reads the clock again here, after
-    // the counter section, for {{date}}/{{time}}).
-    const dt = utcDateTime(Io.Clock.real.now(io).toMilliseconds());
+    // ---- read due docs CONCURRENTLY, then apply the combined-context cap and emit in config
+    // routes[] order ---- The reads run on the Io's worker threads (R-011, mirroring the Node
+    // Promise.all); output order is deterministic regardless of which read finishes first.
     const raws = readDueDocsConcurrent(io, due.items, cfg_dir);
 
     var bodies: std.ArrayList([]const u8) = .empty;
     var sum_units: usize = 0; // running sum of UTF-16 lengths of pushed bodies
-    for (due.items, 0..) |r, i| {
+    for (due.items, 0..) |_, i| {
         if (i >= raws.len) break;
-        const raw = raws[i] orelse continue;
-        const merged = mergeVars(cfg.vars, r.vars);
-        const body = applyTemplate(raw, merged, event, data_cwd orelse "", homedir(env) orelse "", dt, env) catch continue;
+        const body = raws[i] orelse continue;
         const body_units = utf16Len(body);
         const count = bodies.items.len;
         // joined.length == count==0 ? body_units : sum_units + 2*count + body_units
@@ -330,16 +321,14 @@ const Route = struct {
     freq: i64,
     cwd: ?[]const u8,
     doc: []const u8,
-    vars: std.StringHashMap([]const u8),
 };
 
 const ValidConfig = struct {
     routes: std.ArrayList(Route),
-    vars: std.StringHashMap([]const u8),
 };
 
 fn emptyConfig() ValidConfig {
-    return .{ .routes = .empty, .vars = std.StringHashMap([]const u8).init(A) };
+    return .{ .routes = .empty };
 }
 
 // SLUG = /^[a-z0-9][a-z0-9-]*$/
@@ -351,26 +340,6 @@ fn isSlug(s: []const u8) bool {
         if (!((c >= 'a' and c <= 'z') or (c >= '0' and c <= '9') or c == '-')) return false;
     }
     return true;
-}
-
-// Sanitize a JSON `vars` value into a string->string map (non-object -> {}, non-string
-// values dropped) — fail-open like the oracle's sanitizeVars.
-fn sanitizeVars(v: ?std.json.Value) std.StringHashMap([]const u8) {
-    var out = std.StringHashMap([]const u8).init(A);
-    const val = v orelse return out;
-    switch (val) {
-        .object => |obj| {
-            var it = obj.iterator();
-            while (it.next()) |kv| {
-                switch (kv.value_ptr.*) {
-                    .string => |s| out.put(kv.key_ptr.*, s) catch {},
-                    else => {},
-                }
-            }
-        },
-        else => {},
-    }
-    return out;
 }
 
 fn loadValidConfig(io: Io, config_path: []const u8, cfg_dir: []const u8) ValidConfig {
@@ -391,12 +360,10 @@ fn loadValidConfig(io: Io, config_path: []const u8, cfg_dir: []const u8) ValidCo
         if (!ok1) return emptyConfig();
     }
 
-    const config_vars = sanitizeVars(obj.get("vars"));
-
-    const routes_val = obj.get("routes") orelse return .{ .routes = .empty, .vars = config_vars };
+    const routes_val = obj.get("routes") orelse return emptyConfig();
     const arr = switch (routes_val) {
         .array => |a| a,
-        else => return .{ .routes = .empty, .vars = config_vars },
+        else => return emptyConfig(),
     };
     if (arr.items.len > MAX_ROUTES) return emptyConfig();
 
@@ -432,15 +399,13 @@ fn loadValidConfig(io: Io, config_path: []const u8, cfg_dir: []const u8) ValidCo
         if (r.get("cwd")) |cv| {
             switch (cv) {
                 .string => |s| cwd = s,
-                .null => {}, // treated as absent
                 else => continue,
             }
         }
-        const vars = sanitizeVars(r.get("vars"));
         seen.put(id, {}) catch {};
-        out.append(A, .{ .id = id, .event = ev, .freq = freq, .cwd = cwd, .doc = doc, .vars = vars }) catch {};
+        out.append(A, .{ .id = id, .event = ev, .freq = freq, .cwd = cwd, .doc = doc }) catch {};
     }
-    return .{ .routes = out, .vars = config_vars };
+    return .{ .routes = out };
 }
 
 fn isSessionPhase(phase: []const u8) bool {
@@ -659,70 +624,6 @@ fn readDueDocsConcurrent(io: Io, due: []const *const Route, cfg_dir: []const u8)
     return raws;
 }
 
-// ---------------------------------------------------------------------------
-// {{name}} templating (mirrors applyTemplate / resolveToken in src/contracts.ts)
-fn mergeVars(config_vars: std.StringHashMap([]const u8), route_vars: std.StringHashMap([]const u8)) std.StringHashMap([]const u8) {
-    var out = std.StringHashMap([]const u8).init(A);
-    var ci = config_vars.iterator();
-    while (ci.next()) |kv| out.put(kv.key_ptr.*, kv.value_ptr.*) catch {};
-    var ri = route_vars.iterator();
-    while (ri.next()) |kv| out.put(kv.key_ptr.*, kv.value_ptr.*) catch {}; // route wins
-    return out;
-}
-
-const DateTime = struct { date: []const u8, time: []const u8 };
-
-fn isTmplSpace(c: u8) bool {
-    return c == ' ' or c == '\t' or c == '\n' or c == '\r' or c == 0x0b or c == 0x0c;
-}
-fn isTokenChar(c: u8) bool {
-    return (c >= 'A' and c <= 'Z') or (c >= 'a' and c <= 'z') or (c >= '0' and c <= '9') or c == '_' or c == '.' or c == '-';
-}
-
-// Resolve one token: user vars first (they override built-ins), then the deterministic
-// provider. Returns null when nothing resolves it (leave verbatim).
-fn resolveToken(token: []const u8, vars: std.StringHashMap([]const u8), event: []const u8, cwd: []const u8, home: []const u8, dt: DateTime, env: *std.process.Environ.Map) ?[]const u8 {
-    if (vars.get(token)) |v| return v;
-    if (std.mem.eql(u8, token, "event")) return event;
-    if (std.mem.eql(u8, token, "cwd")) return cwd;
-    if (std.mem.eql(u8, token, "home")) return home;
-    if (std.mem.eql(u8, token, "date")) return dt.date;
-    if (std.mem.eql(u8, token, "time")) return dt.time;
-    if (std.mem.startsWith(u8, token, "env.")) {
-        const name = token[4..];
-        return env.get(name) orelse "";
-    }
-    return null;
-}
-
-fn applyTemplate(body: []const u8, vars: std.StringHashMap([]const u8), event: []const u8, cwd: []const u8, home: []const u8, dt: DateTime, env: *std.process.Environ.Map) ![]u8 {
-    var out: std.ArrayList(u8) = .empty;
-    var i: usize = 0;
-    while (i < body.len) {
-        if (body[i] == '{' and i + 1 < body.len and body[i + 1] == '{') {
-            var j = i + 2;
-            while (j < body.len and isTmplSpace(body[j])) j += 1;
-            const tstart = j;
-            while (j < body.len and isTokenChar(body[j])) j += 1;
-            const tend = j;
-            while (j < body.len and isTmplSpace(body[j])) j += 1;
-            if (tend > tstart and j + 1 < body.len and body[j] == '}' and body[j + 1] == '}') {
-                const token = body[tstart..tend];
-                if (resolveToken(token, vars, event, cwd, home, dt, env)) |v| {
-                    try out.appendSlice(A, v);
-                } else {
-                    try out.appendSlice(A, body[i .. j + 2]); // unknown -> verbatim match
-                }
-                i = j + 2;
-                continue;
-            }
-        }
-        try out.append(A, body[i]);
-        i += 1;
-    }
-    return out.items;
-}
-
 // UTF-16 code-unit length of a UTF-8 string (matches JS String.prototype.length).
 fn utf16Len(s: []const u8) usize {
     var n: usize = 0;
@@ -747,47 +648,6 @@ fn utf16Len(s: []const u8) usize {
         i += len;
     }
     return n;
-}
-
-// UTC calendar date/time from Unix ms — the {{date}}/{{time}} contract is UTC on both
-// runtimes (the Node resolver matches this).
-fn utcDateTime(now_ms: i64) DateTime {
-    const secs = @divFloor(now_ms, 1000);
-    const days = @divFloor(secs, 86400);
-    const tod = @mod(secs, 86400); // 0..86399 (@mod is non-negative for positive modulus)
-    const hour = @divFloor(tod, 3600);
-    const minute = @divFloor(@mod(tod, 3600), 60);
-
-    // Howard Hinnant's days->civil algorithm.
-    const z = days + 719468;
-    const era = @divFloor(if (z >= 0) z else z - 146096, 146097);
-    const doe = z - era * 146097; // [0, 146096]
-    const yoe = @divFloor(doe - @divFloor(doe, 1460) + @divFloor(doe, 36524) - @divFloor(doe, 146096), 365);
-    const y0 = yoe + era * 400;
-    const doy = doe - (365 * yoe + @divFloor(yoe, 4) - @divFloor(yoe, 100));
-    const mp = @divFloor(5 * doy + 2, 153); // [0, 11]
-    const d = doy - @divFloor(153 * mp + 2, 5) + 1; // [1, 31]
-    const m = if (mp < 10) mp + 3 else mp - 9; // [1, 12]
-    const y = y0 + (if (m <= 2) @as(i64, 1) else 0);
-
-    var date_buf: std.ArrayList(u8) = .empty;
-    fmtInt(&date_buf, y) catch {};
-    date_buf.append(A, '-') catch {};
-    appendPad2(&date_buf, m) catch {};
-    date_buf.append(A, '-') catch {};
-    appendPad2(&date_buf, d) catch {};
-
-    var time_buf: std.ArrayList(u8) = .empty;
-    appendPad2(&time_buf, hour) catch {};
-    time_buf.append(A, ':') catch {};
-    appendPad2(&time_buf, minute) catch {};
-
-    return .{ .date = date_buf.items, .time = time_buf.items };
-}
-
-fn appendPad2(out: *std.ArrayList(u8), v: i64) !void {
-    if (v >= 0 and v < 10) try out.append(A, '0');
-    try fmtInt(out, v);
 }
 
 // ---------------------------------------------------------------------------
