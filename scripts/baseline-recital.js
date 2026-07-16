@@ -216,22 +216,23 @@ function releaseCounterLock() {
     }
     catch (e) { }
 }
-let input = '';
+const chunks = [];
 let inputBytes = 0;
 let inputTooLarge = false;
 process.stdin.on('data', chunk => {
     inputBytes += chunk.length;
     if (inputBytes > MAX_STDIN_BYTES) {
         inputTooLarge = true;
-        input = '';
+        chunks.length = 0;
         return;
     }
-    input += chunk;
+    chunks.push(chunk);
 });
 process.stdin.on('end', async () => {
     try {
         if (inputTooLarge)
             return;
+        const input = Buffer.concat(chunks).toString('utf8');
         const data = JSON.parse(input);
         const sessionId = data.session_id;
         if (!sessionId)

@@ -610,6 +610,30 @@ function deployRepoNativePrebuilt(prebuiltName: string | null, repoPrebuilt: str
   if (!fs.existsSync(repoPrebuilt)) {
     return fallback('native prebuilt ' + prebuiltName + ' not found under ' + path.dirname(repoPrebuilt));
   }
+  const sumsPath = path.join(repo.binDir, 'SHA256SUMS');
+  if (!fs.existsSync(sumsPath)) {
+    return fallback('SHA256SUMS not found under ' + repo.binDir);
+  }
+  try {
+    let expectedHash: string | null = null;
+    for (const line of fs.readFileSync(sumsPath, 'utf8').split('\n')) {
+      const entry = /^([0-9a-f]{64})  (.+)$/.exec(line);
+      if (entry && entry[2] === prebuiltName) {
+        expectedHash = entry[1];
+        break;
+      }
+    }
+    if (!expectedHash) {
+      return fallback('SHA256SUMS has no entry for native prebuilt ' + prebuiltName);
+    }
+    const actualHash = crypto.createHash('sha256').update(fs.readFileSync(repoPrebuilt)).digest('hex');
+    if (actualHash !== expectedHash) {
+      return fallback('SHA256 mismatch for native prebuilt ' + prebuiltName);
+    }
+  } catch (e) {
+    return fallback('failed to verify native prebuilt ' + prebuiltName + ' against SHA256SUMS (' +
+      (e && e.message ? e.message : String(e)) + ')');
+  }
   try {
     fs.mkdirSync(central.hooksDir, { recursive: true });
     deployNativeBinary(repoPrebuilt, central.hookBin);
@@ -737,6 +761,11 @@ function linkInto(target: string, linkPath: string): string {
     return 'hardlink';
   } catch (e) { /* fall through */ }
   copyFileAtomic(target, linkPath);
+  if (!isWin) {
+    try {
+      if (fs.statSync(target).mode & 0o111) fs.chmodSync(linkPath, 0o755);
+    } catch (e) { /* best effort */ }
+  }
   return 'copy';
 }
 
@@ -799,9 +828,12 @@ function nativeRuntimeFaults(ap: AgentPaths): string[] {
   return faults;
 }
 
-function describeNativeRuntime(ap: AgentPaths): string {
-  const faults = nativeRuntimeFaults(ap);
-  if (!faults.length) return describeLink(linkState(ap.hookBin, central.hookBin)) + '; central ' + central.hookBin;
+function describeNativeRuntime(centralBin: NativeBinaryState, nativeLink: LinkState, agentBin: NativeBinaryState, centralBinPath: string, agentBinPath: string): string {
+  const faults: string[] = [];
+  if (!centralBin.ok) faults.push('central native binary ' + centralBin.detail);
+  if (!nativeLink.ok) faults.push('native link ' + describeLink(nativeLink) + ' at ' + agentBinPath);
+  if (!agentBin.ok) faults.push('agent native binary ' + agentBin.detail);
+  if (!faults.length) return describeLink(nativeLink) + '; central ' + centralBinPath;
   return 'UNHEALTHY — ' + faults.join('; ');
 }
 
@@ -2255,7 +2287,7 @@ function collectStatusData(): any {
   const codexPlugin = centralCodexPluginPayloadStatus();
   const expectedCodexVersion = codexPlugin.expectedVersion;
 
-  const agents = allAgentPaths().map(ap => {
+  const agents: any[] = allAgentPaths().map(ap => {
     if (ap.wiring !== 'hook-config') {
       const shim = shimState(ap);
       const entryWired = ap.wiring === 'opencode-plugin' ? opencodeEntryWired(ap) : null;
@@ -2274,6 +2306,8 @@ function collectStatusData(): any {
       return {
         name: ap.name,
         configDir: ap.configDir,
+        settingsLabel: ap.settingsLabel,
+        hookBin: ap.hookBin,
         wiring: ap.wiring,
         settingsValid: settingsReadable,
         settingsError: settingsReadable ? null : ap.settingsLabel + ' is not valid JSON',
@@ -2292,6 +2326,10 @@ function collectStatusData(): any {
     const nativeEvents = eventsForRuntime(hooks, 'native');
     const nodeEvents = eventsForRuntime(hooks, 'node');
     const invocationDrift = noncanonicalEvents(hooks, ap);
+    const wiredEventsForStatus: string[] = [];
+    for (const hook of hooks) {
+      if (wiredEventsForStatus.indexOf(hook.event) === -1) wiredEventsForStatus.push(hook.event);
+    }
     const links: Record<string, LinkState> = {
       dispatcher: linkState(ap.hookJs, central.hookJs),
       contracts: linkState(ap.hookContractsJs, central.hookContractsJs),
@@ -2307,12 +2345,14 @@ function collectStatusData(): any {
     return {
       name: ap.name,
       configDir: ap.configDir,
+      settingsLabel: ap.settingsLabel,
+      hookBin: ap.hookBin,
       wiring: ap.wiring,
       settingsValid: !error,
       settingsError: error ? error.message : null,
       shim: null,
       opencodeEntry: null,
-      wiredEvents: hooks.map(h => h.event),
+      wiredEvents: wiredEventsForStatus,
       runtime: { nativeEvents, nodeEvents },
       invocation: { canonical: invocationDrift.length === 0, noncanonicalEvents: invocationDrift },
       nativeBinary: nativeEvents.length ? nativeBinaryState(ap.hookBin) : null,
@@ -2328,128 +2368,106 @@ function collectStatusData(): any {
     };
   });
   const nativeConfigured = agents.some(a => a.runtime.nativeEvents.length > 0);
+  const nativeLinked = agents.some(a => a.nativeBinary !== null);
+  const nativeState = nativeLinked ? nativeBinaryState(central.hookBin) : null;
 
   return {
     installRoot: central.root,
     dispatcher: { present: dispatcherPresent, inSync },
-    configFolder: { present: cfg.present, path: central.cfgDir, external: configIsExternal },
-    manager: { present: managerPresent },
-    claudeSkill: { present: skillPresent },
-    codexPlugin,
+    configFolder: { present: cfg.present, path: central.cfgDir, linkPath: central.cfgLink, external: configIsExternal },
+    manager: { present: managerPresent, path: central.managerJs },
+    claudeSkill: { present: skillPresent, path: central.skillDir },
+    codexPlugin: {
+      present: codexPlugin.present,
+      version: codexPlugin.version,
+      expectedVersion: codexPlugin.expectedVersion,
+      stale: codexPlugin.stale,
+      path: central.codexPluginDir,
+      marketplaceRoot: central.codexMarketplaceRoot,
+    },
 
-    nativeDispatcher: { active: nativeConfigured, state: nativeConfigured ? nativeBinaryState(central.hookBin) : null },
+    nativeDispatcher: { active: nativeConfigured, state: nativeConfigured ? nativeState : null, linkedState: nativeState, path: central.hookBin },
     config: { fatal: cfg.fatal, routes: cfg.routes, issues: cfg.issues, desiredEvents: cfg.desiredEvents },
     agents
   };
 }
 
 function cmdStatus(): void {
-  if (jsonMode) { emitJson('status', collectStatusData()); return; }
-  const agentsP = allAgentPaths();
-
-  const dispatcherPresent = fs.existsSync(central.hookJs) && fs.existsSync(central.hookContractsJs);
-  const inSync = dispatcherPresent &&
-    sameFileContents(central.hookJs, repo.hookSourceJs) &&
-    sameFileContents(central.hookContractsJs, repo.contractsSourceJs);
-  const cfg = loadCentralConfig();
+  const status = collectStatusData();
+  if (jsonMode) { emitJson('status', status); return; }
 
   console.log('[baseline] status');
-  console.log('  install root   : ' + central.root);
-  console.log('  dispatcher     : ' + (dispatcherPresent
-    ? 'present' + (inSync ? ' (byte-identical to repo source)' : ' (DIFFERS from repo source — run install to refresh)')
+  console.log('  install root   : ' + status.installRoot);
+  console.log('  dispatcher     : ' + (status.dispatcher.present
+    ? 'present' + (status.dispatcher.inSync ? ' (byte-identical to repo source)' : ' (DIFFERS from repo source — run install to refresh)')
     : 'not present'));
-  console.log('  config folder  : ' + (cfg.present ? 'present at ' + central.cfgDir : 'missing (install will seed it)') +
-    (configIsExternal ? ' [external; ' + central.cfgLink + ' → it]' : ''));
-  const managerPresent = fs.existsSync(central.managerJs) && fs.existsSync(central.managerHookSourceJs) && fs.existsSync(central.managerContractsJs);
-  console.log('  manager        : ' + (managerPresent ? 'present at ' + central.managerJs : 'not deployed (install will deploy it)'));
-  const skillPresent = fs.existsSync(central.skillManifest) && fs.existsSync(central.skillMd);
-  console.log('  claude skill   : ' + (skillPresent ? 'present at ' + central.skillDir : 'not deployed (install will deploy it)'));
-  const codexPlugin = centralCodexPluginPayloadStatus();
-  const codexPluginDetail = !codexPlugin.present
+  console.log('  config folder  : ' + (status.configFolder.present ? 'present at ' + status.configFolder.path : 'missing (install will seed it)') +
+    (status.configFolder.external ? ' [external; ' + status.configFolder.linkPath + ' → it]' : ''));
+  console.log('  manager        : ' + (status.manager.present ? 'present at ' + status.manager.path : 'not deployed (install will deploy it)'));
+  console.log('  claude skill   : ' + (status.claudeSkill.present ? 'present at ' + status.claudeSkill.path : 'not deployed (install will deploy it)'));
+  const codexPluginDetail = !status.codexPlugin.present
     ? 'not deployed (install will deploy it)'
-    : codexPlugin.stale
-      ? 'STALE — deployed @ ' + (codexPlugin.version || 'missing version') + '; expected @ ' + codexPlugin.expectedVersion + ' (update will refresh)'
-      : 'present at ' + central.codexPluginDir + ' via ' + central.codexMarketplaceRoot + (codexPlugin.version ? ' @ ' + codexPlugin.version : '');
+    : status.codexPlugin.stale
+      ? 'STALE — deployed @ ' + (status.codexPlugin.version || 'missing version') + '; expected @ ' + status.codexPlugin.expectedVersion + ' (update will refresh)'
+      : 'present at ' + status.codexPlugin.path + ' via ' + status.codexPlugin.marketplaceRoot + (status.codexPlugin.version ? ' @ ' + status.codexPlugin.version : '');
   console.log('  codex plugin   : ' + codexPluginDetail);
 
-  if (cfg.fatal) console.log('  config         : INVALID — ' + cfg.fatal);
-  console.log('  routes         : ' + cfg.routes.length);
-  for (const r of cfg.routes) {
+  if (status.config.fatal) console.log('  config         : INVALID — ' + status.config.fatal);
+  console.log('  routes         : ' + status.config.routes.length);
+  for (const r of status.config.routes) {
     const bits = ['event=' + r.event, 'freq=' + r.freq];
     if (r.cwd !== undefined) bits.push('cwd=' + r.cwd);
     bits.push('doc=' + r.doc);
     console.log('    ' + r.id + ': ' + bits.join(', '));
   }
-  for (const issue of cfg.issues) {
+  for (const issue of status.config.issues) {
     console.log('    [' + issue.level + '] ' + issue.msg);
   }
 
-  const nativeConfigured = agentsP.some(ap => {
-    if (ap.wiring !== 'hook-config') {
-      if (!shimState(ap).ours) return false;
-      try { fs.lstatSync(ap.hookBin); return true; } catch (e) { return false; }
-    }
-    const { settings, error } = settingsForRead(ap);
-    return !error && eventsForRuntime(wiredHooks(settings, ap), 'native').length > 0;
-  });
-  if (nativeConfigured) {
-    const native = nativeBinaryState(central.hookBin);
+  if (status.nativeDispatcher.active) {
+    const native = status.nativeDispatcher.state;
     console.log('  native binary  : ' + (native.ok ? native.detail : 'UNHEALTHY — ' + native.detail));
   }
 
-  for (const ap of agentsP) {
-    if (ap.wiring !== 'hook-config') {
-      const shim = shimState(ap);
-      const entryWired = ap.wiring === 'opencode-plugin' ? opencodeEntryWired(ap) : null;
-      const supported = SHIM_EVENTS[ap.wiring] || [];
-      const deliverable = cfg.desiredEvents.filter(e => supported.indexOf(e) !== -1);
-      console.log('  agent ' + ap.name + ' @ ' + ap.configDir);
-      console.log('    shim         : ' + describeShimState(shim) +
-        (shim.ours && deliverable.length ? ' — serves [' + deliverable.join(', ') + ']' : ''));
-      if (ap.wiring === 'opencode-plugin') {
-        console.log('    opencode.json: ' + (entryWired ? 'plugin entry present'
-          : shim.ours ? 'PLUGIN ENTRY MISSING — run update' : 'no plugin entry'));
+  for (const agent of status.agents) {
+    if (agent.wiring !== 'hook-config') {
+      console.log('  agent ' + agent.name + ' @ ' + agent.configDir);
+      console.log('    shim         : ' + describeShimState(agent.shim) +
+        (agent.shim.ours && agent.wiredEvents.length ? ' — serves [' + agent.wiredEvents.join(', ') + ']' : ''));
+      if (agent.wiring === 'opencode-plugin') {
+        console.log('    opencode.json: ' + (agent.opencodeEntry ? 'plugin entry present'
+          : agent.shim.ours ? 'PLUGIN ENTRY MISSING — run update' : 'no plugin entry'));
       }
-      console.log('    dispatcher   : ' + describeLink(linkState(ap.hookJs, central.hookJs)));
-      let hasNativeLink = false;
-      try { fs.lstatSync(ap.hookBin); hasNativeLink = true; } catch (e) { /* absent */ }
-      if (hasNativeLink) console.log('    native       : ' + describeNativeRuntime(ap));
-      console.log('    contracts    : ' + describeLink(linkState(ap.hookContractsJs, central.hookContractsJs)));
-      console.log('    cfg folder   : ' + describeLink(dirLinkState(ap.cfgDir, central.cfgLink, CONFIG_MARKER)));
+      console.log('    dispatcher   : ' + describeLink(agent.links.dispatcher));
+      if (agent.nativeBinary) console.log('    native       : ' + describeNativeRuntime(status.nativeDispatcher.linkedState, agent.links.native, agent.nativeBinary, status.nativeDispatcher.path, agent.hookBin));
+      console.log('    contracts    : ' + describeLink(agent.links.contracts));
+      console.log('    cfg folder   : ' + describeLink(agent.links.cfg));
       continue;
     }
-    const { settings, error } = settingsForRead(ap);
-    const hooks = error ? [] : wiredHooks(settings, ap);
-    const nativeEvents = eventsForRuntime(hooks, 'native');
-    const nodeEvents = eventsForRuntime(hooks, 'node');
-    const invocationDrift = noncanonicalEvents(hooks, ap);
-    console.log('  agent ' + ap.name + ' @ ' + ap.configDir);
-    if (error) {
-      console.log('    ' + ap.settingsLabel.padEnd(13) + ': INVALID (' + error.message + ')');
+    console.log('  agent ' + agent.name + ' @ ' + agent.configDir);
+    if (!agent.settingsValid) {
+      console.log('    ' + agent.settingsLabel.padEnd(13) + ': INVALID (' + agent.settingsError + ')');
     } else {
-      const wired = wiredEvents(settings, ap);
       const runtimeBits: string[] = [];
-      if (nativeEvents.length) runtimeBits.push('native [' + nativeEvents.join(', ') + ']');
-      if (nodeEvents.length) runtimeBits.push('node [' + nodeEvents.join(', ') + ']');
-      console.log('    ' + ap.settingsLabel.padEnd(13) + ': ' + (wired.length ? 'wired [' + wired.join(', ') + '] via ' + runtimeBits.join('; ') : 'not wired'));
-      if (invocationDrift.length) {
-        console.log('    invocation   : UNHEALTHY — legacy/noncanonical for [' + invocationDrift.join(', ') + ']; run update');
+      if (agent.runtime.nativeEvents.length) runtimeBits.push('native [' + agent.runtime.nativeEvents.join(', ') + ']');
+      if (agent.runtime.nodeEvents.length) runtimeBits.push('node [' + agent.runtime.nodeEvents.join(', ') + ']');
+      console.log('    ' + agent.settingsLabel.padEnd(13) + ': ' + (agent.wiredEvents.length ? 'wired [' + agent.wiredEvents.join(', ') + '] via ' + runtimeBits.join('; ') : 'not wired'));
+      if (agent.invocation.noncanonicalEvents.length) {
+        console.log('    invocation   : UNHEALTHY — legacy/noncanonical for [' + agent.invocation.noncanonicalEvents.join(', ') + ']; run update');
       }
     }
-    console.log('    dispatcher   : ' + describeLink(linkState(ap.hookJs, central.hookJs)));
-    if (nativeEvents.length) console.log('    native       : ' + describeNativeRuntime(ap));
-    console.log('    contracts    : ' + describeLink(linkState(ap.hookContractsJs, central.hookContractsJs)));
-    console.log('    cfg folder   : ' + describeLink(dirLinkState(ap.cfgDir, central.cfgLink, CONFIG_MARKER)));
-    if (ap.skillDir) console.log('    skill plugin : ' + describeLink(dirLinkState(ap.skillDir, central.skillDir, SKILL_MARKER)));
-    if (ap.codexPlugin) {
-      const codex = codexPluginInspection(ap);
-      console.log('    marketplace  : ' + describeLink(codex.marketplace));
-      const stale = codexPluginVersionIsStale(codex, codexPlugin.expectedVersion);
-      console.log('    codex plugin : ' + (stale
-        ? 'STALE — installed @ ' + (codex.version || 'missing version') + '; expected @ ' + codexPlugin.expectedVersion + ' (run update)'
-        : describeLink(codex.plugin) + (codex.version ? ' @ ' + codex.version : '')));
+    console.log('    dispatcher   : ' + describeLink(agent.links.dispatcher));
+    if (agent.nativeBinary) console.log('    native       : ' + describeNativeRuntime(status.nativeDispatcher.linkedState, agent.links.native, agent.nativeBinary, status.nativeDispatcher.path, agent.hookBin));
+    console.log('    contracts    : ' + describeLink(agent.links.contracts));
+    console.log('    cfg folder   : ' + describeLink(agent.links.cfg));
+    if (agent.links.skill) console.log('    skill plugin : ' + describeLink(agent.links.skill));
+    if (agent.codex) {
+      console.log('    marketplace  : ' + describeLink(agent.links.codexMarketplace));
+      console.log('    codex plugin : ' + (agent.codex.stale
+        ? 'STALE — installed @ ' + (agent.codex.version || 'missing version') + '; expected @ ' + agent.codex.expectedVersion + ' (run update)'
+        : describeLink(agent.links.codexPlugin) + (agent.codex.version ? ' @ ' + agent.codex.version : '')));
 
-      if (codex.detail) console.log('    codex detail : ' + codex.detail);
+      if (agent.codex.detail) console.log('    codex detail : ' + agent.codex.detail);
     }
   }
 }
@@ -2933,6 +2951,7 @@ function readConfigObject(): any {
   if (r.missing || r.value === null || r.value === undefined) return { version: 1, routes: [] };
   const v = r.value;
   if (typeof v !== 'object' || Array.isArray(v)) fail('config.json root must be an object', 1, 'invalid_config');
+  if (v.version !== undefined && v.version !== 1) fail('config.json version must be 1 (got ' + JSON.stringify(v.version) + ')', 1, 'invalid_config');
   if (!Array.isArray(v.routes)) v.routes = [];
   return v;
 }
@@ -2993,6 +3012,7 @@ function cmdRouteAdd(argv: string[]): void {
 
   const cfg = readConfigObject();
   if (cfg.routes.some((r: any) => r && r.id === id)) fail('route add: a route with id "' + id + '" already exists', 2, 'duplicate');
+  if (cfg.routes.length >= MAX_ROUTES) fail('route add: route cap is ' + MAX_ROUTES, 2, 'invalid_args');
   const route: Route = { id, event, freq, doc };
   if (cwd) route.cwd = cwd;
   cfg.routes.push(route);

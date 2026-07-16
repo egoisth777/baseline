@@ -6,7 +6,10 @@ import * as path from 'path';
 import * as crypto from 'crypto';
 import { builtinModules } from 'module';
 import { spawnSync } from 'child_process';
-import { ROUTE_KEYS, SESSION_PHASES, SUPPORTED_EVENTS, isSupportedRouteEvent } from './contracts';
+import {
+  ROUTE_KEYS, SESSION_PHASES, SUPPORTED_EVENTS,
+  cwdMatches, eventMatches, isSupportedRouteEvent, parseEvent, safeDocPath
+} from './contracts';
 
 const root = path.resolve(__dirname, '..');
 const manage = path.join(root, 'scripts', 'manage.js');
@@ -113,9 +116,13 @@ function runInstalledWithoutBaselineEnv(args: string[], cfg: string, home: strin
 // Drive the deployed dispatcher directly with one synthetic hook payload. It reads
 // CLAUDE_CONFIG_DIR for the linked cfg/baseline and the counter file.
 function hook(input: any, cfg: string) {
+  const env = Object.assign({}, process.env,
+    { CLAUDE_CONFIG_DIR: cfg, CODEX_HOME: codexFor(cfg), BASELINE_HOME: homeFor(cfg) },
+    shimAgentEnv(cfg));
+  delete env.BASELINE_AGENT_CONFIG_DIR;
   return spawnSync(process.execPath, [dispatcher], {
     input: JSON.stringify(input),
-    env: Object.assign({}, process.env, { CLAUDE_CONFIG_DIR: cfg, CODEX_HOME: codexFor(cfg), BASELINE_HOME: homeFor(cfg) }, shimAgentEnv(cfg)),
+    env,
     encoding: 'utf8'
   });
 }
@@ -935,7 +942,10 @@ function testCodexResolvesBareNativeExecutableAlias(): void {
 // PATH. The native target lives only in that CWD; PATHEXT proves the resolver
 // finds its .exe target without a shell fallback.
 function testWindowsCodexResolvesBareCwdExecutableBeforePath(): void {
-  if (process.platform !== 'win32') return;
+  if (process.platform !== 'win32') {
+    console.log('  (skip) testWindowsCodexResolvesBareCwdExecutableBeforePath: Windows-only.');
+    return;
+  }
   const cfg = tempConfig('baseline test cwd & native-');
   const home = homeFor(cfg);
   const codex = codexFor(cfg);
@@ -957,7 +967,10 @@ function testWindowsCodexResolvesBareCwdExecutableBeforePath(): void {
 // npm publishes Codex through a .cmd shim on Windows. This must work from the
 // normal bare `codex` name, rather than only through an explicit shim path.
 function testCodexResolvesBareBatchShimAlias(): void {
-  if (process.platform !== 'win32') return;
+  if (process.platform !== 'win32') {
+    console.log('  (skip) testCodexResolvesBareBatchShimAlias: Windows-only.');
+    return;
+  }
   const cfg = tempConfig('baseline test bare & batch-');
   const home = homeFor(cfg);
   const codex = codexFor(cfg);
@@ -1005,6 +1018,7 @@ function testCodexOwnershipAcceptsCanonicalSymlinkedHome(): void {
   try {
     fs.symlinkSync(realHome, linkedHome, process.platform === 'win32' ? 'junction' : 'dir');
   } catch {
+    console.log('  (skip) testCodexOwnershipAcceptsCanonicalSymlinkedHome: symlink/junction creation unavailable.');
     return; // Windows policy can prohibit both symlink and junction creation.
   }
   const env = { BASELINE_TEST_FAKE_CODEX_CANONICAL_PATHS: '1' };
@@ -1403,7 +1417,8 @@ function testNativeDispatchParity(): void {
     return dir;
   }
 
-  const env = process.env;
+  const env = Object.assign({}, process.env);
+  delete env.BASELINE_AGENT_CONFIG_DIR;
   const nDir = fixture();
   const jDir = fixture();
   const native = (dir: string, input: any) => spawnSync(nativeBin, ['--agent-config', dir], { input: JSON.stringify(input), encoding: 'utf8', env });
@@ -1749,6 +1764,56 @@ function fireBodies(res: { stdout: string }): string | null {
   return JSON.parse(out).hookSpecificOutput.additionalContext;
 }
 
+function testContractsPureHelpers(): void {
+  assert.deepStrictEqual(parseEvent('SessionStart.compact'), { base: 'SessionStart', phase: 'compact' });
+  const bare = parseEvent('UserPromptSubmit');
+  assert.deepStrictEqual(bare, { base: 'UserPromptSubmit' });
+  assert.strictEqual(bare.phase, undefined, 'bare events must have an undefined phase');
+  assert.deepStrictEqual(parseEvent('a.b.c'), { base: 'a', phase: 'b.c' });
+
+  for (const event of SUPPORTED_EVENTS) {
+    assert.strictEqual(isSupportedRouteEvent(event), true, event + ' should be a supported bare route event');
+  }
+  assert.strictEqual(isSupportedRouteEvent('SessionStart.compact'), true, 'recognized SessionStart phase should be supported');
+  assert.strictEqual(isSupportedRouteEvent('PreToolUse.startup'), false, 'non-SessionStart phases should be unsupported');
+  assert.strictEqual(isSupportedRouteEvent('Notification'), false, 'unsupported base event should be rejected');
+
+  for (const source of [undefined, 'startup', 'compact']) {
+    assert.strictEqual(eventMatches('UserPromptSubmit', 'UserPromptSubmit', source), true,
+      'bare route must match UserPromptSubmit regardless of source');
+  }
+  assert.strictEqual(eventMatches('SessionStart.compact', 'SessionStart', 'compact'), true,
+    'phased route must match its base event and phase');
+  assert.strictEqual(eventMatches('SessionStart.compact', 'SessionStart', 'startup'), false,
+    'phased route must reject a different source');
+  assert.strictEqual(eventMatches('SessionStart.compact', 'UserPromptSubmit', 'compact'), false,
+    'phased route must reject a different hook event');
+
+  // cwdMatches delegates path normalization to the host path module. Keep the
+  // literal Windows paths in the Windows runtime, and use equivalent native
+  // paths elsewhere while exercising the isWin case-folding branch.
+  const routeCwd = process.platform === 'win32' ? 'C:\\foo' : path.join(os.tmpdir(), 'foo');
+  const siblingCwd = routeCwd + 'bar';
+  const subdirectoryCwd = process.platform === 'win32' ? 'C:\\foo\\sub' : path.join(routeCwd, 'sub');
+  assert.strictEqual(cwdMatches(routeCwd, siblingCwd, true), false,
+    'Windows cwd matching must not accept a sibling-prefix collision');
+  assert.strictEqual(cwdMatches(routeCwd, subdirectoryCwd, true), true,
+    'Windows cwd matching must accept a true subdirectory');
+  assert.strictEqual(cwdMatches(routeCwd, routeCwd, true), true,
+    'Windows cwd matching must accept the exact directory');
+  assert.strictEqual(cwdMatches(routeCwd.toUpperCase(), subdirectoryCwd.toLowerCase(), true), true,
+    'Windows cwd matching must be case-insensitive');
+
+  const cfgDir = path.join(os.tmpdir(), 'baseline-contracts-unit');
+  assert.strictEqual(safeDocPath(path.resolve(cfgDir, 'absolute.md'), cfgDir), null,
+    'absolute doc paths must be rejected');
+  assert.strictEqual(safeDocPath('../escape.md', cfgDir), null,
+    'doc paths escaping the config folder must be rejected');
+  assert.strictEqual(safeDocPath('docs/../docs/x.md', cfgDir), path.resolve(cfgDir, 'docs', 'x.md'),
+    'normalized in-config doc paths must be accepted');
+  assert.strictEqual(safeDocPath('', cfgDir), null, 'empty doc paths must be rejected');
+}
+
 function testPerRouteCountersIndependent(): void {
   const cfg = tempConfig();
   const home = homeFor(cfg);
@@ -1912,6 +1977,7 @@ function testDocSymlinkEscapeRejected(): void {
   try {
     fs.symlinkSync(path.join(home, 'secret.md'), link);
   } catch (e) {
+    console.log('  (skip) testDocSymlinkEscapeRejected: symlink creation unavailable.');
     return; // Windows without symlink privilege: covered where the platform allows it.
   }
   setCentralConfig(home, [
@@ -1940,6 +2006,68 @@ function testOversizeDocSkipped(): void {
   const doctor = run(['doctor'], cfg);
   assert.notStrictEqual(doctor.status, 0, 'doctor should fail on doc over context cap');
   assert.match(doctor.stdout, /10,000 character context cap/);
+}
+
+function testDocInjectionCharCapBoundaries(): void {
+  const cfg = tempConfig();
+  const home = homeFor(cfg);
+  assert.strictEqual(run(['install'], cfg).status, 0);
+
+  const asciiAtCap = 'A'.repeat(10_000);
+  assert.strictEqual(asciiAtCap.length, 10_000, 'ASCII at-cap fixture must be exactly 10,000 characters');
+  setCentralConfig(home, [
+    { id: 'ascii-at-cap', event: 'UserPromptSubmit', freq: 1, doc: 'docs/ascii-at-cap.md' }
+  ], { 'docs/ascii-at-cap.md': asciiAtCap });
+  assert.strictEqual(fireBodies(hook({ session_id: 'ascii-at-cap', hook_event_name: 'UserPromptSubmit', cwd: cfg }, cfg)),
+    asciiAtCap, 'a 10,000-character ASCII doc must be injected verbatim');
+
+  const asciiOverCap = 'B'.repeat(10_001);
+  assert.strictEqual(asciiOverCap.length, 10_001, 'ASCII over-cap fixture must be exactly 10,001 characters');
+  setCentralConfig(home, [
+    { id: 'ascii-over-cap', event: 'UserPromptSubmit', freq: 1, doc: 'docs/ascii-over-cap.md' }
+  ], { 'docs/ascii-over-cap.md': asciiOverCap });
+  const asciiOver = hook({ session_id: 'ascii-over-cap', hook_event_name: 'UserPromptSubmit', cwd: cfg }, cfg);
+  assert.strictEqual((asciiOver.stdout || '').trim(), '', 'a 10,001-character ASCII doc must emit no JSON');
+
+  const rocket = '🚀';
+  const emojiAtCap = rocket.repeat(4_999);
+  assert.strictEqual(emojiAtCap.length, 9_998, '4,999 rockets must occupy 9,998 UTF-16 code units');
+  setCentralConfig(home, [
+    { id: 'emoji-at-cap', event: 'UserPromptSubmit', freq: 1, doc: 'docs/emoji-at-cap.md' }
+  ], { 'docs/emoji-at-cap.md': emojiAtCap });
+  assert.strictEqual(fireBodies(hook({ session_id: 'emoji-at-cap', hook_event_name: 'UserPromptSubmit', cwd: cfg }, cfg)),
+    emojiAtCap, 'a 9,998-code-unit emoji doc must be injected verbatim');
+
+  const emojiOverCap = rocket.repeat(5_001);
+  assert.strictEqual(emojiOverCap.length, 10_002, '5,001 rockets must occupy 10,002 UTF-16 code units');
+  setCentralConfig(home, [
+    { id: 'emoji-over-cap', event: 'UserPromptSubmit', freq: 1, doc: 'docs/emoji-over-cap.md' }
+  ], { 'docs/emoji-over-cap.md': emojiOverCap });
+  const emojiOver = hook({ session_id: 'emoji-over-cap', hook_event_name: 'UserPromptSubmit', cwd: cfg }, cfg);
+  assert.strictEqual((emojiOver.stdout || '').trim(), '', 'a 10,002-code-unit emoji doc must emit no JSON');
+}
+
+function testCombinedDocInjectionCapSkipsMiddleBody(): void {
+  const cfg = tempConfig();
+  const home = homeFor(cfg);
+  assert.strictEqual(run(['install'], cfg).status, 0);
+  const doc1 = 'A'.repeat(6_000);
+  const doc2 = 'B'.repeat(6_000);
+  const doc3 = 'C'.repeat(1_000);
+  setCentralConfig(home, [
+    { id: 'first', event: 'UserPromptSubmit', freq: 1, doc: 'docs/first.md' },
+    { id: 'second', event: 'UserPromptSubmit', freq: 1, doc: 'docs/second.md' },
+    { id: 'third', event: 'UserPromptSubmit', freq: 1, doc: 'docs/third.md' }
+  ], {
+    'docs/first.md': doc1,
+    'docs/second.md': doc2,
+    'docs/third.md': doc3
+  });
+
+  const body = fireBodies(hook({ session_id: 'combined-cap', hook_event_name: 'UserPromptSubmit', cwd: cfg }, cfg));
+  assert.strictEqual(body, doc1 + '\n\n' + doc3,
+    'the dispatcher must skip the over-cap middle body and append the later fitting body');
+  assert.ok(!body!.includes(doc2), 'the skipped middle body must not appear in additionalContext');
 }
 
 // --- doctor / verify --------------------------------------------------------
@@ -3350,6 +3478,7 @@ const TESTS: Array<[string, () => void]> = [
   ['testConfigDrivenWiringAndUnwire', testConfigDrivenWiringAndUnwire],
   ['testCoResidentHookPreserved', testCoResidentHookPreserved],
   ['testBaselineHookDoesNotInheritMatcher', testBaselineHookDoesNotInheritMatcher],
+  ['testContractsPureHelpers', testContractsPureHelpers],
   ['testPerRouteCountersIndependent', testPerRouteCountersIndependent],
   ['testMalformedCounterArrayDoesNotBreakFrequency', testMalformedCounterArrayDoesNotBreakFrequency],
   ['testEventNameSemantics', testEventNameSemantics],
@@ -3360,6 +3489,8 @@ const TESTS: Array<[string, () => void]> = [
   ['testDocPathTraversalRejected', testDocPathTraversalRejected],
   ['testDocSymlinkEscapeRejected', testDocSymlinkEscapeRejected],
   ['testOversizeDocSkipped', testOversizeDocSkipped],
+  ['testDocInjectionCharCapBoundaries', testDocInjectionCharCapBoundaries],
+  ['testCombinedDocInjectionCapSkipsMiddleBody', testCombinedDocInjectionCapSkipsMiddleBody],
   ['testDoctorReportsAndFixes', testDoctorReportsAndFixes],
   ['testDoctorDetectsDanglingHookLinks', testDoctorDetectsDanglingHookLinks],
   ['testDoctorDetectsMissingDoc', testDoctorDetectsMissingDoc],

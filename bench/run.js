@@ -240,11 +240,19 @@ function enforceBudgets(results) {
   } else {
     process.stdout.write('bench:check RSS budget not pinned yet (TODO after native engine); skipping RSS gate.\n');
   }
+  if (baseline.ok === false) {
+    process.stdout.write('bench:check ' + baseline.name + ' output mismatch — BREACH\n');
+    bad = true;
+  }
 
   // Native hot-path budgets (R-009, decision #18). Enforced where the native lane ran and
   // its numbers are obtainable; skip-with-notice when the lane skipped (no prebuilt for this
   // platform) or its peak RSS is n/a (e.g. Windows) — never a false green.
   const native = results.find((r) => r.name === 'baseline-native');
+  if (native && !native.skipped && !native.error && native.ok === false) {
+    process.stdout.write('bench:check ' + native.name + ' output mismatch — BREACH\n');
+    bad = true;
+  }
   const nb = budgets.native;
   if (nb && native && !native.skipped && !native.error) {
     if (nb.latencyP95Ms != null && native.p95 != null) {
