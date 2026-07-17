@@ -25,13 +25,32 @@
 import * as fs from 'fs';
 import * as path from 'path';
 import * as os from 'os';
+import * as crypto from 'crypto';
+import { isUtf8 } from 'buffer';
 import {
+  CONFIG_DIR,
+  CONFIG_FILE,
+  COUNTER_FILE,
+  COUNTER_KEY_SEPARATOR,
+  DIAGNOSTICS_ENV,
+  DOCUMENT_SEPARATOR,
+  LOCK_RETRY_MS,
+  LOCK_SUFFIX,
+  MAX_COMBINED_CONTEXT_CHARS,
   MAX_CONFIG_BYTES,
+  MAX_COUNTER_BYTES,
   MAX_DOC_BYTES,
   MAX_DOC_CHARS,
+  MAX_LOCK_WAIT_MS,
   MAX_ROUTES,
+  MAX_STDIN_BYTES,
+  OUTPUT_CONTEXT_FIELD,
+  OUTPUT_EVENT_FIELD,
+  OUTPUT_OUTER_FIELD,
+  PRUNE_MS,
   Route,
   SLUG,
+  STALE_LOCK_MS,
   SUPPORTED_EVENTS,
   cwdMatches as matchCwd,
   eventMatches as matchEvent,
@@ -55,14 +74,6 @@ interface HookInput {
   source?: string;
 }
 
-// Drop counter entries untouched for longer than this (stale sessions).
-const PRUNE_MS = 7 * 24 * 60 * 60 * 1000;
-const MAX_STDIN_BYTES = 1024 * 1024;
-const MAX_COUNTER_BYTES = 1024 * 1024;
-const MAX_LOCK_WAIT_MS = 2000;
-const LOCK_RETRY_MS = 10;
-const STALE_LOCK_MS = 5000;
-
 function argValue(name: string): string | null {
   for (let i = 2; i < process.argv.length; i++) {
     const arg = process.argv[i];
@@ -73,18 +84,23 @@ function argValue(name: string): string | null {
 }
 
 const agentDir =
-  process.env.BASELINE_AGENT_CONFIG_DIR ||
   argValue('--agent-config') ||
+  process.env.BASELINE_AGENT_CONFIG_DIR ||
   process.env.CLAUDE_CONFIG_DIR ||
   process.env.CODEX_HOME ||
   path.join(os.homedir(), '.claude');
 // The agent's config folder links back to <install root>/cfg, so reading here is
 // transparently reading the configured config folder — the dispatcher resolves only
 // via the agent dir and knows nothing about BASELINE_HOME / BASELINE_CFG.
-const cfgDir = path.join(agentDir, 'cfg', 'baseline');
-const configPath = path.join(cfgDir, 'config.json');
-const counterPath = path.join(agentDir, '.baseline-counters.json');
-const counterLockPath = counterPath + '.lock';
+const cfgDir = path.join(agentDir, CONFIG_DIR);
+const configPath = path.join(cfgDir, CONFIG_FILE);
+const counterPath = path.join(agentDir, COUNTER_FILE);
+const counterLockPath = counterPath + LOCK_SUFFIX;
+
+function diagnose(code: string): void {
+  if (process.env[DIAGNOSTICS_ENV] !== '1') return;
+  try { process.stderr.write('baseline: ' + code + '\n'); } catch (e) {}
+}
 
 interface ValidConfig {
   routes: Route[];
@@ -99,21 +115,22 @@ function loadValidConfig(): ValidConfig {
   let raw: string;
   try {
     const st = fs.statSync(configPath);
-    if (st.size > MAX_CONFIG_BYTES) return empty;
+    if (st.size > MAX_CONFIG_BYTES) { diagnose('CONFIG_TOO_LARGE'); return empty; }
     raw = fs.readFileSync(configPath, 'utf8');
-    if (Buffer.byteLength(raw, 'utf8') > MAX_CONFIG_BYTES) return empty;
+    if (Buffer.byteLength(raw, 'utf8') > MAX_CONFIG_BYTES) { diagnose('CONFIG_TOO_LARGE'); return empty; }
   } catch (e) {
+    diagnose('CONFIG_READ');
     return empty;
   }
 
   let cfg: any;
-  try { cfg = JSON.parse(raw); } catch (e) { return empty; }
-  if (!cfg || typeof cfg !== 'object' || Array.isArray(cfg)) return empty;
+  try { cfg = JSON.parse(raw); } catch (e) { diagnose('CONFIG_INVALID'); return empty; }
+  if (!cfg || typeof cfg !== 'object' || Array.isArray(cfg)) { diagnose('CONFIG_INVALID'); return empty; }
   // version: missing => assume 1; any value other than 1 => inject nothing.
-  if (cfg.version !== undefined && cfg.version !== 1) return empty;
+  if (cfg.version !== undefined && cfg.version !== 1) { diagnose('CONFIG_VERSION'); return empty; }
 
   const routes = Array.isArray(cfg.routes) ? cfg.routes : [];
-  if (routes.length > MAX_ROUTES) return empty;
+  if (routes.length > MAX_ROUTES) { diagnose('CONFIG_ROUTES_CAP'); return empty; }
 
   const seen: { [id: string]: true } = {};
   const out: Route[] = [];
@@ -152,18 +169,25 @@ function cwdMatches(route: Route, data: HookInput): boolean {
 // unreadable, over-cap, or — defensively — out of range). The content read is async so
 // several due docs can be read concurrently (R-011); the path-safety realpath check
 // stays synchronous, and the byte/char caps are unchanged.
-async function readDocAsync(doc: string): Promise<string | null> {
+interface DocRead {
+  body: string | null;
+  invalidUtf8: boolean;
+}
+
+async function readDocAsync(doc: string): Promise<DocRead> {
   const p = safeRealDocPath(doc, cfgDir);
-  if (!p) return null;
+  if (!p) return { body: null, invalidUtf8: false };
   try {
     const st = await fs.promises.stat(p);
-    if (st.size > MAX_DOC_BYTES) return null;
-    const body = await fs.promises.readFile(p, 'utf8');
-    if (Buffer.byteLength(body, 'utf8') > MAX_DOC_BYTES) return null;
-    if (body.length > MAX_DOC_CHARS) return null;
-    return body;
+    if (st.size > MAX_DOC_BYTES) return { body: null, invalidUtf8: false };
+    const bytes = await fs.promises.readFile(p);
+    if (bytes.length > MAX_DOC_BYTES) return { body: null, invalidUtf8: false };
+    if (!isUtf8(bytes)) return { body: null, invalidUtf8: true };
+    const body = bytes.toString('utf8');
+    if (body.length > MAX_DOC_CHARS) return { body: null, invalidUtf8: false };
+    return { body, invalidUtf8: false };
   } catch (e) {
-    return null;
+    return { body: null, invalidUtf8: false };
   }
 }
 
@@ -181,20 +205,45 @@ function readCounters(): Counters {
   }
 }
 
-function writeCounters(counters: Counters): void {
+function counterDestinationSafe(): boolean {
   try {
     const st = fs.lstatSync(counterPath);
-    if (st.isSymbolicLink()) return;
-  } catch (e) {
-    // ENOENT — fine, file will be created.
+    return st.isFile() && !st.isSymbolicLink();
+  } catch (e: any) {
+    return !!e && e.code === 'ENOENT';
   }
-  try {
-    const tmp = counterPath + '.' + process.pid + '.' + Date.now() + '.' + Math.random().toString(16).slice(2) + '.tmp';
-    fs.writeFileSync(tmp, JSON.stringify(counters), 'utf8');
-    fs.renameSync(tmp, counterPath); // atomic replace
-  } catch (e) {
-    // Best-effort; never break the agent over counter I/O.
+}
+
+function writeCounters(counters: Counters): void {
+  if (!counterDestinationSafe()) { diagnose('COUNTER_DESTINATION'); return; }
+  const flags = fs.constants.O_CREAT | fs.constants.O_EXCL | fs.constants.O_WRONLY |
+    (typeof fs.constants.O_NOFOLLOW === 'number' ? fs.constants.O_NOFOLLOW : 0);
+  const body = JSON.stringify(counters);
+
+  for (let attempt = 0; attempt < 8; attempt++) {
+    const tmp = counterPath + '.' + crypto.randomBytes(16).toString('hex') + '.tmp';
+    let fd: number | null = null;
+    let created = false;
+    try {
+      fd = fs.openSync(tmp, flags, 0o600);
+      created = true;
+      fs.writeFileSync(fd, body, 'utf8');
+      fs.fsyncSync(fd);
+      fs.closeSync(fd);
+      fd = null;
+      if (!counterDestinationSafe()) { diagnose('COUNTER_DESTINATION'); return; }
+      fs.renameSync(tmp, counterPath);
+      created = false;
+      return;
+    } catch (e: any) {
+      if (!e || e.code !== 'EEXIST') diagnose('COUNTER_IO');
+      if (!e || e.code !== 'EEXIST') return;
+    } finally {
+      if (fd !== null) { try { fs.closeSync(fd); } catch (e) {} }
+      if (created) { try { fs.unlinkSync(tmp); } catch (e) {} }
+    }
   }
+  diagnose('COUNTER_TEMP_COLLISION');
 }
 
 function sleep(ms: number): void {
@@ -239,14 +288,14 @@ process.stdin.on('data', chunk => {
 });
 process.stdin.on('end', async () => {
   try {
-    if (inputTooLarge) return;
+    if (inputTooLarge) { diagnose('INPUT_TOO_LARGE'); return; }
     const input = Buffer.concat(chunks).toString('utf8');
     const data: HookInput = JSON.parse(input);
     const sessionId = data.session_id;
-    if (!sessionId) return; // No stable key → nothing to count.
+    if (!sessionId) { diagnose('INPUT_SESSION'); return; } // No stable key → nothing to count.
 
     const event = data.hook_event_name;
-    if (typeof event !== 'string' || SUPPORTED_EVENTS.indexOf(event) === -1) return;
+    if (typeof event !== 'string' || SUPPORTED_EVENTS.indexOf(event) === -1) { diagnose('INPUT_EVENT'); return; }
 
     // Select the routes this invocation activates (event name + cwd).
     const config = loadValidConfig();
@@ -255,7 +304,7 @@ process.stdin.on('end', async () => {
     if (!selected.length) return;
 
     const due: Route[] = [];
-    if (!acquireCounterLock()) return;
+    if (!acquireCounterLock()) { diagnose('COUNTER_LOCK'); return; }
     try {
       const now = Date.now();
       const counters = readCounters();
@@ -271,7 +320,7 @@ process.stdin.on('end', async () => {
       // Bump each selected route's per-route counter; collect the ones now due.
       // The counter domain is "matching invocations", so only selected routes count.
       for (const r of selected) {
-        const key = sessionId + ':' + r.id;
+        const key = sessionId + COUNTER_KEY_SEPARATOR + r.id;
         const prev = counters[key] && typeof counters[key].count === 'number' ? counters[key].count : 0;
         const count = prev + 1;
         counters[key] = { count: count, ts: now };
@@ -289,22 +338,27 @@ process.stdin.on('end', async () => {
     // which read finishes first. No headers, route-id labels, or replacement pass: every
     // accepted body is injected byte-for-byte as read from its static doc.
     const rawBodies = await Promise.all(due.map(r => readDocAsync(r.doc)));
+    if (rawBodies.some(result => result.invalidUtf8)) {
+      diagnose('DOC_INVALID_UTF8');
+      return;
+    }
     const bodies: string[] = [];
     for (let i = 0; i < due.length; i++) {
-      const body = rawBodies[i];
+      const body = rawBodies[i].body;
       if (body === null) continue;
-      const joined = bodies.length ? bodies.join('\n\n') + '\n\n' + body : body;
-      if (joined.length <= MAX_DOC_CHARS) bodies.push(body);
+      const joined = bodies.length ? bodies.join(DOCUMENT_SEPARATOR) + DOCUMENT_SEPARATOR + body : body;
+      if (joined.length <= MAX_COMBINED_CONTEXT_CHARS) bodies.push(body);
     }
     if (!bodies.length) return;
 
     process.stdout.write(JSON.stringify({
-      hookSpecificOutput: {
-        hookEventName: event,
-        additionalContext: bodies.join('\n\n')
+      [OUTPUT_OUTER_FIELD]: {
+        [OUTPUT_EVENT_FIELD]: event,
+        [OUTPUT_CONTEXT_FIELD]: bodies.join(DOCUMENT_SEPARATOR)
       }
     }));
   } catch (e) {
     // Silent fail — a hook error must never block the agent.
+    diagnose('INTERNAL');
   }
 });

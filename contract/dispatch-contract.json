@@ -1,0 +1,32 @@
+{
+  "schemaVersion": 1,
+  "events": ["UserPromptSubmit", "SessionStart", "PreToolUse", "PostToolUse"],
+  "sessionPhases": ["startup", "resume", "clear", "compact"],
+  "routeKeys": ["id", "event", "freq", "cwd", "doc"],
+  "caps": {
+    "configBytes": 65536,
+    "docBytes": 65536,
+    "docChars": 10000,
+    "stdinBytes": 1048576,
+    "counterBytes": 1048576,
+    "routes": 64,
+    "combinedContextChars": 10000
+  },
+  "pruneMs": 604800000,
+  "lockProtocol": { "maxWaitMs": 2000, "retryMs": 10, "staleMs": 5000 },
+  "wire": {
+    "outerField": "hookSpecificOutput",
+    "eventField": "hookEventName",
+    "contextField": "additionalContext",
+    "documentSeparator": "\n\n",
+    "counterKeySeparator": ":"
+  },
+  "layout": {
+    "configDir": "cfg/baseline",
+    "configFile": "config.json",
+    "counterFile": ".baseline-counters.json",
+    "lockSuffix": ".lock",
+    "defaultAgentDir": ".claude"
+  },
+  "diagnosticsEnv": "BASELINE_DIAGNOSTICS"
+}

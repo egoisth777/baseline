@@ -5,6 +5,11 @@ $ErrorActionPreference = "Stop"
 $root = $PSScriptRoot
 Set-Location $root
 
+& node tools/generate-contracts.js
+if ($LASTEXITCODE -ne 0) { throw "Contract generation failed (node exited $LASTEXITCODE)." }
+& node tools/generate-contracts.js --check
+if ($LASTEXITCODE -ne 0) { throw "Generated contract drift check failed (node exited $LASTEXITCODE)." }
+
 # Zig does the cross-compiling. Without it we cannot build.
 $zig = Get-Command zig -ErrorAction SilentlyContinue
 if (-not $zig) {
@@ -16,6 +21,10 @@ if ($zigVersion -notmatch '^0\.16\.') {
 	Write-Error "Zig 0.16.x is required; found $zigVersion."
 	exit 1
 }
+
+Write-Host "Testing native modules..."
+& zig test src/native/test.zig
+if ($LASTEXITCODE -ne 0) { throw "Native module tests failed (zig exited $LASTEXITCODE)." }
 
 if (-not (Test-Path "bin")) {
 	New-Item -ItemType Directory -Path "bin" | Out-Null

@@ -11,6 +11,9 @@ done
 SCRIPT_DIR="$(cd -P "$(dirname "$SOURCE")" >/dev/null 2>&1 && pwd)"
 cd "$SCRIPT_DIR"
 
+node tools/generate-contracts.js
+node tools/generate-contracts.js --check
+
 # Zig does the cross-compiling. Without it we cannot build.
 if ! command -v zig >/dev/null 2>&1; then
 	echo "Error: Zig is required to build the recital binaries, but 'zig' was not found on your PATH." >&2
@@ -25,6 +28,9 @@ case "$ZIG_VERSION" in
 		exit 1
 		;;
 esac
+
+echo "Testing native modules..."
+zig test src/native/test.zig
 
 mkdir -p bin
 

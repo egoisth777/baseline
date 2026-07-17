@@ -48,6 +48,7 @@ const path = require("path");
 const os = require("os");
 const crypto = require("crypto");
 const readline = require("readline");
+const buffer_1 = require("buffer");
 const child_process_1 = require("child_process");
 const contracts_1 = require("./contracts");
 // --- constants -------------------------------------------------------------
@@ -143,6 +144,7 @@ const central = {
     hookJs: path.join(installRoot, 'hooks', 'baseline-recital.js'),
     hookBin: path.join(installRoot, 'hooks', nativeBinName), // native prebuilt when deployed
     hookContractsJs: path.join(installRoot, 'hooks', 'contracts.js'),
+    hookGeneratedContractJs: path.join(installRoot, 'hooks', 'generated-contract.js'),
     cfgLink: cfgLink, // <installRoot>/cfg — what agents link to (real dir, or symlink to cfgReal)
     cfgDir: cfgReal, // the real config folder (flat: config.json + docs/)
     config: path.join(cfgReal, 'config.json'),
@@ -153,6 +155,7 @@ const central = {
     managerJs: path.join(installRoot, 'scripts', 'manage.js'),
     managerHookSourceJs: path.join(installRoot, 'scripts', 'baseline-recital.js'),
     managerContractsJs: path.join(installRoot, 'scripts', 'contracts.js'),
+    managerGeneratedContractJs: path.join(installRoot, 'scripts', 'generated-contract.js'),
     installedClaudeManifest: path.join(installRoot, '.claude-plugin', 'plugin.json'),
     installedCodexManifest: path.join(installRoot, '.codex-plugin', 'plugin.json'),
     installedPresetsDir: path.join(installRoot, 'presets'),
@@ -174,6 +177,7 @@ const repo = {
     managerSourceJs: path.join(repoRoot, 'scripts', 'manage.js'),
     hookSourceJs: path.join(repoRoot, 'scripts', 'baseline-recital.js'),
     contractsSourceJs: path.join(repoRoot, 'scripts', 'contracts.js'),
+    generatedContractSourceJs: path.join(repoRoot, 'scripts', 'generated-contract.js'),
     presetsDir: path.join(repoRoot, 'presets'),
     binDir: path.join(repoRoot, 'bin'),
     // Source of truth for plugin manifests, copied into installed control-surface payloads.
@@ -242,6 +246,7 @@ function agentPaths(agent) {
         hookJs: path.join(d, 'hooks', 'baseline-recital.js'),
         hookBin: path.join(d, 'hooks', nativeBinName),
         hookContractsJs: path.join(d, 'hooks', 'contracts.js'),
+        hookGeneratedContractJs: path.join(d, 'hooks', 'generated-contract.js'),
         cfgDir: path.join(d, 'cfg', 'baseline'),
         skillDir: agent.skillPlugin ? path.join(d, 'skills', 'baseline') : null,
         codexPlugin: agent.codexPlugin,
@@ -1117,6 +1122,14 @@ function piShimSource(ap) {
         'const HOOK_JS = ' + JSON.stringify(ap.hookJs) + '; // Node dispatcher fallback',
         'const TIMEOUT_MS = 5000;',
         '',
+        'function dispatcherEnv(): NodeJS.ProcessEnv {',
+        '  const env = { ...process.env };',
+        '  delete env.BASELINE_AGENT_CONFIG_DIR;',
+        '  delete env.CLAUDE_CONFIG_DIR;',
+        '  delete env.CODEX_HOME;',
+        '  return env;',
+        '}',
+        '',
         '// pi session_start reasons -> baseline SessionStart phases (hook stdin `source`).',
         'const PHASE: { [reason: string]: string } = {',
         '  startup: "startup", new: "startup", resume: "resume", fork: "resume", reload: "resume",',
@@ -1128,7 +1141,7 @@ function piShimSource(ap) {
         '      const native = existsSync(HOOK_BIN);',
         '      const file = native ? HOOK_BIN : process.execPath;',
         '      const args = native ? ["--agent-config", AGENT_DIR] : [HOOK_JS, "--agent-config", AGENT_DIR];',
-        '      const child = execFile(file, args, { timeout: TIMEOUT_MS, windowsHide: true }, (err, stdout) => {',
+        '      const child = execFile(file, args, { timeout: TIMEOUT_MS, windowsHide: true, env: dispatcherEnv() }, (err, stdout) => {',
         '        if (err || !stdout) { resolve(""); return; }',
         '        try { resolve(String(JSON.parse(String(stdout)).hookSpecificOutput.additionalContext || "")); }',
         '        catch (e) { resolve(""); }',
@@ -1190,12 +1203,20 @@ function opencodePluginSource(ap) {
         'const HOOK_JS = ' + JSON.stringify(ap.hookJs) + '; // Node dispatcher fallback (needs `node` on PATH under Bun)',
         'const TIMEOUT_MS = 5000;',
         '',
+        'function dispatcherEnv() {',
+        '  const env = { ...process.env };',
+        '  delete env.BASELINE_AGENT_CONFIG_DIR;',
+        '  delete env.CLAUDE_CONFIG_DIR;',
+        '  delete env.CODEX_HOME;',
+        '  return env;',
+        '}',
+        '',
         'function dispatch(payload) {',
         '  try {',
         '    const native = existsSync(HOOK_BIN);',
         '    const file = native ? HOOK_BIN : "node";',
         '    const args = native ? ["--agent-config", AGENT_DIR] : [HOOK_JS, "--agent-config", AGENT_DIR];',
-        '    const r = spawnSync(file, args, { input: JSON.stringify(payload), encoding: "utf8", timeout: TIMEOUT_MS, windowsHide: true });',
+        '    const r = spawnSync(file, args, { input: JSON.stringify(payload), encoding: "utf8", timeout: TIMEOUT_MS, windowsHide: true, env: dispatcherEnv() });',
         '    if (r.error || r.status !== 0 || !r.stdout) return "";',
         '    return String(JSON.parse(r.stdout).hookSpecificOutput.additionalContext || "");',
         '  } catch (e) { return ""; }',
@@ -1669,7 +1690,10 @@ function loadCentralConfig() {
             }
             if (st.size > contracts_1.MAX_DOC_BYTES)
                 report.issues.push({ level: 'fail', msg: 'route ' + label + ' doc exceeds 64 KiB cap' });
-            const body = fs.readFileSync(docPath, 'utf8');
+            const bytes = fs.readFileSync(docPath);
+            if (!(0, buffer_1.isUtf8)(bytes))
+                report.issues.push({ level: 'fail', msg: 'route ' + label + ' doc is not valid UTF-8' });
+            const body = bytes.toString('utf8');
             if (body.length > contracts_1.MAX_DOC_CHARS)
                 report.issues.push({ level: 'fail', msg: 'route ' + label + ' doc exceeds 10,000 character context cap' });
         }
@@ -1782,6 +1806,9 @@ function ensureInstalledManagerArtifacts() {
     if (!fs.existsSync(repo.contractsSourceJs)) {
         throw new Error('compiled contracts missing at ' + repo.contractsSourceJs + ' — run `npm run build` first.');
     }
+    if (!fs.existsSync(repo.generatedContractSourceJs)) {
+        throw new Error('generated contract artifact missing at ' + repo.generatedContractSourceJs + ' — run `npm run build` first.');
+    }
     if (!fs.existsSync(repo.claudePluginManifest)) {
         throw new Error('Claude plugin manifest missing at ' + repo.claudePluginManifest + ' — cannot deploy the skill plugin.');
     }
@@ -1794,6 +1821,7 @@ function ensureInstalledManagerArtifacts() {
     copyFileIfDifferent(repo.managerSourceJs, central.managerJs);
     copyFileIfDifferent(repo.hookSourceJs, central.managerHookSourceJs);
     copyFileIfDifferent(repo.contractsSourceJs, central.managerContractsJs);
+    copyFileIfDifferent(repo.generatedContractSourceJs, central.managerGeneratedContractJs);
     copyFileIfDifferent(repo.claudePluginManifest, central.installedClaudeManifest);
     copyFileIfDifferent(repo.codexPluginManifest, central.installedCodexManifest);
     copyDir(repo.presetsDir, central.installedPresetsDir);
@@ -2066,9 +2094,13 @@ async function cmdInstall(opts) {
     if (!fs.existsSync(repo.contractsSourceJs)) {
         fail('install: compiled contracts missing at ' + repo.contractsSourceJs + ' — run `npm run build` first.', 1);
     }
+    if (!fs.existsSync(repo.generatedContractSourceJs)) {
+        fail('install: generated contract artifact missing at ' + repo.generatedContractSourceJs + ' — run `npm run build` first.', 1);
+    }
     fs.mkdirSync(central.hooksDir, { recursive: true });
     atomicWrite(central.hookJs, fs.readFileSync(repo.hookSourceJs, 'utf8'));
     copyFileIfDifferent(repo.contractsSourceJs, central.hookContractsJs);
+    copyFileIfDifferent(repo.generatedContractSourceJs, central.hookGeneratedContractJs);
     // 2b. Deploy installed manager/source artifacts used by generated control surfaces.
     try {
         ensureInstalledManagerArtifacts();
@@ -2117,6 +2149,7 @@ async function cmdInstall(opts) {
     for (const ap of agentsP) {
         const jsMech = linkInto(central.hookJs, ap.hookJs);
         const contractsMech = linkInto(central.hookContractsJs, ap.hookContractsJs);
+        const generatedContractMech = linkInto(central.hookGeneratedContractJs, ap.hookGeneratedContractJs);
         // Native binary: link it in when active (the wired hot path), unlink our copy otherwise.
         const binMech = useNative ? linkInto(central.hookBin, ap.hookBin) : (removeOurLink(ap.hookBin, central.hookBin) ? 'removed' : null);
         const cfgMech = linkDirInto(central.cfgLink, ap.cfgDir, CONFIG_MARKER);
@@ -2139,7 +2172,7 @@ async function cmdInstall(opts) {
                 fail('install: ' + ap.name + ': ' + e.message, 1);
             }
         }
-        perAgent.push({ name: ap.name, configDir: ap.configDir, jsMech, contractsMech, binMech, cfgMech, skillMech, codexPlugin, sync, shimSync, shimFile: ap.shimFile });
+        perAgent.push({ name: ap.name, configDir: ap.configDir, jsMech, contractsMech, generatedContractMech, binMech, cfgMech, skillMech, codexPlugin, sync, shimSync, shimFile: ap.shimFile });
     }
     if (removeNative)
         removeCentralNative();
@@ -2157,7 +2190,7 @@ async function cmdInstall(opts) {
         console.log('  config WARNING: ' + cfg.fatal + ' — run doctor');
     for (const a of perAgent) {
         console.log('  agent ' + a.name + ' @ ' + a.configDir);
-        console.log('    links       : dispatcher=' + a.jsMech + ', contracts=' + a.contractsMech + (a.binMech && a.binMech !== 'removed' ? ', native=' + a.binMech : '') + ', cfg=' + a.cfgMech + (a.skillMech ? ', skill=' + a.skillMech : '') +
+        console.log('    links       : dispatcher=' + a.jsMech + ', contracts=' + a.contractsMech + ', generated=' + a.generatedContractMech + (a.binMech && a.binMech !== 'removed' ? ', native=' + a.binMech : '') + ', cfg=' + a.cfgMech + (a.skillMech ? ', skill=' + a.skillMech : '') +
             (a.codexPlugin ? ', codex-marketplace=' + a.codexPlugin.marketplace + ', codex-plugin=' + a.codexPlugin.plugin + (a.codexPlugin.version ? '@' + a.codexPlugin.version : '') : ''));
         if (a.codexPlugin && a.codexPlugin.plugin === 'unavailable') {
             console.log('    codex NOTICE: `codex` CLI unavailable; hooks are wired but the Codex control surface was not installed');
@@ -2198,6 +2231,7 @@ function cmdUninstall() {
         const jsGone = removeOurLink(ap.hookJs, central.hookJs);
         const binGone = removeOurLink(ap.hookBin, central.hookBin);
         const contractsGone = removeOurLink(ap.hookContractsJs, central.hookContractsJs);
+        const generatedContractGone = removeOurLink(ap.hookGeneratedContractJs, central.hookGeneratedContractJs);
         const cfgGone = removeOurDirLink(ap.cfgDir, central.cfgLink, CONFIG_MARKER);
         const skillGone = ap.skillDir ? removeOurDirLink(ap.skillDir, central.skillDir, SKILL_MARKER) : false;
         let codexLifecycle = null;
@@ -2219,6 +2253,7 @@ function cmdUninstall() {
         if (binGone)
             console.log('    native      : unlinked');
         console.log('    contracts   : ' + (contractsGone ? 'unlinked' : 'absent'));
+        console.log('    generated   : ' + (generatedContractGone ? 'unlinked' : 'absent'));
         console.log('    cfg folder  : ' + (cfgGone ? 'unlinked (central kept)' : 'left as-is'));
         if (ap.skillDir)
             console.log('    skill plugin: ' + (skillGone ? 'unlinked (central kept)' : 'left as-is'));
@@ -2233,12 +2268,13 @@ function cmdUninstall() {
 // Structured mirror of `status` for the --json surface: the same facts the human view
 // prints, shaped for machines. Link fields carry the { ok, mechanism } LinkState.
 function collectStatusData() {
-    const dispatcherPresent = fs.existsSync(central.hookJs) && fs.existsSync(central.hookContractsJs);
+    const dispatcherPresent = fs.existsSync(central.hookJs) && fs.existsSync(central.hookContractsJs) && fs.existsSync(central.hookGeneratedContractJs);
     const inSync = dispatcherPresent &&
         sameFileContents(central.hookJs, repo.hookSourceJs) &&
-        sameFileContents(central.hookContractsJs, repo.contractsSourceJs);
+        sameFileContents(central.hookContractsJs, repo.contractsSourceJs) &&
+        sameFileContents(central.hookGeneratedContractJs, repo.generatedContractSourceJs);
     const cfg = loadCentralConfig();
-    const managerPresent = fs.existsSync(central.managerJs) && fs.existsSync(central.managerHookSourceJs) && fs.existsSync(central.managerContractsJs);
+    const managerPresent = fs.existsSync(central.managerJs) && fs.existsSync(central.managerHookSourceJs) && fs.existsSync(central.managerContractsJs) && fs.existsSync(central.managerGeneratedContractJs);
     const skillPresent = fs.existsSync(central.skillManifest) && fs.existsSync(central.skillMd);
     const codexPlugin = centralCodexPluginPayloadStatus();
     const expectedCodexVersion = codexPlugin.expectedVersion;
@@ -2252,6 +2288,7 @@ function collectStatusData() {
             const links = {
                 dispatcher: linkState(ap.hookJs, central.hookJs),
                 contracts: linkState(ap.hookContractsJs, central.hookContractsJs),
+                generatedContract: linkState(ap.hookGeneratedContractJs, central.hookGeneratedContractJs),
                 cfg: dirLinkState(ap.cfgDir, central.cfgLink, CONFIG_MARKER),
             };
             let hasNativeLink = false;
@@ -2294,6 +2331,7 @@ function collectStatusData() {
         const links = {
             dispatcher: linkState(ap.hookJs, central.hookJs),
             contracts: linkState(ap.hookContractsJs, central.hookContractsJs),
+            generatedContract: linkState(ap.hookGeneratedContractJs, central.hookGeneratedContractJs),
             cfg: dirLinkState(ap.cfgDir, central.cfgLink, CONFIG_MARKER),
         };
         if (nativeEvents.length)
@@ -2402,6 +2440,7 @@ function cmdStatus() {
             if (agent.nativeBinary)
                 console.log('    native       : ' + describeNativeRuntime(status.nativeDispatcher.linkedState, agent.links.native, agent.nativeBinary, status.nativeDispatcher.path, agent.hookBin));
             console.log('    contracts    : ' + describeLink(agent.links.contracts));
+            console.log('    generated    : ' + describeLink(agent.links.generatedContract));
             console.log('    cfg folder   : ' + describeLink(agent.links.cfg));
             continue;
         }
@@ -2424,6 +2463,7 @@ function cmdStatus() {
         if (agent.nativeBinary)
             console.log('    native       : ' + describeNativeRuntime(status.nativeDispatcher.linkedState, agent.links.native, agent.nativeBinary, status.nativeDispatcher.path, agent.hookBin));
         console.log('    contracts    : ' + describeLink(agent.links.contracts));
+        console.log('    generated    : ' + describeLink(agent.links.generatedContract));
         console.log('    cfg folder   : ' + describeLink(agent.links.cfg));
         if (agent.links.skill)
             console.log('    skill plugin : ' + describeLink(agent.links.skill));
@@ -2593,13 +2633,14 @@ function doctorChecks() {
     if (!fs.existsSync(central.root)) {
         checks.push({ name: 'install root', level: 'fail', detail: 'missing — ' + central.root + ' does not exist; agent hook links are dangling. Run doctor --fix (or install) from the source checkout to re-deploy', fixable: true });
     }
-    const dispatcherPresent = fs.existsSync(central.hookJs) && fs.existsSync(central.hookContractsJs);
+    const dispatcherPresent = fs.existsSync(central.hookJs) && fs.existsSync(central.hookContractsJs) && fs.existsSync(central.hookGeneratedContractJs);
     if (!dispatcherPresent) {
         checks.push({ name: 'central dispatcher', level: 'fail', detail: 'not fully deployed under ' + central.hooksDir, fixable: true });
     }
     else {
         const inSync = sameFileContents(central.hookJs, repo.hookSourceJs) &&
-            sameFileContents(central.hookContractsJs, repo.contractsSourceJs);
+            sameFileContents(central.hookContractsJs, repo.contractsSourceJs) &&
+            sameFileContents(central.hookGeneratedContractJs, repo.generatedContractSourceJs);
         checks.push(inSync
             ? { name: 'central dispatcher', level: 'ok', detail: 'byte-identical to repo source' }
             : { name: 'central dispatcher', level: 'warn', detail: 'DIFFERS from repo source (stale — update will refresh)', fixable: true });
@@ -2634,7 +2675,7 @@ function doctorChecks() {
             : { name: 'config location', level: 'fail', detail: central.cfgLink + ' does not link to ' + central.cfgDir + ' (run install)', fixable: true });
     }
     // Installed manager artifacts used by self-contained control surfaces.
-    const managerPresent = fs.existsSync(central.managerJs) && fs.existsSync(central.managerHookSourceJs) && fs.existsSync(central.managerContractsJs);
+    const managerPresent = fs.existsSync(central.managerJs) && fs.existsSync(central.managerHookSourceJs) && fs.existsSync(central.managerContractsJs) && fs.existsSync(central.managerGeneratedContractJs);
     if (!managerPresent) {
         checks.push({ name: 'installed manager', level: 'warn', detail: 'not fully deployed under ' + central.managerDir + ' (install will deploy it)', fixable: true });
     }
@@ -2643,7 +2684,8 @@ function doctorChecks() {
         try {
             managerSync = sameFileContents(central.managerJs, repo.managerSourceJs) &&
                 sameFileContents(central.managerHookSourceJs, repo.hookSourceJs) &&
-                sameFileContents(central.managerContractsJs, repo.contractsSourceJs);
+                sameFileContents(central.managerContractsJs, repo.contractsSourceJs) &&
+                sameFileContents(central.managerGeneratedContractJs, repo.generatedContractSourceJs);
         }
         catch (e) { }
         checks.push(managerSync
@@ -2833,6 +2875,15 @@ function doctorChecks() {
             checks.push({ name: 'contracts link', level: 'fail', detail: 'dangling — target ' + central.hookContractsJs + ' missing', fixable: true });
         else
             checks.push({ name: 'contracts link', level: 'fail', detail: contracts.mechanism + ' — not linked to ' + central.hookContractsJs, fixable: true });
+        const generatedContract = linkState(ap.hookGeneratedContractJs, central.hookGeneratedContractJs);
+        if (generatedContract.ok && generatedContract.mechanism !== 'copy')
+            checks.push({ name: 'generated contract link', level: 'ok', detail: 'linked to center (' + generatedContract.mechanism + ')' });
+        else if (generatedContract.ok)
+            checks.push({ name: 'generated contract link', level: 'warn', detail: 'degraded copy (edits will not propagate; install will relink)', fixable: true });
+        else if (generatedContract.mechanism === 'dangling')
+            checks.push({ name: 'generated contract link', level: 'fail', detail: 'dangling — target ' + central.hookGeneratedContractJs + ' missing', fixable: true });
+        else
+            checks.push({ name: 'generated contract link', level: 'fail', detail: generatedContract.mechanism + ' — not linked to ' + central.hookGeneratedContractJs, fixable: true });
         const cl = dirLinkState(ap.cfgDir, central.cfgLink, CONFIG_MARKER);
         if (cl.ok && cl.mechanism !== 'copy')
             checks.push({ name: 'config link', level: 'ok', detail: 'linked to center (' + cl.mechanism + ')' });

@@ -26,7 +26,8 @@ Content and routing are kept separate: **docs** (`docs/*.md`) hold the verbatim 
 | Piece | Path | Role |
 |---|---|---|
 | Dispatcher (Node fallback) | `src/baseline-recital.ts` → `scripts/baseline-recital.js` | TypeScript source for the Node dispatcher. Reads the event, loads `config.json`, selects routes, counts per route, injects due docs verbatim. Used when no native prebuilt is available or `--runtime node` is selected. |
-| Zig/native hook runtime | `src/baseline-recital.zig`, `bin/baseline-recital-*`, `bin/SHA256SUMS` | Default hook hot path when a shipped prebuilt exists. `--runtime prebuilt` selects it explicitly; `--runtime build` compiles it first; missing/undeployable prebuilts fall back to Node. |
+| Shared dispatch contract | `contract/dispatch-contract.json` → `src/generated-contract.ts`, `src/native/contracts.zig` | Runtime-neutral protocol/layout values. Generated files are checked in and must not be hand-edited. |
+| Zig/native hook runtime | `src/baseline-recital.zig`, `src/native/`, `bin/baseline-recital-*`, `bin/SHA256SUMS` | Thin composition root plus owned modules for resolution, input, config, counters, docs, emission, and diagnostics. Default hook hot path when a shipped prebuilt exists. |
 | Install root | `BASELINE_HOME`, else the installed manager's own root, else `~/.baseline` | Holds regenerable artifacts only: deployed dispatcher (`hooks/`) + skill payload (`skills/`), plus `cfg` → your config folder. |
 | Deployed dispatcher artifacts | `~/.baseline/hooks/baseline-recital.js`, native hook binary when active | Hook artifacts deployed by the Node manager. |
 | Agent dispatcher link | `~/.claude/hooks/`, `~/.codex/hooks/`, `~/.pi/agent/hooks/`, `~/.omp/agent/hooks/`, `~/.config/opencode/hooks/` | Installed command path wired in hook config (or spawned by a shim); links to the install root. Native runtime wiring executes the native binary directly; Node wiring runs `baseline-recital.js`. |
@@ -51,6 +52,10 @@ Requires Claude Code, Codex, pi, oh-my-pi, or opencode, plus Node.js. Node runs 
 ## Trust boundary
 
 Every `docs/*.md` is injected into model context, so treat docs as trusted configuration: inspect edits, keep them short, never paste untrusted text. The dispatcher caps `config.json`/each doc at 64 KiB, skips docs over 10,000 characters, caps the combined hook context at 10,000 characters, limits routes to 64, resolves each `doc` strictly inside the config folder after realpath checks, and fails open. If `status` reports a copy fallback for the config link, rerun install/update after editing the config folder.
+
+Docs must be valid UTF-8; one malformed due doc makes the invocation emit nothing.
+For redacted fail-open reason codes on stderr, set `BASELINE_DIAGNOSTICS=1`.
+An explicit dispatcher `--agent-config` outranks inherited agent/home environment values.
 
 ## The two most common tasks
 

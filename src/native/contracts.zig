@@ -1,0 +1,27 @@
+// GENERATED from contract/dispatch-contract.json. DO NOT EDIT.
+pub const schema_version: i64 = 1;
+pub const supported_events = [_][]const u8{ "UserPromptSubmit", "SessionStart", "PreToolUse", "PostToolUse" };
+pub const session_phases = [_][]const u8{ "startup", "resume", "clear", "compact" };
+pub const route_keys = [_][]const u8{ "id", "event", "freq", "cwd", "doc" };
+pub const max_config_bytes: usize = 65536;
+pub const max_doc_bytes: usize = 65536;
+pub const max_doc_chars: usize = 10000;
+pub const max_stdin_bytes: usize = 1048576;
+pub const max_counter_bytes: usize = 1048576;
+pub const max_routes: usize = 64;
+pub const max_combined_context_chars: usize = 10000;
+pub const prune_ms: i64 = 604800000;
+pub const max_lock_wait_ms: i64 = 2000;
+pub const lock_retry_ms: i64 = 10;
+pub const stale_lock_ms: i64 = 5000;
+pub const output_outer_field = "hookSpecificOutput";
+pub const output_event_field = "hookEventName";
+pub const output_context_field = "additionalContext";
+pub const document_separator = "\n\n";
+pub const counter_key_separator = ":";
+pub const config_dir = "cfg/baseline";
+pub const config_file = "config.json";
+pub const counter_file = ".baseline-counters.json";
+pub const lock_suffix = ".lock";
+pub const default_agent_dir = ".claude";
+pub const diagnostics_env = "BASELINE_DIAGNOSTICS";

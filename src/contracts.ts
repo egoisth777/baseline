@@ -1,5 +1,10 @@
 import * as fs from 'fs';
 import * as path from 'path';
+import {
+  SUPPORTED_EVENTS, SESSION_PHASES, ROUTE_KEYS,
+  MAX_CONFIG_BYTES, MAX_DOC_BYTES, MAX_DOC_CHARS, MAX_ROUTES,
+} from './generated-contract';
+export * from './generated-contract';
 
 export interface Route {
   id: string;
@@ -15,20 +20,17 @@ export interface ParsedEvent {
 }
 
 // Events this dispatcher can inject standing context into.
-export const SUPPORTED_EVENTS = ['UserPromptSubmit', 'SessionStart', 'PreToolUse', 'PostToolUse'];
+export { SUPPORTED_EVENTS };
 // SessionStart lifecycle phases. An event may name one via a "SessionStart.<phase>"
 // suffix; the phase then resolves against the hook stdin `source`.
-export const SESSION_PHASES = ['startup', 'resume', 'clear', 'compact'];
+export { SESSION_PHASES };
 // Exact config-schema-v1 route keys. This is internal implementation source, not a
 // public package API.
-export const ROUTE_KEYS = ['id', 'event', 'freq', 'cwd', 'doc'];
+export { ROUTE_KEYS };
 // Route id shape — keys the counter and labels the route in status/doctor.
 export const SLUG = /^[a-z0-9][a-z0-9-]*$/;
 
-export const MAX_CONFIG_BYTES = 64 * 1024;
-export const MAX_DOC_BYTES = 64 * 1024;
-export const MAX_DOC_CHARS = 10_000;
-export const MAX_ROUTES = 64;
+export { MAX_CONFIG_BYTES, MAX_DOC_BYTES, MAX_DOC_CHARS, MAX_ROUTES };
 
 // Split a route event into its base event and optional SessionStart phase suffix, on
 // the FIRST '.'. "SessionStart.compact" -> { base:'SessionStart', phase:'compact' };

@@ -1,0 +1,27 @@
+// GENERATED from contract/dispatch-contract.json. DO NOT EDIT.
+export const SCHEMA_VERSION = 1;
+export const SUPPORTED_EVENTS = ["UserPromptSubmit","SessionStart","PreToolUse","PostToolUse"] as readonly string[];
+export const SESSION_PHASES = ["startup","resume","clear","compact"] as readonly string[];
+export const ROUTE_KEYS = ["id","event","freq","cwd","doc"] as readonly string[];
+export const MAX_CONFIG_BYTES = 65536;
+export const MAX_DOC_BYTES = 65536;
+export const MAX_DOC_CHARS = 10000;
+export const MAX_STDIN_BYTES = 1048576;
+export const MAX_COUNTER_BYTES = 1048576;
+export const MAX_ROUTES = 64;
+export const MAX_COMBINED_CONTEXT_CHARS = 10000;
+export const PRUNE_MS = 604800000;
+export const MAX_LOCK_WAIT_MS = 2000;
+export const LOCK_RETRY_MS = 10;
+export const STALE_LOCK_MS = 5000;
+export const OUTPUT_OUTER_FIELD = "hookSpecificOutput";
+export const OUTPUT_EVENT_FIELD = "hookEventName";
+export const OUTPUT_CONTEXT_FIELD = "additionalContext";
+export const DOCUMENT_SEPARATOR = "\n\n";
+export const COUNTER_KEY_SEPARATOR = ":";
+export const CONFIG_DIR = "cfg/baseline";
+export const CONFIG_FILE = "config.json";
+export const COUNTER_FILE = ".baseline-counters.json";
+export const LOCK_SUFFIX = ".lock";
+export const DEFAULT_AGENT_DIR = ".claude";
+export const DIAGNOSTICS_ENV = "BASELINE_DIAGNOSTICS";

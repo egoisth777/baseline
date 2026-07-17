@@ -57,7 +57,7 @@ bash install.sh
 Both delegate to `node scripts/manage.js install`, which:
 1. Deploys the Node dispatcher/contracts and, when selected or available, the shipped Zig/native hook binary to the **install root**, under `~/.baseline/hooks/`.
 2. Establishes the **config folder** — your routes + docs (`config.json` + `docs/`). It lives wherever you point `BASELINE_CFG` (else `<install root>/cfg`); when `BASELINE_CFG` is set, `<install root>/cfg` is a symlink to it. If empty, it is seeded from a repo **preset** — `default` by plain install (`--preset minimal` for the neutral floor).
-3. **Links** each agent's config dir back into the install root — for example `~/.claude/hooks/baseline-recital.js` + `~/.claude/hooks/contracts.js` and `~/.codex/hooks/baseline-recital.js` + `~/.codex/hooks/contracts.js` → the install-root hook artifacts, with the native hook binary linked when active and each agent's `cfg/baseline/` → `<install root>/cfg` (your config folder).
+3. **Links** each agent's config dir back into the install root — the dispatcher plus `contracts.js` and its generated `generated-contract.js` dependency — with the native hook binary linked when active and each agent's `cfg/baseline/` → `<install root>/cfg` (your config folder).
 4. Deploys the installed control-surface payload. Claude gets the skills-dir plugin as `baseline@skills-dir`; Codex gets a manager-owned local marketplace registered and installed through `codex plugin`. The manager does not edit Codex's private cache or plugin tables directly. Control-surface plugins carry **no hooks** — they only make baseline discoverable, not active.
 5. Wires Claude Code `~/.claude/settings.json` and Codex `~/.codex/hooks.json` for **exactly** the events the config's routes use, and unwires events no route references. For pi (`~/.pi/agent/extensions/`), oh-my-pi (`~/.omp/agent/extensions/`), and opencode (`~/.config/opencode/plugins/baseline/` plus a `plugin` entry in `opencode.json`) it deploys the generated shim when the config has events that agent can deliver, and removes it when none remain.
 
@@ -101,6 +101,12 @@ A route is one entry in `config.json` `routes[]`:
 Docs are static in schema v1. Their contents are injected byte-for-byte; text that
 looks like a placeholder, such as `{{event}}`, remains literal text. Dynamic
 replacement is reserved for a future explicit opt-in contract.
+
+Docs must be valid UTF-8. If any due doc is malformed, the dispatcher fails open:
+it emits no hook output and exits successfully. To troubleshoot a silent no-op, set
+`BASELINE_DIAGNOSTICS=1`; the dispatcher then writes only a stable, redacted reason
+code to stderr. Diagnostics never include doc text, session ids, counter contents,
+or absolute paths, and never change stdout or the exit status.
 
 To add a new injection, copy a pair from `assets/route-templates/` (a doc + its matching route) or ask the plugin to author one. See the `README.md` in your config folder for the runtime caps.
 
@@ -181,13 +187,18 @@ baseline/
 ├── src/                         # Source of truth (edit here, then npm run build for TS)
 │   ├── manage.ts                # Manager source
 │   ├── baseline-recital.ts      # Node dispatcher source (fallback / --runtime node)
-│   ├── baseline-recital.zig     # Zig/native hook source (default hot path when prebuilt ships)
-│   ├── contracts.ts             # Shared dispatcher/manager contract helpers
+│   ├── baseline-recital.zig     # Thin Zig/native composition root
+│   ├── native/                  # Native resolve/input/config/counter/doc/emit/diagnostic modules + tests
+│   ├── generated-contract.ts    # Generated Node contract values (do not edit)
+│   ├── contracts.ts             # Hand-authored dispatcher/manager contract helpers
 │   └── test.ts                  # Test source
+├── contract/dispatch-contract.json # Runtime-neutral dispatch contract manifest
+├── tools/generate-contracts.js  # Deterministically generates Node and Zig contract values
 ├── scripts/                     # Committed compiled output deployed by the manager
 │   ├── manage.js
 │   ├── baseline-recital.js
 │   ├── contracts.js
+│   ├── generated-contract.js   # Compiled generated contract values
 │   └── test.js
 ├── presets/
 │   ├── minimal/                 # Neutral floor preset (config.json + docs + README)
@@ -213,6 +224,12 @@ baseline/
 ## Trust boundary
 
 Doc bytes enter the model's context, so treat every `docs/*.md` as trusted configuration: inspect edits, keep docs short, never paste untrusted text. The dispatcher caps `config.json` and each doc at 64 KiB, skips docs over 10,000 characters, caps the combined hook context at 10,000 characters, limits routes to 64, resolves each `doc` strictly inside the config folder after realpath checks (no `..` or symlink escapes), and always exits 0 — a hook fault never blocks the agent. Counters are locked during update and auto-pruned after 7 days of inactivity.
+
+An explicit dispatcher `--agent-config <dir>` is authoritative over inherited agent/home
+environment variables; generated shims always pass it. Counter updates use an exclusive,
+unpredictable sibling temp followed by atomic replacement. Path-containment and descendant
+link policy remain owned by I-018 P0; stale-lock fencing and retry policy remain owned by
+I-018 P4.
 
 ## Develop
 

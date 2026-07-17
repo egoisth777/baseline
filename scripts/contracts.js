@@ -1,4 +1,18 @@
 "use strict";
+var __createBinding = (this && this.__createBinding) || (Object.create ? (function(o, m, k, k2) {
+    if (k2 === undefined) k2 = k;
+    var desc = Object.getOwnPropertyDescriptor(m, k);
+    if (!desc || ("get" in desc ? !m.__esModule : desc.writable || desc.configurable)) {
+      desc = { enumerable: true, get: function() { return m[k]; } };
+    }
+    Object.defineProperty(o, k2, desc);
+}) : (function(o, m, k, k2) {
+    if (k2 === undefined) k2 = k;
+    o[k2] = m[k];
+}));
+var __exportStar = (this && this.__exportStar) || function(m, exports) {
+    for (var p in m) if (p !== "default" && !Object.prototype.hasOwnProperty.call(exports, p)) __createBinding(exports, m, p);
+};
 Object.defineProperty(exports, "__esModule", { value: true });
 exports.MAX_ROUTES = exports.MAX_DOC_CHARS = exports.MAX_DOC_BYTES = exports.MAX_CONFIG_BYTES = exports.SLUG = exports.ROUTE_KEYS = exports.SESSION_PHASES = exports.SUPPORTED_EVENTS = void 0;
 exports.parseEvent = parseEvent;
@@ -10,20 +24,17 @@ exports.pathInside = pathInside;
 exports.safeRealDocPath = safeRealDocPath;
 const fs = require("fs");
 const path = require("path");
-// Events this dispatcher can inject standing context into.
-exports.SUPPORTED_EVENTS = ['UserPromptSubmit', 'SessionStart', 'PreToolUse', 'PostToolUse'];
-// SessionStart lifecycle phases. An event may name one via a "SessionStart.<phase>"
-// suffix; the phase then resolves against the hook stdin `source`.
-exports.SESSION_PHASES = ['startup', 'resume', 'clear', 'compact'];
-// Exact config-schema-v1 route keys. This is internal implementation source, not a
-// public package API.
-exports.ROUTE_KEYS = ['id', 'event', 'freq', 'cwd', 'doc'];
+const generated_contract_1 = require("./generated-contract");
+Object.defineProperty(exports, "SUPPORTED_EVENTS", { enumerable: true, get: function () { return generated_contract_1.SUPPORTED_EVENTS; } });
+Object.defineProperty(exports, "SESSION_PHASES", { enumerable: true, get: function () { return generated_contract_1.SESSION_PHASES; } });
+Object.defineProperty(exports, "ROUTE_KEYS", { enumerable: true, get: function () { return generated_contract_1.ROUTE_KEYS; } });
+Object.defineProperty(exports, "MAX_CONFIG_BYTES", { enumerable: true, get: function () { return generated_contract_1.MAX_CONFIG_BYTES; } });
+Object.defineProperty(exports, "MAX_DOC_BYTES", { enumerable: true, get: function () { return generated_contract_1.MAX_DOC_BYTES; } });
+Object.defineProperty(exports, "MAX_DOC_CHARS", { enumerable: true, get: function () { return generated_contract_1.MAX_DOC_CHARS; } });
+Object.defineProperty(exports, "MAX_ROUTES", { enumerable: true, get: function () { return generated_contract_1.MAX_ROUTES; } });
+__exportStar(require("./generated-contract"), exports);
 // Route id shape — keys the counter and labels the route in status/doctor.
 exports.SLUG = /^[a-z0-9][a-z0-9-]*$/;
-exports.MAX_CONFIG_BYTES = 64 * 1024;
-exports.MAX_DOC_BYTES = 64 * 1024;
-exports.MAX_DOC_CHARS = 10_000;
-exports.MAX_ROUTES = 64;
 // Split a route event into its base event and optional SessionStart phase suffix, on
 // the FIRST '.'. "SessionStart.compact" -> { base:'SessionStart', phase:'compact' };
 // a bare "UserPromptSubmit" -> { base:'UserPromptSubmit' }.
@@ -37,9 +48,9 @@ function parseEvent(event) {
 // SessionStart phase. Other base-event suffixes are invalid.
 function isSupportedRouteEvent(event) {
     const { base, phase } = parseEvent(event);
-    if (exports.SUPPORTED_EVENTS.indexOf(base) === -1)
+    if (generated_contract_1.SUPPORTED_EVENTS.indexOf(base) === -1)
         return false;
-    return phase === undefined || (base === 'SessionStart' && exports.SESSION_PHASES.indexOf(phase) !== -1);
+    return phase === undefined || (base === 'SessionStart' && generated_contract_1.SESSION_PHASES.indexOf(phase) !== -1);
 }
 // Event-name match: the route's base event equals the native hook event, and any
 // SessionStart phase suffix equals the stdin `source` (a bare event matches every

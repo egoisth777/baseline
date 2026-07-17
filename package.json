@@ -5,8 +5,11 @@
   "description": "baseline drift-correction dispatcher and Claude Code/Codex lifecycle manager (TypeScript source compiled to scripts/).",
   "license": "MIT",
   "scripts": {
-    "build": "tsc -p tsconfig.json",
-    "test": "tsc -p tsconfig.json && node scripts/test.js",
+    "contracts:generate": "node tools/generate-contracts.js",
+    "contracts:check": "node tools/generate-contracts.js --check",
+    "test:native": "zig test src/native/test.zig",
+    "build": "node tools/generate-contracts.js && node tools/generate-contracts.js --check && tsc -p tsconfig.json",
+    "test": "node tools/generate-contracts.js --check && tsc -p tsconfig.json && zig test src/native/test.zig && node tools/test-with-native.js",
     "bench": "node bench/run.js",
     "bench:check": "node bench/run.js --check"
   },

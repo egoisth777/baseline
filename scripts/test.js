@@ -1183,69 +1183,223 @@ function testUpdateRuntimeNodeForcesNode() {
     const verify = run(['verify'], cfg);
     assert.strictEqual(verify.status, 0, 'the wired Node command should fire after --runtime node: ' + (verify.stderr || verify.stdout));
 }
-// End-to-end byte-parity: identical stdin fixtures to the native binary and the Node
-// dispatcher must produce byte-identical stdout across static docs, freq rollover, and
-// a no-match event. Skips cleanly where no prebuilt exists for the platform.
+// End-to-end byte parity against a native binary freshly built by tools/test-with-native.js.
+// On the mapped release hosts this lane is mandatory: a missing or failed build is a test
+// failure, never a fallback to a stale shipped prebuilt.
 function testNativeDispatchParity() {
-    const target = nativePrebuiltForPlatform();
-    if (!target || !fs.existsSync(path.join(root, 'bin', target))) {
-        console.log('  (skip) testNativeDispatchParity: no native prebuilt for ' + process.platform + '-' + process.arch + '.');
+    const nativeBin = process.env.BASELINE_TEST_NATIVE_BIN;
+    const mapped = process.arch === 'x64' && (process.platform === 'win32' || process.platform === 'linux');
+    if (!nativeBin || !fs.existsSync(nativeBin)) {
+        if (mapped)
+            assert.fail('fresh native binary missing; run tests through tools/test-with-native.js');
+        console.log('  (skip) testNativeDispatchParity: fresh host native binary unavailable on ' + process.platform + '-' + process.arch + '.');
         return;
     }
-    const nativeBin = path.join(root, 'bin', target);
-    const firstDoc = 'FIRST literal={{event}}/{{cwd}}/{{env.FOO}}\n';
-    const secondDoc = 'SECOND\n';
-    const everyTwoDoc = 'EVERY-TWO\n';
-    function fixture() {
-        const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'baseline-parity-'));
-        const cb = path.join(dir, 'cfg', 'baseline');
-        fs.mkdirSync(path.join(cb, 'docs'), { recursive: true });
-        fs.writeFileSync(path.join(cb, 'config.json'), JSON.stringify({
-            version: 1,
-            routes: [
-                { id: 'first', event: 'UserPromptSubmit', freq: 1, doc: 'docs/first.md' },
-                { id: 'second', event: 'UserPromptSubmit', freq: 1, doc: 'docs/second.md' },
-                { id: 'every2', event: 'UserPromptSubmit', freq: 2, doc: 'docs/every2.md' }
-            ]
-        }, null, 2));
-        fs.writeFileSync(path.join(cb, 'docs', 'first.md'), firstDoc);
-        fs.writeFileSync(path.join(cb, 'docs', 'second.md'), secondDoc);
-        fs.writeFileSync(path.join(cb, 'docs', 'every2.md'), everyTwoDoc);
-        return dir;
+    const freshNativeBin = nativeBin;
+    function pair(setup) {
+        const nativeDir = fs.mkdtempSync(path.join(os.tmpdir(), 'baseline-parity-native-'));
+        const nodeDir = fs.mkdtempSync(path.join(os.tmpdir(), 'baseline-parity-node-'));
+        const cfgPath = (dir) => path.join(dir, 'cfg', 'baseline');
+        const config = (dir, value) => {
+            fs.mkdirSync(path.join(cfgPath(dir), 'docs'), { recursive: true });
+            fs.writeFileSync(path.join(cfgPath(dir), 'config.json'), typeof value === 'string' ? value : JSON.stringify(value));
+        };
+        const doc = (dir, name, value) => {
+            fs.mkdirSync(path.join(cfgPath(dir), 'docs'), { recursive: true });
+            fs.writeFileSync(path.join(cfgPath(dir), 'docs', name), value);
+        };
+        setup(nativeDir);
+        setup(nodeDir);
+        const invoke = (input, raw, extraEnv) => {
+            const env = Object.assign({}, process.env, extraEnv || {});
+            delete env.BASELINE_AGENT_CONFIG_DIR;
+            const bytes = raw === undefined ? JSON.stringify(input) : raw;
+            const nodeInput = raw === undefined && input && typeof input === 'object'
+                ? Object.assign({}, input, typeof input.cwd === 'string'
+                    ? { cwd: input.cwd.replace(nativeDir, nodeDir) } : {})
+                : input;
+            const native = (0, child_process_1.spawnSync)(freshNativeBin, ['--agent-config', nativeDir], { input: bytes, encoding: 'utf8', env });
+            const nodeBytes = raw === undefined ? JSON.stringify(nodeInput) : raw;
+            const node = (0, child_process_1.spawnSync)(process.execPath, [dispatcher, '--agent-config', nodeDir], { input: nodeBytes, encoding: 'utf8', env });
+            assert.strictEqual(native.status, 0, 'fresh native exit: ' + native.stderr);
+            assert.strictEqual(node.status, 0, 'node exit: ' + node.stderr);
+            assert.strictEqual(native.stdout, node.stdout, 'stdout parity\n native=' + JSON.stringify(native.stdout) + '\n node=' + JSON.stringify(node.stdout));
+            return { native, node };
+        };
+        return {
+            nativeDir, nodeDir, config, doc, invoke,
+            close: () => {
+                fs.rmSync(nativeDir, { recursive: true, force: true });
+                fs.rmSync(nodeDir, { recursive: true, force: true });
+            }
+        };
     }
-    const env = Object.assign({}, process.env);
-    delete env.BASELINE_AGENT_CONFIG_DIR;
-    const nDir = fixture();
-    const jDir = fixture();
-    const native = (dir, input) => (0, child_process_1.spawnSync)(nativeBin, ['--agent-config', dir], { input: JSON.stringify(input), encoding: 'utf8', env });
-    const node = (dir, input) => (0, child_process_1.spawnSync)(process.execPath, [dispatcher, '--agent-config', dir], { input: JSON.stringify(input), encoding: 'utf8', env });
-    try {
-        const turns = [
-            { hook_event_name: 'UserPromptSubmit' }, // t1: first + second (every2 not yet due)
-            { hook_event_name: 'UserPromptSubmit' }, // t2: first + second + every2 (config order)
-            { hook_event_name: 'PostToolUse', tool_name: 'Bash' } // no matching route -> empty
-        ];
-        const nativeOut = [];
-        for (let i = 0; i < turns.length; i++) {
-            const rn = native(nDir, Object.assign({ session_id: 'p', cwd: nDir }, turns[i]));
-            const rj = node(jDir, Object.assign({ session_id: 'p', cwd: jDir }, turns[i]));
-            assert.strictEqual(rn.status, 0, 'native exit 0 at turn ' + (i + 1) + ': ' + (rn.stderr || ''));
-            assert.strictEqual(rj.status, 0, 'node exit 0 at turn ' + (i + 1) + ': ' + (rj.stderr || ''));
-            assert.strictEqual(rn.stdout, rj.stdout, 'native vs node stdout must be byte-identical at turn ' + (i + 1) +
-                '\n  native: ' + JSON.stringify(rn.stdout) + '\n  node:   ' + JSON.stringify(rj.stdout));
-            nativeOut.push(rn.stdout || '');
+    const exactEnvelope = (event, body) => JSON.stringify({
+        hookSpecificOutput: { hookEventName: event, additionalContext: body }
+    });
+    // Every event and SessionStart phase, including exact envelope and separator bytes.
+    {
+        const p = pair(dir => {
+            const routes = [];
+            for (const event of contracts_1.SUPPORTED_EVENTS)
+                routes.push({ id: event.toLowerCase(), event, freq: 1, doc: 'docs/' + event + '.md' });
+            for (const phase of contracts_1.SESSION_PHASES)
+                routes.push({ id: 'phase-' + phase, event: 'SessionStart.' + phase, freq: 1, doc: 'docs/' + phase + '.md' });
+            pConfig(dir, { version: 1, routes });
+            for (const event of contracts_1.SUPPORTED_EVENTS)
+                pDoc(dir, event + '.md', event + '\n');
+            for (const phase of contracts_1.SESSION_PHASES)
+                pDoc(dir, phase + '.md', phase + '\n');
+        });
+        function pConfig(dir, value) {
+            const cb = path.join(dir, 'cfg', 'baseline');
+            fs.mkdirSync(path.join(cb, 'docs'), { recursive: true });
+            fs.writeFileSync(path.join(cb, 'config.json'), JSON.stringify(value));
         }
-        // Assert the dispatched context exactly, rather than merely checking a substring:
-        // {{event}} is static doc content, not an interpolation token.
-        assert.strictEqual(fireBodies({ stdout: nativeOut[0] }), firstDoc + '\n\n' + secondDoc, 't1 must inject static docs byte-for-byte without interpolating {{event}}: ' + nativeOut[0]);
-        assert.ok(nativeOut[0].includes('SECOND') && !nativeOut[0].includes('EVERY-TWO'), 't1: freq-2 route not yet due');
-        const iF = nativeOut[1].indexOf('FIRST'), iS = nativeOut[1].indexOf('SECOND'), iE = nativeOut[1].indexOf('EVERY-TWO');
-        assert.ok(iF !== -1 && iS !== -1 && iE !== -1 && iF < iS && iS < iE, 't2: all three due, emitted in config order: ' + nativeOut[1]);
-        assert.strictEqual(nativeOut[2].trim(), '', 't3: no-match event injects nothing');
+        function pDoc(dir, name, value) {
+            fs.writeFileSync(path.join(dir, 'cfg', 'baseline', 'docs', name), value);
+        }
+        try {
+            for (const event of contracts_1.SUPPORTED_EVENTS) {
+                if (event === 'SessionStart')
+                    continue;
+                const r = p.invoke({ session_id: 'event-' + event, hook_event_name: event, cwd: p.nativeDir });
+                assert.strictEqual(r.native.stdout, exactEnvelope(event, event + '\n'));
+            }
+            for (const phase of contracts_1.SESSION_PHASES) {
+                const r = p.invoke({ session_id: 'phase-' + phase, hook_event_name: 'SessionStart', source: phase });
+                assert.strictEqual(r.native.stdout, exactEnvelope('SessionStart', 'SessionStart\n\n\n' + phase + '\n'));
+            }
+        }
+        finally {
+            p.close();
+        }
     }
-    finally {
-        fs.rmSync(nDir, { recursive: true, force: true });
-        fs.rmSync(jDir, { recursive: true, force: true });
+    // Cwd boundary accept/reject.
+    {
+        const p = pair(dir => {
+            const scoped = path.join(dir, 'project');
+            fs.mkdirSync(path.join(scoped, 'child'), { recursive: true });
+            const cb = path.join(dir, 'cfg', 'baseline');
+            fs.mkdirSync(path.join(cb, 'docs'), { recursive: true });
+            fs.writeFileSync(path.join(cb, 'config.json'), JSON.stringify({ version: 1, routes: [
+                    { id: 'cwd', event: 'UserPromptSubmit', freq: 1, cwd: scoped, doc: 'docs/cwd.md' }
+                ] }));
+            fs.writeFileSync(path.join(cb, 'docs', 'cwd.md'), 'CWD\n');
+        });
+        try {
+            assert.ok(p.invoke({ session_id: 'cwd-ok', hook_event_name: 'UserPromptSubmit', cwd: path.join(p.nativeDir, 'project', 'child') }).native.stdout);
+            assert.strictEqual(p.invoke({ session_id: 'cwd-no', hook_event_name: 'UserPromptSubmit', cwd: p.nativeDir + '-other' }).native.stdout, '');
+        }
+        finally {
+            p.close();
+        }
+    }
+    // Malformed hook and config inputs fail open identically.
+    {
+        const p = pair(dir => {
+            const cb = path.join(dir, 'cfg', 'baseline');
+            fs.mkdirSync(path.join(cb, 'docs'), { recursive: true });
+            fs.writeFileSync(path.join(cb, 'config.json'), '{bad json');
+        });
+        try {
+            assert.strictEqual(p.invoke({}, '{bad hook').native.stdout, '');
+            assert.strictEqual(p.invoke({ hook_event_name: 'UserPromptSubmit' }).native.stdout, '');
+            assert.strictEqual(p.invoke({ session_id: 'bad-event', hook_event_name: 'Unknown' }).native.stdout, '');
+            assert.strictEqual(p.invoke({ session_id: 'bad-config', hook_event_name: 'UserPromptSubmit' }).native.stdout, '');
+            p.config(p.nativeDir, { version: 2, routes: [] });
+            p.config(p.nodeDir, { version: 2, routes: [] });
+            assert.strictEqual(p.invoke({ session_id: 'bad-version', hook_event_name: 'UserPromptSubmit' }).native.stdout, '');
+        }
+        finally {
+            p.close();
+        }
+    }
+    // Route/doc/combined caps and config order.
+    {
+        const p = pair(dir => {
+            const routes = [
+                { id: 'first', event: 'UserPromptSubmit', freq: 1, doc: 'docs/first.md' },
+                { id: 'oversize', event: 'UserPromptSubmit', freq: 1, doc: 'docs/oversize.md' },
+                { id: 'second', event: 'UserPromptSubmit', freq: 1, doc: 'docs/second.md' },
+                { id: 'combined-skip', event: 'UserPromptSubmit', freq: 1, doc: 'docs/combined-skip.md' },
+                { id: 'third', event: 'UserPromptSubmit', freq: 1, doc: 'docs/third.md' },
+            ];
+            const cb = path.join(dir, 'cfg', 'baseline');
+            fs.mkdirSync(path.join(cb, 'docs'), { recursive: true });
+            fs.writeFileSync(path.join(cb, 'config.json'), JSON.stringify({ version: 1, routes }));
+            fs.writeFileSync(path.join(cb, 'docs', 'first.md'), 'A'.repeat(4000));
+            fs.writeFileSync(path.join(cb, 'docs', 'oversize.md'), 'X'.repeat(65537));
+            fs.writeFileSync(path.join(cb, 'docs', 'second.md'), 'B'.repeat(2000));
+            fs.writeFileSync(path.join(cb, 'docs', 'combined-skip.md'), 'Y'.repeat(5000));
+            fs.writeFileSync(path.join(cb, 'docs', 'third.md'), 'C'.repeat(1000));
+        });
+        try {
+            const expected = 'A'.repeat(4000) + '\n\n' + 'B'.repeat(2000) + '\n\n' + 'C'.repeat(1000);
+            assert.strictEqual(fireBodies(p.invoke({ session_id: 'caps', hook_event_name: 'UserPromptSubmit' }).native), expected);
+            const tooMany = Array.from({ length: 65 }, (_, i) => ({ id: 'r' + i, event: 'UserPromptSubmit', doc: 'docs/first.md' }));
+            p.config(p.nativeDir, { version: 1, routes: tooMany });
+            p.config(p.nodeDir, { version: 1, routes: tooMany });
+            assert.strictEqual(p.invoke({ session_id: 'route-cap', hook_event_name: 'UserPromptSubmit' }).native.stdout, '');
+        }
+        finally {
+            p.close();
+        }
+    }
+    // A live config frequency change uses existing counter state and preserves the exact key shape.
+    {
+        const p = pair(dir => {
+            const cb = path.join(dir, 'cfg', 'baseline');
+            fs.mkdirSync(path.join(cb, 'docs'), { recursive: true });
+            fs.writeFileSync(path.join(cb, 'config.json'), JSON.stringify({ version: 1, routes: [
+                    { id: 'freq', event: 'UserPromptSubmit', freq: 2, doc: 'docs/freq.md' }
+                ] }));
+            fs.writeFileSync(path.join(cb, 'docs', 'freq.md'), 'FREQ\n');
+        });
+        try {
+            assert.strictEqual(p.invoke({ session_id: 'state', hook_event_name: 'UserPromptSubmit' }).native.stdout, '');
+            for (const dir of [p.nativeDir, p.nodeDir])
+                p.config(dir, { version: 1, routes: [
+                        { id: 'freq', event: 'UserPromptSubmit', freq: 1, doc: 'docs/freq.md' }
+                    ] });
+            assert.strictEqual(p.invoke({ session_id: 'state', hook_event_name: 'UserPromptSubmit' }).native.stdout, exactEnvelope('UserPromptSubmit', 'FREQ\n'));
+            for (const dir of [p.nativeDir, p.nodeDir]) {
+                const counters = JSON.parse(fs.readFileSync(path.join(dir, '.baseline-counters.json'), 'utf8'));
+                assert.deepStrictEqual(Object.keys(counters), ['state:freq']);
+                assert.strictEqual(counters['state:freq'].count, 2);
+                assert.strictEqual(typeof counters['state:freq'].ts, 'number');
+            }
+        }
+        finally {
+            p.close();
+        }
+    }
+    // One malformed due doc suppresses all output; diagnostics stay exact and redacted.
+    {
+        const p = pair(dir => {
+            const cb = path.join(dir, 'cfg', 'baseline');
+            fs.mkdirSync(path.join(cb, 'docs'), { recursive: true });
+            fs.writeFileSync(path.join(cb, 'config.json'), JSON.stringify({ version: 1, routes: [
+                    { id: 'good', event: 'UserPromptSubmit', freq: 1, doc: 'docs/good.md' },
+                    { id: 'bad', event: 'UserPromptSubmit', freq: 1, doc: 'docs/bad.md' }
+                ] }));
+            fs.writeFileSync(path.join(cb, 'docs', 'good.md'), 'GOOD\n');
+            fs.writeFileSync(path.join(cb, 'docs', 'bad.md'), Buffer.from([0x66, 0x80, 0x67]));
+        });
+        try {
+            const silent = p.invoke({ session_id: 'redacted-session', hook_event_name: 'UserPromptSubmit' });
+            assert.strictEqual(silent.native.stdout, '');
+            assert.strictEqual(silent.native.stderr, silent.node.stderr);
+            const diagnostic = p.invoke({ session_id: 'redacted-session-2', hook_event_name: 'UserPromptSubmit' }, undefined, { BASELINE_DIAGNOSTICS: '1' });
+            assert.strictEqual(diagnostic.native.stdout, '');
+            assert.strictEqual(diagnostic.native.stderr, 'baseline: DOC_INVALID_UTF8\n');
+            assert.strictEqual(diagnostic.native.stderr, diagnostic.node.stderr);
+            assert.ok(!diagnostic.native.stderr.includes('redacted-session'));
+            assert.ok(!diagnostic.native.stderr.includes(p.nativeDir));
+        }
+        finally {
+            p.close();
+        }
     }
 }
 // The native counter update runs under the SAME mkdir-lock as the Node oracle. Verify freq
@@ -2942,6 +3096,184 @@ function testDispatchRssWithinCeiling() {
         fs.rmSync(dir, { recursive: true, force: true });
     }
 }
+function standaloneDispatcherFixture(label, routes) {
+    const agent = fs.mkdtempSync(path.join(os.tmpdir(), 'baseline-dispatch-' + label + '-'));
+    const cfgDir = path.join(agent, 'cfg', 'baseline');
+    fs.mkdirSync(path.join(cfgDir, 'docs'), { recursive: true });
+    fs.writeFileSync(path.join(cfgDir, 'config.json'), JSON.stringify({
+        version: 1,
+        routes: routes || [{ id: 'route', event: 'UserPromptSubmit', freq: 1, doc: 'docs/route.md' }]
+    }));
+    fs.writeFileSync(path.join(cfgDir, 'docs', 'route.md'), label + '\n');
+    return agent;
+}
+function dispatcherEnv(extra) {
+    const env = Object.assign({}, process.env);
+    delete env.BASELINE_DIAGNOSTICS;
+    return Object.assign(env, extra || {});
+}
+// An explicit agent directory is capability-like authority: no inherited manager,
+// agent, or home fallback may redirect config reads or counter writes.
+function testExplicitAgentConfigOutranksHostileEnvironment() {
+    const requested = standaloneDispatcherFixture('requested');
+    const hostile = standaloneDispatcherFixture('hostile');
+    try {
+        const env = dispatcherEnv({
+            BASELINE_AGENT_CONFIG_DIR: hostile,
+            CLAUDE_CONFIG_DIR: hostile,
+            CODEX_HOME: hostile,
+            HOME: hostile,
+            USERPROFILE: hostile,
+            HOMEDRIVE: hostile.slice(0, 2),
+            HOMEPATH: hostile.slice(2),
+        });
+        const input = JSON.stringify({ session_id: 'authority', hook_event_name: 'UserPromptSubmit' });
+        const explicit = (0, child_process_1.spawnSync)(process.execPath, [dispatcher, '--agent-config', requested], { input, env, encoding: 'utf8' });
+        assert.strictEqual(explicit.status, 0, explicit.stderr);
+        assert.strictEqual(fireBodies(explicit), 'requested\n');
+        assert.ok(fs.existsSync(path.join(requested, '.baseline-counters.json')), 'explicit dir receives counter state');
+        assert.ok(!fs.existsSync(path.join(hostile, '.baseline-counters.json')), 'hostile env dir remains untouched');
+        const fallback = (0, child_process_1.spawnSync)(process.execPath, [dispatcher], { input, env, encoding: 'utf8' });
+        assert.strictEqual(fireBodies(fallback), 'hostile\n', 'environment fallback remains active without the argument');
+    }
+    finally {
+        fs.rmSync(requested, { recursive: true, force: true });
+        fs.rmSync(hostile, { recursive: true, force: true });
+    }
+}
+// Invalid UTF-8 is an all-output fail-open no-op. Diagnostics are opt-in, stable,
+// stderr-only, and contain no input or path material.
+function testInvalidUtf8AndRedactedDiagnostics() {
+    const agent = standaloneDispatcherFixture('utf8', [
+        { id: 'good', event: 'UserPromptSubmit', freq: 1, doc: 'docs/route.md' },
+        { id: 'bad', event: 'UserPromptSubmit', freq: 1, doc: 'docs/bad.md' },
+    ]);
+    const badPath = path.join(agent, 'cfg', 'baseline', 'docs', 'bad.md');
+    fs.writeFileSync(badPath, Buffer.from([0x66, 0x80, 0x67]));
+    const input = JSON.stringify({ session_id: 'sensitive-session', hook_event_name: 'UserPromptSubmit' });
+    try {
+        const silent = (0, child_process_1.spawnSync)(process.execPath, [dispatcher, '--agent-config', agent], {
+            input, env: dispatcherEnv(), encoding: 'utf8'
+        });
+        assert.strictEqual(silent.status, 0);
+        assert.strictEqual(silent.stdout, '');
+        assert.strictEqual(silent.stderr, '');
+        const diagnostic = (0, child_process_1.spawnSync)(process.execPath, [dispatcher, '--agent-config', agent], {
+            input, env: dispatcherEnv({ BASELINE_DIAGNOSTICS: '1' }), encoding: 'utf8'
+        });
+        assert.strictEqual(diagnostic.status, 0);
+        assert.strictEqual(diagnostic.stdout, '');
+        assert.strictEqual(diagnostic.stderr, 'baseline: DOC_INVALID_UTF8\n');
+        assert.ok(!diagnostic.stderr.includes(agent));
+        assert.ok(!diagnostic.stderr.includes('sensitive-session'));
+    }
+    finally {
+        fs.rmSync(agent, { recursive: true, force: true });
+    }
+}
+// Counter persistence never opens the old predictable temp path and never follows a
+// planted destination link. Only a temp created by this invocation may be cleaned up.
+function testCounterTempAndDestinationSymlinksAreSafe() {
+    const agent = standaloneDispatcherFixture('counter-safe');
+    const target = path.join(agent, 'external-target.txt');
+    const counter = path.join(agent, '.baseline-counters.json');
+    const legacyTemp = counter + '.tmp';
+    fs.writeFileSync(target, 'DO NOT TOUCH');
+    try {
+        try {
+            fs.symlinkSync(target, legacyTemp, 'file');
+        }
+        catch (e) {
+            console.log('SKIP testCounterTempAndDestinationSymlinksAreSafe: file symlinks unavailable');
+            return;
+        }
+        const input = JSON.stringify({ session_id: 'counter-safe', hook_event_name: 'UserPromptSubmit' });
+        const first = (0, child_process_1.spawnSync)(process.execPath, [dispatcher, '--agent-config', agent], {
+            input, env: dispatcherEnv(), encoding: 'utf8'
+        });
+        assert.strictEqual(first.status, 0, first.stderr);
+        assert.strictEqual(fs.readFileSync(target, 'utf8'), 'DO NOT TOUCH');
+        assert.ok(fs.lstatSync(legacyTemp).isSymbolicLink(), 'foreign legacy temp remains untouched');
+        assert.ok(fs.existsSync(counter), 'counter state persisted through an unpredictable sibling temp');
+        const leftovers = fs.readdirSync(agent).filter(name => /^\.baseline-counters\.json\..+\.tmp$/.test(name));
+        assert.deepStrictEqual(leftovers, [], 'self-created temps are cleaned up');
+        fs.rmSync(counter);
+        fs.symlinkSync(target, counter, 'file');
+        const second = (0, child_process_1.spawnSync)(process.execPath, [dispatcher, '--agent-config', agent], {
+            input, env: dispatcherEnv(), encoding: 'utf8'
+        });
+        assert.strictEqual(second.status, 0, second.stderr);
+        assert.strictEqual(fs.readFileSync(target, 'utf8'), 'DO NOT TOUCH');
+        assert.ok(fs.lstatSync(counter).isSymbolicLink(), 'destination symlink remains untouched');
+    }
+    finally {
+        fs.rmSync(agent, { recursive: true, force: true });
+    }
+}
+function testGeneratedShimsPinAndSanitizeAgentConfig() {
+    const cfg = tempConfig();
+    const home = homeFor(cfg);
+    const pi = piFor(cfg);
+    const oc = opencodeFor(cfg);
+    const hostile = standaloneDispatcherFixture('shim-hostile');
+    fs.mkdirSync(pi, { recursive: true });
+    fs.mkdirSync(oc, { recursive: true });
+    try {
+        const install = run(['install', '--runtime', 'node', '--agents', 'pi,opencode'], cfg);
+        assert.strictEqual(install.status, 0, install.stderr || install.stdout);
+        for (const shim of [
+            path.join(pi, 'extensions', 'baseline-recital.ts'),
+            path.join(oc, 'plugins', 'baseline', 'plugin.js'),
+        ]) {
+            const text = fs.readFileSync(shim, 'utf8');
+            assert.match(text, /"--agent-config", AGENT_DIR/);
+            assert.match(text, /delete env\.BASELINE_AGENT_CONFIG_DIR/);
+            assert.match(text, /delete env\.CLAUDE_CONFIG_DIR/);
+            assert.match(text, /delete env\.CODEX_HOME/);
+            assert.match(text, /env: dispatcherEnv\(\)/);
+        }
+        setCentralConfig(home, [{ id: 'shim', event: 'UserPromptSubmit', freq: 1, doc: 'docs/shim.md' }], { 'docs/shim.md': 'shim-requested\n' });
+        const update = run(['update', '--runtime', 'node'], cfg);
+        assert.strictEqual(update.status, 0, update.stderr || update.stdout);
+        const plugin = path.join(oc, 'plugins', 'baseline', 'plugin.js');
+        const probe = [
+            'const { pathToFileURL } = require("node:url");',
+            '(async () => {',
+            '  const plugin = await import(pathToFileURL(process.argv[1]).href);',
+            '  const hooks = await plugin.default({ directory: process.cwd() });',
+            '  await hooks["chat.message"]({ sessionID: "shim-authority" });',
+            '  const output = { system: [] };',
+            '  await hooks["experimental.chat.system.transform"]({ sessionID: "shim-authority" }, output);',
+            '  process.stdout.write(JSON.stringify(output));',
+            '})().catch(e => { process.stderr.write(String(e)); process.exitCode = 1; });',
+        ].join('\n');
+        const env = dispatcherEnv({
+            BASELINE_AGENT_CONFIG_DIR: hostile,
+            CLAUDE_CONFIG_DIR: hostile,
+            CODEX_HOME: hostile,
+            HOME: hostile,
+            USERPROFILE: hostile,
+        });
+        const direct = (0, child_process_1.spawnSync)(process.execPath, [path.join(oc, 'hooks', 'baseline-recital.js'), '--agent-config', oc], {
+            input: JSON.stringify({ session_id: 'shim-direct', hook_event_name: 'UserPromptSubmit' }),
+            env, encoding: 'utf8', cwd: root
+        });
+        assert.strictEqual(fireBodies(direct), 'shim-requested\n', 'generated shim dispatcher fixture must be executable: ' + direct.stderr);
+        const executed = (0, child_process_1.spawnSync)(process.execPath, ['-e', probe, plugin], { env, encoding: 'utf8', cwd: root });
+        assert.strictEqual(executed.status, 0, executed.stderr);
+        assert.deepStrictEqual(JSON.parse(executed.stdout).system, ['shim-requested\n']);
+        assert.ok(fs.existsSync(path.join(oc, '.baseline-counters.json')), 'generated shim writes only requested agent state');
+        assert.ok(!fs.existsSync(path.join(hostile, '.baseline-counters.json')), 'hostile inherited directory remains untouched');
+    }
+    finally {
+        fs.rmSync(cfg, { recursive: true, force: true });
+        fs.rmSync(home, { recursive: true, force: true });
+        fs.rmSync(codexFor(cfg), { recursive: true, force: true });
+        fs.rmSync(pi, { recursive: true, force: true });
+        fs.rmSync(oc, { recursive: true, force: true });
+        fs.rmSync(hostile, { recursive: true, force: true });
+    }
+}
 // --- runner -----------------------------------------------------------------
 const TESTS = [
     ['testCentralInstallAndAgentLinks', testCentralInstallAndAgentLinks],
@@ -2996,6 +3328,10 @@ const TESTS = [
     ['testOversizeDocSkipped', testOversizeDocSkipped],
     ['testDocInjectionCharCapBoundaries', testDocInjectionCharCapBoundaries],
     ['testCombinedDocInjectionCapSkipsMiddleBody', testCombinedDocInjectionCapSkipsMiddleBody],
+    ['testExplicitAgentConfigOutranksHostileEnvironment', testExplicitAgentConfigOutranksHostileEnvironment],
+    ['testInvalidUtf8AndRedactedDiagnostics', testInvalidUtf8AndRedactedDiagnostics],
+    ['testCounterTempAndDestinationSymlinksAreSafe', testCounterTempAndDestinationSymlinksAreSafe],
+    ['testGeneratedShimsPinAndSanitizeAgentConfig', testGeneratedShimsPinAndSanitizeAgentConfig],
     ['testDoctorReportsAndFixes', testDoctorReportsAndFixes],
     ['testDoctorDetectsDanglingHookLinks', testDoctorDetectsDanglingHookLinks],
     ['testDoctorDetectsMissingDoc', testDoctorDetectsMissingDoc],
