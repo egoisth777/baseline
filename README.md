@@ -28,7 +28,7 @@ Canonical goal docs live under `.arca/baseline-sp/goal/`: `vision.md`, `architec
 
 ## How it works
 
-One small **dispatcher** runs on each wired hook event. It reads the event JSON the harness passes on stdin, loads `cfg/baseline/config.json`, selects the routes matching the `(event, cwd)`, bumps each route's own per-session counter, and on a route's Nth match prints a JSON object whose `additionalContext` field the agent injects into the model's context as a system reminder. The dispatcher carries **zero baked content**: if the config or docs are gone it injects nothing and exits clean, and `doctor` reports the fault.
+One small **dispatcher** runs on each wired hook event. It reads the event JSON the harness passes on stdin, requiring `session_id` to be a non-empty string, loads `cfg/baseline/config.json`, selects the routes matching the `(event, cwd)`, bumps each route's own per-session counter, and on a route's Nth match prints a JSON object whose `additionalContext` field the agent injects into the model's context as a system reminder. The dispatcher carries **zero baked content**: if the config or docs are gone it injects nothing and exits clean, and `doctor` reports the fault.
 
 Supported injecting events: `UserPromptSubmit`, `SessionStart` (optionally a lifecycle phase via the event form `SessionStart.<phase>`, e.g. `SessionStart.compact`), `PreToolUse` / `PostToolUse`.
 
@@ -223,13 +223,12 @@ baseline/
 
 ## Trust boundary
 
-Doc bytes enter the model's context, so treat every `docs/*.md` as trusted configuration: inspect edits, keep docs short, never paste untrusted text. The dispatcher caps `config.json` and each doc at 64 KiB, skips docs over 10,000 characters, caps the combined hook context at 10,000 characters, limits routes to 64, resolves each `doc` strictly inside the config folder after realpath checks (no `..` or symlink escapes), and always exits 0 — a hook fault never blocks the agent. Counters are locked during update and auto-pruned after 7 days of inactivity.
+Doc bytes enter the model's context, so treat every `docs/*.md` as trusted configuration: inspect edits, keep docs short, never paste untrusted text. The dispatcher caps `config.json` and each doc at 64 KiB, skips docs over 10,000 characters, caps the combined hook context at 10,000 characters, limits routes to 64, and always exits 0—a hook fault never blocks the agent. Document paths are checked using the real paths of both the config folder and candidate. A symlink is followed only when its target remains inside the real config folder; any path resolving outside is rejected. Counters are locked during update and auto-pruned after 7 days of inactivity.
 
 An explicit dispatcher `--agent-config <dir>` is authoritative over inherited agent/home
 environment variables; generated shims always pass it. Counter updates use an exclusive,
-unpredictable sibling temp followed by atomic replacement. Path-containment and descendant
-link policy remain owned by I-018 P0; stale-lock fencing and retry policy remain owned by
-I-018 P4.
+unpredictable sibling temp followed by atomic replacement. Stale-lock fencing and retry
+policy remain owned by I-018 P4.
 
 ## Develop
 

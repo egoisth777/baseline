@@ -16,7 +16,7 @@ pub fn parse(allocator: std.mem.Allocator, input: []const u8) ?Payload {
         .object => |o| o,
         else => return null,
     };
-    const session_id = sessionId(allocator, root) orelse return null;
+    const session_id = sessionId(root) orelse return null;
     const event = stringField(root, "hook_event_name") orelse return null;
     if (!isSupportedEvent(event)) return null;
     return .{ .session_id = session_id, .event = event, .source = stringField(root, "source"), .cwd = stringField(root, "cwd") };
@@ -30,14 +30,10 @@ pub fn stringField(obj: std.json.ObjectMap, key: []const u8) ?[]const u8 {
     };
 }
 
-fn sessionId(allocator: std.mem.Allocator, obj: std.json.ObjectMap) ?[]const u8 {
+fn sessionId(obj: std.json.ObjectMap) ?[]const u8 {
     const value = obj.get("session_id") orelse return null;
     return switch (value) {
         .string => |s| if (s.len == 0) null else s,
-        .integer => |n| if (n == 0) null else std.fmt.allocPrint(allocator, "{d}", .{n}) catch null,
-        .number_string => |s| if (s.len == 0) null else s,
-        .float => |f| if (f == 0 or std.math.isNan(f)) null else std.fmt.allocPrint(allocator, "{d}", .{f}) catch null,
-        .bool => |b| if (b) "true" else null,
         else => null,
     };
 }
@@ -62,8 +58,10 @@ pub fn eventMatches(route_event: []const u8, hook_event: []const u8, source: ?[]
 test "payload parsing and phase selection" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    const p = parse(arena.allocator(), "{\"session_id\":7,\"hook_event_name\":\"SessionStart\",\"source\":\"resume\"}").?;
+    const p = parse(arena.allocator(), "{\"session_id\":\"7\",\"hook_event_name\":\"SessionStart\",\"source\":\"resume\"}").?;
     try std.testing.expectEqualStrings("7", p.session_id);
     try std.testing.expect(eventMatches("SessionStart.resume", p.event, p.source));
     try std.testing.expect(!eventMatches("SessionStart.startup", p.event, p.source));
+    try std.testing.expect(parse(arena.allocator(), "{\"session_id\":7,\"hook_event_name\":\"UserPromptSubmit\"}") == null);
+    try std.testing.expect(parse(arena.allocator(), "{\"session_id\":true,\"hook_event_name\":\"UserPromptSubmit\"}") == null);
 }

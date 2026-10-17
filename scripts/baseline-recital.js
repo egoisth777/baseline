@@ -104,14 +104,14 @@ function loadValidConfig() {
         diagnose('CONFIG_ROUTES_CAP');
         return empty;
     }
-    const seen = {};
+    const seen = new Set();
     const out = [];
     for (const r of routes) {
         if (!r || typeof r !== 'object')
             continue;
         if (typeof r.id !== 'string' || !contracts_1.SLUG.test(r.id))
             continue;
-        if (seen[r.id])
+        if (seen.has(r.id))
             continue; // duplicate id — first wins, never double-count
         if (typeof r.event !== 'string')
             continue;
@@ -127,7 +127,7 @@ function loadValidConfig() {
         }
         if (r.cwd !== undefined && typeof r.cwd !== 'string')
             continue;
-        seen[r.id] = true;
+        seen.add(r.id);
         out.push({ id: r.id, event: r.event, freq, cwd: r.cwd, doc: r.doc });
     }
     return { routes: out };
@@ -292,10 +292,10 @@ process.stdin.on('end', async () => {
         const input = Buffer.concat(chunks).toString('utf8');
         const data = JSON.parse(input);
         const sessionId = data.session_id;
-        if (!sessionId) {
+        if (typeof sessionId !== 'string' || sessionId.length === 0) {
             diagnose('INPUT_SESSION');
-            return;
-        } // No stable key → nothing to count.
+            return; // No stable string key → nothing to count.
+        }
         const event = data.hook_event_name;
         if (typeof event !== 'string' || contracts_1.SUPPORTED_EVENTS.indexOf(event) === -1) {
             diagnose('INPUT_EVENT');

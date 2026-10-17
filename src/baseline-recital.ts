@@ -132,12 +132,12 @@ function loadValidConfig(): ValidConfig {
   const routes = Array.isArray(cfg.routes) ? cfg.routes : [];
   if (routes.length > MAX_ROUTES) { diagnose('CONFIG_ROUTES_CAP'); return empty; }
 
-  const seen: { [id: string]: true } = {};
+  const seen = new Set<string>();
   const out: Route[] = [];
   for (const r of routes) {
     if (!r || typeof r !== 'object') continue;
     if (typeof r.id !== 'string' || !SLUG.test(r.id)) continue;
-    if (seen[r.id]) continue; // duplicate id — first wins, never double-count
+    if (seen.has(r.id)) continue; // duplicate id — first wins, never double-count
     if (typeof r.event !== 'string') continue;
     if (!isSupportedRouteEvent(r.event)) continue;
     if (!safeDocPath(r.doc, cfgDir)) continue;
@@ -147,7 +147,7 @@ function loadValidConfig(): ValidConfig {
       freq = r.freq;
     }
     if (r.cwd !== undefined && typeof r.cwd !== 'string') continue;
-    seen[r.id] = true;
+    seen.add(r.id);
     out.push({ id: r.id, event: r.event, freq, cwd: r.cwd, doc: r.doc });
   }
   return { routes: out };
@@ -292,7 +292,10 @@ process.stdin.on('end', async () => {
     const input = Buffer.concat(chunks).toString('utf8');
     const data: HookInput = JSON.parse(input);
     const sessionId = data.session_id;
-    if (!sessionId) { diagnose('INPUT_SESSION'); return; } // No stable key → nothing to count.
+    if (typeof sessionId !== 'string' || sessionId.length === 0) {
+      diagnose('INPUT_SESSION');
+      return; // No stable string key → nothing to count.
+    }
 
     const event = data.hook_event_name;
     if (typeof event !== 'string' || SUPPORTED_EVENTS.indexOf(event) === -1) { diagnose('INPUT_EVENT'); return; }

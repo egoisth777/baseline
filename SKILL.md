@@ -51,7 +51,7 @@ Requires Claude Code, Codex, pi, oh-my-pi, or opencode, plus Node.js. Node runs 
 
 ## Trust boundary
 
-Every `docs/*.md` is injected into model context, so treat docs as trusted configuration: inspect edits, keep them short, never paste untrusted text. The dispatcher caps `config.json`/each doc at 64 KiB, skips docs over 10,000 characters, caps the combined hook context at 10,000 characters, limits routes to 64, resolves each `doc` strictly inside the config folder after realpath checks, and fails open. If `status` reports a copy fallback for the config link, rerun install/update after editing the config folder.
+Every `docs/*.md` is injected into model context, so treat docs as trusted configuration: inspect edits, keep them short, never paste untrusted text. The dispatcher caps `config.json`/each doc at 64 KiB, skips docs over 10,000 characters, caps the combined hook context at 10,000 characters, limits routes to 64, and fails open. Document paths use the real paths of both the config folder and candidate: links resolving inside the real config folder are followed; anything resolving outside is rejected. If `status` reports a copy fallback for the config link, rerun install/update after editing the config folder.
 
 Docs must be valid UTF-8; one malformed due doc makes the invocation emit nothing.
 For redacted fail-open reason codes on stderr, set `BASELINE_DIAGNOSTICS=1`.

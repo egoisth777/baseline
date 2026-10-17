@@ -1592,6 +1592,129 @@ function testNativeDispatchParity(): void {
       assert.ok(!diagnostic.native.stderr.includes('redacted-session'));
       assert.ok(!diagnostic.native.stderr.includes(p.nativeDir));
     } finally { p.close(); }
+
+  // Real containment: a symlinked docs directory must not escape the config root.
+  {
+    let linksAvailable = true;
+    const p = pair(dir => {
+      const cb = path.join(dir, 'cfg', 'baseline');
+      const outside = path.join(dir, 'outside-docs');
+      fs.mkdirSync(cb, { recursive: true });
+      fs.mkdirSync(outside, { recursive: true });
+      fs.writeFileSync(path.join(outside, 'escape.md'), 'OUTSIDE\n');
+      try {
+        fs.symlinkSync(outside, path.join(cb, 'docs'), process.platform === 'win32' ? 'junction' : 'dir');
+      } catch {
+        linksAvailable = false;
+      }
+      fs.writeFileSync(path.join(cb, 'config.json'), JSON.stringify({ version: 1, routes: [
+        { id: 'escape', event: 'UserPromptSubmit', doc: 'docs/escape.md' }
+      ] }));
+    });
+    try {
+      if (!linksAvailable) {
+        console.log('  (skip) native intermediate doc symlink parity: link creation unavailable.');
+      } else {
+        const r = p.invoke({ session_id: 'intermediate-link', hook_event_name: 'UserPromptSubmit' });
+        assert.strictEqual(r.native.stdout, '');
+        assert.strictEqual(r.node.stdout, '');
+      }
+    } finally { p.close(); }
+  }
+
+  // A final symlink whose target remains inside cfg is allowed, matching the Node policy.
+  {
+    let linksAvailable = true;
+    const p = pair(dir => {
+      const cb = path.join(dir, 'cfg', 'baseline');
+      fs.mkdirSync(path.join(cb, 'docs'), { recursive: true });
+      const target = path.join(cb, 'docs', 'real.md');
+      fs.writeFileSync(target, 'INSIDE\n');
+      try {
+        fs.symlinkSync(target, path.join(cb, 'docs', 'alias.md'), 'file');
+      } catch {
+        linksAvailable = false;
+      }
+      fs.writeFileSync(path.join(cb, 'config.json'), JSON.stringify({ version: 1, routes: [
+        { id: 'inside-link', event: 'UserPromptSubmit', doc: 'docs/alias.md' }
+      ] }));
+    });
+    try {
+      if (!linksAvailable) {
+        console.log('  (skip) native in-config doc symlink parity: link creation unavailable.');
+      } else {
+        const r = p.invoke({ session_id: 'inside-link', hook_event_name: 'UserPromptSubmit' });
+        assert.strictEqual(r.native.stdout, exactEnvelope('UserPromptSubmit', 'INSIDE\n'));
+        assert.strictEqual(r.node.stdout, r.native.stdout);
+      }
+    } finally { p.close(); }
+  }
+
+  // The config root itself may be linked when BASELINE_CFG is external. Realpath both
+  // sides so that supported layout remains readable while descendant escapes are denied.
+  {
+    let linksAvailable = true;
+    const p = pair(dir => {
+      const cfgParent = path.join(dir, 'cfg');
+      const external = path.join(dir, 'external-config');
+      fs.mkdirSync(cfgParent, { recursive: true });
+      fs.mkdirSync(path.join(external, 'docs'), { recursive: true });
+      fs.writeFileSync(path.join(external, 'docs', 'external.md'), 'EXTERNAL\n');
+      fs.writeFileSync(path.join(external, 'config.json'), JSON.stringify({ version: 1, routes: [
+        { id: 'external', event: 'UserPromptSubmit', doc: 'docs/external.md' }
+      ] }));
+      try {
+        fs.symlinkSync(external, path.join(cfgParent, 'baseline'), process.platform === 'win32' ? 'junction' : 'dir');
+      } catch {
+        linksAvailable = false;
+      }
+    });
+    try {
+      if (!linksAvailable) {
+        console.log('  (skip) native linked config-root parity: link creation unavailable.');
+      } else {
+        const r = p.invoke({ session_id: 'external-root', hook_event_name: 'UserPromptSubmit' });
+        assert.strictEqual(r.native.stdout, exactEnvelope('UserPromptSubmit', 'EXTERNAL\n'));
+        assert.strictEqual(r.node.stdout, r.native.stdout);
+      }
+    } finally { p.close(); }
+  }
+  }
+
+  // Route IDs are dynamic data, not Object prototype properties.
+  {
+    const p = pair(dir => {
+      const cb = path.join(dir, 'cfg', 'baseline');
+      fs.mkdirSync(path.join(cb, 'docs'), { recursive: true });
+      fs.writeFileSync(path.join(cb, 'docs', 'constructor.md'), 'CONSTRUCTOR\n');
+      fs.writeFileSync(path.join(cb, 'config.json'), JSON.stringify({ version: 1, routes: [
+        { id: 'constructor', event: 'UserPromptSubmit', doc: 'docs/constructor.md' }
+      ] }));
+    });
+    try {
+      const r = p.invoke({ session_id: 'constructor-route', hook_event_name: 'UserPromptSubmit' });
+      assert.strictEqual(r.native.stdout, exactEnvelope('UserPromptSubmit', 'CONSTRUCTOR\n'));
+      assert.strictEqual(r.node.stdout, r.native.stdout);
+    } finally { p.close(); }
+  }
+
+  // Only a non-empty string is a stable session key; every other JSON type fails open.
+  {
+    const p = pair(dir => {
+      const cb = path.join(dir, 'cfg', 'baseline');
+      fs.mkdirSync(path.join(cb, 'docs'), { recursive: true });
+      fs.writeFileSync(path.join(cb, 'docs', 'session.md'), 'SESSION\n');
+      fs.writeFileSync(path.join(cb, 'config.json'), JSON.stringify({ version: 1, routes: [
+        { id: 'session', event: 'UserPromptSubmit', doc: 'docs/session.md' }
+      ] }));
+    });
+    try {
+      for (const sessionId of [{ nested: true }, ['array'], 7, true, false]) {
+        const r = p.invoke({ session_id: sessionId, hook_event_name: 'UserPromptSubmit' });
+        assert.strictEqual(r.native.stdout, '');
+        assert.strictEqual(r.node.stdout, r.native.stdout);
+      }
+    } finally { p.close(); }
   }
 }
 
@@ -2129,6 +2252,32 @@ function testDocSymlinkEscapeRejected(): void {
 
   const doctor = run(['doctor'], cfg);
   assert.notStrictEqual(doctor.status, 0, 'doctor should fail on symlink escape');
+  assert.match(doctor.stdout, /resolves outside the config folder/);
+}
+
+function testDocDirectorySymlinkEscapeRejected(): void {
+  const cfg = tempConfig();
+  const home = homeFor(cfg);
+  assert.strictEqual(run(['install'], cfg).status, 0);
+  const docsDir = path.join(home, 'cfg', 'docs');
+  const outside = path.join(home, 'outside-docs');
+  fs.rmSync(docsDir, { recursive: true, force: true });
+  write(path.join(outside, 'secret.md'), 'SECRET\n');
+  try {
+    fs.symlinkSync(outside, docsDir, process.platform === 'win32' ? 'junction' : 'dir');
+  } catch {
+    console.log('  (skip) testDocDirectorySymlinkEscapeRejected: link creation unavailable.');
+    return;
+  }
+  setCentralConfig(home, [
+    { id: 'directory-link', event: 'UserPromptSubmit', freq: 1, doc: 'docs/secret.md' }
+  ], {});
+
+  const r = hook({ session_id: 'directory-sym', hook_event_name: 'UserPromptSubmit', cwd: cfg }, cfg);
+  assert.strictEqual((r.stdout || '').trim(), '', 'doc directory symlink escape must be rejected');
+
+  const doctor = run(['doctor'], cfg);
+  assert.notStrictEqual(doctor.status, 0, 'doctor should fail on a directory symlink escape');
   assert.match(doctor.stdout, /resolves outside the config folder/);
 }
 
@@ -3815,6 +3964,7 @@ const TESTS: Array<[string, () => void]> = [
   ['testBadRouteSkippedOthersFire', testBadRouteSkippedOthersFire],
   ['testDocPathTraversalRejected', testDocPathTraversalRejected],
   ['testDocSymlinkEscapeRejected', testDocSymlinkEscapeRejected],
+  ['testDocDirectorySymlinkEscapeRejected', testDocDirectorySymlinkEscapeRejected],
   ['testOversizeDocSkipped', testOversizeDocSkipped],
   ['testDocInjectionCharCapBoundaries', testDocInjectionCharCapBoundaries],
   ['testCombinedDocInjectionCapSkipsMiddleBody', testCombinedDocInjectionCapSkipsMiddleBody],

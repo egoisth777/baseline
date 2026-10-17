@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const contracts = @import("contracts.zig");
 
 pub fn safePath(allocator: std.mem.Allocator, doc: []const u8, cfg_dir: []const u8) ?[]const u8 {
@@ -10,9 +11,22 @@ pub fn safePath(allocator: std.mem.Allocator, doc: []const u8, cfg_dir: []const 
     return if (std.mem.startsWith(u8, resolved, prefix)) resolved else null;
 }
 
-fn isSymlink(io: std.Io, path: []const u8) bool {
-    const stat = std.Io.Dir.cwd().statFile(io, path, .{ .follow_symlinks = false }) catch return false;
-    return stat.kind == .sym_link;
+pub fn safeRealPath(io: std.Io, allocator: std.mem.Allocator, doc: []const u8, cfg_dir: []const u8) ?[]const u8 {
+    const resolved = safePath(allocator, doc, cfg_dir) orelse return null;
+    const cwd: std.Io.Dir = .cwd();
+    const real_base = cwd.realPathFileAlloc(io, cfg_dir, allocator) catch return null;
+    const real_doc = cwd.realPathFileAlloc(io, resolved, allocator) catch return null;
+    if (pathEql(real_doc, real_base)) return null;
+    const prefix = if (real_base.len > 0 and real_base[real_base.len - 1] == std.fs.path.sep) real_base else std.fmt.allocPrint(allocator, "{s}{c}", .{ real_base, std.fs.path.sep }) catch return null;
+    return if (pathStartsWith(real_doc, prefix)) resolved else null;
+}
+
+fn pathEql(a: []const u8, b: []const u8) bool {
+    return if (builtin.os.tag == .windows) std.ascii.eqlIgnoreCase(a, b) else std.mem.eql(u8, a, b);
+}
+
+fn pathStartsWith(path: []const u8, prefix: []const u8) bool {
+    return if (builtin.os.tag == .windows) std.ascii.startsWithIgnoreCase(path, prefix) else std.mem.startsWith(u8, path, prefix);
 }
 
 pub fn validUtf8(bytes: []const u8) bool {
@@ -46,7 +60,6 @@ pub fn readBatch(io: std.Io, allocator: std.mem.Allocator, paths: []const ?[]con
     var group: std.Io.Group = .init;
     for (paths, 0..) |maybe_path, i| {
         const path = maybe_path orelse continue;
-        if (isSymlink(io, path)) continue; // I-018 policy preserved.
         group.concurrent(io, worker, .{ io, path, &slots[i] }) catch worker(io, path, &slots[i]);
     }
     group.await(io) catch {};

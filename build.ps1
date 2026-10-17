@@ -45,14 +45,44 @@ Move-Item -LiteralPath "baseline-recital" -Destination "bin\baseline-recital-lin
 # Drop the debug/object leftovers Zig emits next to the binaries.
 Remove-Item -Path "bin\*.pdb", "bin\*.o", "bin\*.obj" -Force -ErrorAction SilentlyContinue
 
-$hashes = @(
-	Get-FileHash -Algorithm SHA256 -Path "bin\baseline-recital-windows-x64.exe"
-	Get-FileHash -Algorithm SHA256 -Path "bin\baseline-recital-linux-x64"
-) | ForEach-Object {
-	"$($_.Hash.ToLower())  $(Split-Path -Leaf $_.Path)"
+function Get-Sha256([string]$Path) {
+	$hashCommand = Get-Command Get-FileHash -ErrorAction SilentlyContinue
+	if ($hashCommand) {
+		return (Get-FileHash -Algorithm SHA256 -Path $Path).Hash.ToLowerInvariant()
+	}
+
+	$certutil = Get-Command certutil -ErrorAction SilentlyContinue
+	if ($certutil) {
+		$output = & $certutil.Source -hashfile $Path SHA256
+		if ($LASTEXITCODE -eq 0) {
+			$hash = $output |
+				ForEach-Object { $_ -replace '\s', '' } |
+				Where-Object { $_ -match '^[0-9A-Fa-f]{64}$' } |
+				Select-Object -First 1
+			if ($hash) { return $hash.ToLowerInvariant() }
+		}
+	}
+	return $null
 }
-# Join with LF (not CRLF) so `sha256sum -c` works on POSIX consumers.
-[System.IO.File]::WriteAllText("$root\bin\SHA256SUMS", ($hashes -join "`n") + "`n", (New-Object System.Text.ASCIIEncoding))
+
+$hashPaths = @(
+	"bin\baseline-recital-windows-x64.exe"
+	"bin\baseline-recital-linux-x64"
+)
+$hashes = @()
+foreach ($path in $hashPaths) {
+	$hash = Get-Sha256 $path
+	if (-not $hash) {
+		Write-Warning "No working Get-FileHash or certutil found; bin\SHA256SUMS was not refreshed."
+		$hashes = @()
+		break
+	}
+	$hashes += "$hash  $(Split-Path -Leaf $path)"
+}
+if ($hashes.Count -eq $hashPaths.Count) {
+	# Join with LF (not CRLF) so `sha256sum -c` works on POSIX consumers.
+	[System.IO.File]::WriteAllText("$root\bin\SHA256SUMS", ($hashes -join "`n") + "`n", (New-Object System.Text.ASCIIEncoding))
+}
 
 Write-Host ""
 Write-Host "Built binaries:"

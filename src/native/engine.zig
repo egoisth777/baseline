@@ -50,7 +50,7 @@ fn run(io: std.Io, env: *std.process.Environ.Map) !void {
     if (due.len == 0) return;
 
     const paths = try allocator.alloc(?[]const u8, due.len);
-    for (due, 0..) |route, i| paths[i] = docs.safePath(allocator, route.doc, cfg_dir);
+    for (due, 0..) |route, i| paths[i] = docs.safeRealPath(io, allocator, route.doc, cfg_dir);
     const batch = docs.readBatch(io, allocator, paths);
     if (batch.invalid_utf8) {
         diagnostics.write(io, diagnostic, "DOC_INVALID_UTF8");
