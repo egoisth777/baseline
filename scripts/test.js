@@ -273,7 +273,18 @@ if (command.length === 1 && command[0] === 'list') {
     output({ installed: [null] });
     process.exit(0);
   }
-  output({ installed: state.installed.map(entry => Object.assign({}, entry, { source: { path: reportedPath(entry.source.path) } })) });
+  const installed = state.installed.map(entry => Object.assign({}, entry, { source: { path: reportedPath(entry.source.path) } }));
+  if (process.env.BASELINE_TEST_FAKE_CODEX_PLUGIN_LIST_REMOTE_ENTRY === '1') {
+    // Real Codex lists cloud-hosted plugins with a remote source and no folder path.
+    installed.push({
+      pluginId: 'caveman@openai-curated-remote',
+      version: '2.7.0',
+      installed: true,
+      enabled: true,
+      source: { source: 'remote', id: 'plugins_test_remote' },
+    });
+  }
+  output({ installed });
   process.exit(0);
 }
 
@@ -2405,6 +2416,33 @@ function testUninstallKeepsCodexStateWhenListJsonHasWrongShape() {
         assert.match(uninstall.stdout, fault.marketplaceReport, fault.name + ': wrong-shaped JSON must report why marketplace state was preserved');
     }
 }
+// Codex lists cloud-hosted plugins as `source: { source: 'remote', id }` with no
+// folder path. Such entries belong to other plugins; they must not turn the whole
+// plugin list into unknown state for doctor, status, or uninstall.
+function testCodexRemotePluginEntriesAreReadable() {
+    const cfg = tempConfig();
+    const home = homeFor(cfg);
+    const codex = codexFor(cfg);
+    const remote = { BASELINE_TEST_FAKE_CODEX_PLUGIN_LIST_REMOTE_ENTRY: '1' };
+    const install = run(['install'], cfg, undefined, remote);
+    assert.strictEqual(install.status, 0, install.stderr || install.stdout);
+    assertCodexPluginInstalled(codex, home, 'remote entry install');
+    const doctor = run(['doctor'], cfg, undefined, remote);
+    assert.strictEqual(doctor.status, 0, doctor.stdout);
+    assert.match(doctor.stdout, /codex plugin install: codex baseline@baseline-local installed @/, 'doctor must find baseline next to a remote plugin entry');
+    const status = run(['status'], cfg, undefined, remote);
+    assert.strictEqual(status.status, 0, status.stderr || status.stdout);
+    assert.match(statusAgentSection(status.stdout, 'codex'), /codex plugin\s+: OK \(installed\) @/, 'status must report baseline installed next to a remote plugin entry');
+    resetFakeCodexCommands(codex);
+    const uninstall = run(['uninstall'], cfg, undefined, remote);
+    assert.strictEqual(uninstall.status, 0, uninstall.stderr || uninstall.stdout);
+    assert.deepStrictEqual(readFakeCodexState(codex).commands, [
+        codexCommand('marketplace', 'list'),
+        codexCommand('list'),
+        codexCommand('remove', CODEX_PLUGIN_KEY),
+        codexCommand('marketplace', 'remove', CODEX_MARKETPLACE),
+    ], 'uninstall must remove baseline when the list also holds a remote plugin entry');
+}
 // --- repo invariants --------------------------------------------------------
 function assertGitVisible(file) {
     const r = (0, child_process_1.spawnSync)('git', ['check-ignore', '-q', '--', file], { cwd: root, encoding: 'utf8' });
@@ -3515,6 +3553,7 @@ const TESTS = [
     ['testUninstallKeepsCodexMarketplaceWhenPluginStateUnreadable', testUninstallKeepsCodexMarketplaceWhenPluginStateUnreadable],
     ['testUninstallPreservesForeignCodexMarketplace', testUninstallPreservesForeignCodexMarketplace],
     ['testUninstallKeepsCodexStateWhenListJsonHasWrongShape', testUninstallKeepsCodexStateWhenListJsonHasWrongShape],
+    ['testCodexRemotePluginEntriesAreReadable', testCodexRemotePluginEntriesAreReadable],
     ['testUnavailableCodexCliLeavesControlSurfaceUninstalled', testUnavailableCodexCliLeavesControlSurfaceUninstalled],
     ['testClaudePluginManifest', testClaudePluginManifest],
     ['testExternalConfigLocation', testExternalConfigLocation],
