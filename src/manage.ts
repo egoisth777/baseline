@@ -138,7 +138,9 @@ interface CodexPluginListEntry {
   pluginId: string;
   enabled?: boolean;
   version?: string;
-  source: { path: string };
+  // Local plugins carry a folder path; remote (cloud-hosted) plugins carry
+  // `{ source: 'remote', id }` and no path.
+  source: { path?: string };
 }
 
 interface CodexPluginInspection {
@@ -1060,7 +1062,8 @@ function isCodexPluginListEntry(value: unknown): value is CodexPluginListEntry {
     typeof value.pluginId === 'string' &&
     (value.enabled === undefined || typeof value.enabled === 'boolean') &&
     (value.version === undefined || typeof value.version === 'string') &&
-    isRecord(value.source) && typeof value.source.path === 'string';
+    isRecord(value.source) &&
+    (value.source.path === undefined || typeof value.source.path === 'string');
 }
 
 function codexMarketplaceEntries(data: unknown): CodexMarketplaceListEntry[] | null {
@@ -1135,7 +1138,7 @@ function codexPluginInspection(ap: AgentPaths): CodexPluginInspection {
       plugin: { ok: false, mechanism: 'foreign' },
       version: plugin.version === undefined ? null : plugin.version,
       installedPath: null,
-      detail: CODEX_PLUGIN_KEY + ' resolves to ' + String(pluginSource) + ', not ' + central.codexPluginDir,
+      detail: CODEX_PLUGIN_KEY + ' resolves to ' + (pluginSource || 'a non-local source') + ', not ' + central.codexPluginDir,
     };
   }
   return {
