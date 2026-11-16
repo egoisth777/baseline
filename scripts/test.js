@@ -284,6 +284,20 @@ if (command.length === 1 && command[0] === 'list') {
       source: { source: 'remote', id: 'plugins_test_remote' },
     });
   }
+  if (process.env.BASELINE_TEST_FAKE_CODEX_PLUGIN_LIST_PATHLESS_BASELINE === '1') {
+    // The baseline plugin id reported with no folder path: not the manager-owned folder.
+    for (const entry of installed) {
+      if (entry.pluginId === 'baseline@baseline-local') entry.source = { source: 'remote', id: 'plugins_test_baseline' };
+    }
+  }
+  if (process.env.BASELINE_TEST_FAKE_CODEX_PLUGIN_LIST_NON_STRING_PATH === '1') {
+    installed.push({
+      pluginId: 'other@other-local',
+      installed: true,
+      enabled: true,
+      source: { source: 'local', path: 42 },
+    });
+  }
   output({ installed });
   process.exit(0);
 }
@@ -2397,6 +2411,12 @@ function testUninstallKeepsCodexStateWhenListJsonHasWrongShape() {
             commands: [codexCommand('marketplace', 'list'), codexCommand('list')],
             marketplaceReport: /marketplace : owned — kept because plugin is unreadable/,
         },
+        {
+            name: 'plugin entry with non-string path',
+            env: { BASELINE_TEST_FAKE_CODEX_PLUGIN_LIST_NON_STRING_PATH: '1' },
+            commands: [codexCommand('marketplace', 'list'), codexCommand('list')],
+            marketplaceReport: /marketplace : owned — kept because plugin is unreadable/,
+        },
     ];
     for (const fault of faults) {
         const cfg = tempConfig();
@@ -2442,6 +2462,33 @@ function testCodexRemotePluginEntriesAreReadable() {
         codexCommand('remove', CODEX_PLUGIN_KEY),
         codexCommand('marketplace', 'remove', CODEX_MARKETPLACE),
     ], 'uninstall must remove baseline when the list also holds a remote plugin entry');
+}
+// Decision #24: a baseline@baseline-local entry with no folder path is foreign,
+// not unreadable and not installed. doctor fails without offering a fix, status
+// names the state, and uninstall issues no Codex remove command.
+function testCodexPathlessBaselinePluginEntryIsForeign() {
+    const cfg = tempConfig();
+    const codex = codexFor(cfg);
+    const pathless = { BASELINE_TEST_FAKE_CODEX_PLUGIN_LIST_PATHLESS_BASELINE: '1' };
+    const install = run(['install'], cfg);
+    assert.strictEqual(install.status, 0, install.stderr || install.stdout);
+    const before = readFakeCodexState(codex);
+    const doctor = run(['doctor'], cfg, undefined, pathless);
+    assert.strictEqual(doctor.status, 1, doctor.stdout);
+    assert.match(doctor.stdout, /\[FAIL\] codex plugin install: codex foreign — baseline@baseline-local resolves to a non-local source, not /, 'doctor must report a path-less baseline entry as foreign');
+    assert.doesNotMatch(doctor.stdout, /invalid plugin list JSON shape/, 'a path-less baseline entry must not make the list unreadable');
+    const status = run(['status'], cfg, undefined, pathless);
+    assert.strictEqual(status.status, 0, status.stderr || status.stdout);
+    assert.match(statusAgentSection(status.stdout, 'codex'), /codex plugin\s+: FOREIGN/, 'status must report a path-less baseline entry as foreign');
+    resetFakeCodexCommands(codex);
+    const uninstall = run(['uninstall'], cfg, undefined, pathless);
+    assert.strictEqual(uninstall.status, 0, uninstall.stderr || uninstall.stdout);
+    const after = readFakeCodexState(codex);
+    assert.deepStrictEqual(after.commands, [codexCommand('marketplace', 'list'), codexCommand('list')], 'uninstall must issue no Codex remove command for a foreign plugin entry');
+    assert.deepStrictEqual(after.marketplaces, before.marketplaces, 'foreign plugin entry must keep the marketplace');
+    assert.deepStrictEqual(after.installed, before.installed, 'foreign plugin entry must stay installed');
+    assert.match(uninstall.stdout, /codex plugin: foreign — left as-is/);
+    assert.match(uninstall.stdout, /marketplace : owned — kept because plugin is foreign/);
 }
 // --- repo invariants --------------------------------------------------------
 function assertGitVisible(file) {
@@ -3554,6 +3601,7 @@ const TESTS = [
     ['testUninstallPreservesForeignCodexMarketplace', testUninstallPreservesForeignCodexMarketplace],
     ['testUninstallKeepsCodexStateWhenListJsonHasWrongShape', testUninstallKeepsCodexStateWhenListJsonHasWrongShape],
     ['testCodexRemotePluginEntriesAreReadable', testCodexRemotePluginEntriesAreReadable],
+    ['testCodexPathlessBaselinePluginEntryIsForeign', testCodexPathlessBaselinePluginEntryIsForeign],
     ['testUnavailableCodexCliLeavesControlSurfaceUninstalled', testUnavailableCodexCliLeavesControlSurfaceUninstalled],
     ['testClaudePluginManifest', testClaudePluginManifest],
     ['testExternalConfigLocation', testExternalConfigLocation],
